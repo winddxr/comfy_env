@@ -1,7 +1,7 @@
 # ComfyUI environment governance config (Batch-1)
 
 [paths]
-comfyui_dir = "/home/windy/comfy-hub/ComfyUI"
+comfyui_dir = "/home/ComfyUI"
 
 [runtime]
 prod_env = ".venv-prod"

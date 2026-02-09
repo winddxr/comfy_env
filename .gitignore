@@ -6,3 +6,4 @@
 .cluade/
 .venv-prod/                
 .venv-candidate/ 
+config.toml
