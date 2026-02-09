@@ -1,0 +1,1835 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+STATE_DIR="${ROOT_DIR}/state"
+TX_DIR="${STATE_DIR}/transactions"
+LOG_DIR="${STATE_DIR}/logs"
+CONFLICT_DIR="${STATE_DIR}/conflicts"
+WORK_DIR="${STATE_DIR}/work"
+CACHE_WHEELS_DIR="${ROOT_DIR}/cache/wheels"
+SNAPSHOT_DIR="${ROOT_DIR}/snapshots"
+SNAPSHOT_INDEX_FILE="${STATE_DIR}/snapshots_index.json"
+CONFIG_FILE="${ROOT_DIR}/config.toml"
+PROJECT_FILE="${ROOT_DIR}/pyproject.toml"
+LOCK_FILE="${ROOT_DIR}/uv.lock"
+PLUGINS_FILE="${STATE_DIR}/plugins.json"
+
+TX_FILE=""
+
+detect_python_bin() {
+    if [ -n "${PYTHON_CMD:-}" ] && command -v "${PYTHON_CMD}" >/dev/null 2>&1; then
+        echo "${PYTHON_CMD}"
+        return 0
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        echo "python3"
+        return 0
+    fi
+    if command -v python >/dev/null 2>&1; then
+        echo "python"
+        return 0
+    fi
+    return 1
+}
+
+PYTHON_BIN="$(detect_python_bin || true)"
+
+timestamp_utc() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+require_python() {
+    if [ -z "${PYTHON_BIN}" ]; then
+        echo "ERROR: python3/python is required" >&2
+        exit 1
+    fi
+}
+
+require_cmd() {
+    local cmd="$1"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "ERROR: command not found: $cmd" >&2
+        exit 1
+    fi
+}
+
+config_get() {
+    local key="$1"
+    local default_value="$2"
+    require_python
+    "${PYTHON_BIN}" - "$CONFIG_FILE" "$key" "$default_value" <<'PY'
+import pathlib
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        print(sys.argv[3])
+        raise SystemExit(0)
+
+cfg_path = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+default = sys.argv[3]
+
+if not cfg_path.exists():
+    print(default)
+    raise SystemExit(0)
+
+try:
+    data = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
+except Exception:
+    print(default)
+    raise SystemExit(0)
+
+cur = data
+for part in key.split('.'):
+    if isinstance(cur, dict) and part in cur:
+        cur = cur[part]
+    else:
+        print(default)
+        raise SystemExit(0)
+
+if isinstance(cur, bool):
+    print("true" if cur else "false")
+elif isinstance(cur, (int, float)):
+    print(cur)
+elif isinstance(cur, list):
+    print(",".join(str(x) for x in cur))
+elif cur is None:
+    print(default)
+else:
+    print(str(cur))
+PY
+}
+
+ensure_layout() {
+    mkdir -p "${STATE_DIR}" "${TX_DIR}" "${LOG_DIR}" "${CONFLICT_DIR}" "${WORK_DIR}" "${CACHE_WHEELS_DIR}" "${SNAPSHOT_DIR}" "${ROOT_DIR}/.venv-candidate"
+    if [ ! -f "${PLUGINS_FILE}" ]; then
+        printf '[]\n' > "${PLUGINS_FILE}"
+    fi
+    if [ ! -f "${SNAPSHOT_INDEX_FILE}" ]; then
+        cat > "${SNAPSHOT_INDEX_FILE}" <<'JSON'
+{
+  "snapshots": []
+}
+JSON
+    fi
+}
+
+prod_env_path() {
+    local rel
+    rel="$(config_get "runtime.prod_env" ".venv-prod")"
+    echo "${ROOT_DIR}/${rel}"
+}
+
+candidate_root_path() {
+    local rel
+    rel="$(config_get "runtime.candidate_root" ".venv-candidate")"
+    echo "${ROOT_DIR}/${rel}"
+}
+
+comfyui_dir_path() {
+    config_get "paths.comfyui_dir" "/opt/comfyui"
+}
+
+tx_timeout_seconds() {
+    config_get "tx.timeout_seconds" "120"
+}
+
+core_packages_csv() {
+    config_get "policy.core_packages" "torch,torchvision,torchaudio,xformers,triton,onnxruntime,onnxruntime-gpu,numpy"
+}
+
+snapshot_retention_count() {
+    config_get "rollback.snapshot_retention" "50"
+}
+
+smoke_test_cmd() {
+    config_get "tx.smoke_test_cmd" ""
+}
+
+new_txid() {
+    require_python
+    "${PYTHON_BIN}" - <<'PY'
+import datetime
+import uuid
+print(datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8])
+PY
+}
+
+new_snapshot_id() {
+    require_python
+    "${PYTHON_BIN}" - <<'PY'
+import datetime
+import uuid
+print(datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-snap-" + uuid.uuid4().hex[:6])
+PY
+}
+
+collect_freeze_file() {
+    local env_path="$1"
+    local out_file="$2"
+    if [ -d "$env_path" ]; then
+        UV_PROJECT_ENVIRONMENT="$env_path" uv pip freeze 2>/dev/null | sort > "$out_file" || true
+    else
+        : > "$out_file"
+    fi
+}
+
+load_tx() {
+    local txid="$1"
+    TX_FILE="${TX_DIR}/${txid}.json"
+    if [ ! -f "$TX_FILE" ]; then
+        echo "ERROR: transaction not found: $txid" >&2
+        exit 2
+    fi
+}
+
+save_tx() {
+    local tx_file="$1"
+    local tmp_file="$2"
+    cp "$tmp_file" "$tx_file"
+}
+ensure_plugin_exists() {
+    local node_id="$1"
+    require_python
+    "${PYTHON_BIN}" - "$PLUGINS_FILE" "$node_id" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+node_id = sys.argv[2]
+
+if not path.exists():
+    raise SystemExit(1)
+
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(2)
+
+ok = any(isinstance(x, dict) and x.get("id") == node_id for x in data)
+raise SystemExit(0 if ok else 3)
+PY
+}
+
+plugin_get_meta() {
+    local node_id="$1"
+    local out_json="$2"
+    require_python
+    "${PYTHON_BIN}" - "$PLUGINS_FILE" "$node_id" "$out_json" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+node_id = sys.argv[2]
+out_json = pathlib.Path(sys.argv[3])
+
+if not path.exists():
+    raise SystemExit(2)
+
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(3)
+
+for item in data:
+    if isinstance(item, dict) and item.get("id") == node_id:
+        out_json.write_text(json.dumps(item, ensure_ascii=True), encoding="utf-8")
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+plugin_remove_record() {
+    local node_id="$1"
+    require_python
+    "${PYTHON_BIN}" - "$PLUGINS_FILE" "$node_id" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+node_id = sys.argv[2]
+
+data = []
+if path.exists():
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = []
+
+if not isinstance(data, list):
+    data = []
+
+new_data = [x for x in data if not (isinstance(x, dict) and x.get("id") == node_id)]
+path.write_text(json.dumps(new_data, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+plugin_update_after_promote() {
+    local node_id="$1"
+    local txid="$2"
+    local post_snapshot="$3"
+    local direct_file="$4"
+    require_python
+    "${PYTHON_BIN}" - "$PLUGINS_FILE" "$node_id" "$txid" "$post_snapshot" "$direct_file" <<'PY'
+import json
+import pathlib
+import sys
+
+plugins_path = pathlib.Path(sys.argv[1])
+node_id = sys.argv[2]
+txid = sys.argv[3]
+post_snapshot = sys.argv[4]
+direct_file = pathlib.Path(sys.argv[5])
+
+managed = []
+if direct_file.exists():
+    managed = [line.strip() for line in direct_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+try:
+    data = json.loads(plugins_path.read_text(encoding="utf-8")) if plugins_path.exists() else []
+except Exception:
+    data = []
+
+if not isinstance(data, list):
+    data = []
+
+found = False
+for item in data:
+    if isinstance(item, dict) and item.get("id") == node_id:
+        item["managed_deps"] = managed
+        item["last_txid"] = txid
+        item["last_snapshot"] = post_snapshot
+        found = True
+        break
+
+if not found:
+    data.append({
+        "id": node_id,
+        "managed_deps": managed,
+        "last_txid": txid,
+        "last_snapshot": post_snapshot,
+        "enabled": True,
+    })
+
+plugins_path.write_text(json.dumps(data, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+build_workdir_for_tx() {
+    local txid="$1"
+    local workdir="${WORK_DIR}/${txid}"
+    rm -rf "$workdir"
+    mkdir -p "$workdir"
+    cp "$PROJECT_FILE" "$workdir/pyproject.toml"
+    if [ -f "$LOCK_FILE" ]; then
+        cp "$LOCK_FILE" "$workdir/uv.lock"
+    fi
+    echo "$workdir"
+}
+
+apply_plan_in_workdir() {
+    local workdir="$1"
+    local node_id="$2"
+    local direct_file="$3"
+    local override_file="$4"
+    local log_file="$5"
+
+    (
+        cd "$workdir"
+        if [ -s "$direct_file" ]; then
+            while IFS= read -r spec; do
+                [ -z "$spec" ] && continue
+                uv add --group "node-${node_id}" "$spec"
+            done < "$direct_file"
+        fi
+
+        if [ -s "$override_file" ]; then
+            while IFS= read -r spec; do
+                [ -z "$spec" ] && continue
+                uv add --group overrides "$spec"
+            done < "$override_file"
+        fi
+
+        uv lock
+    ) >"$log_file" 2>&1
+}
+
+tx_get_field() {
+    local tx_file="$1"
+    local field_path="$2"
+    local default_value="${3:-}"
+    require_python
+    "${PYTHON_BIN}" - "$tx_file" "$field_path" "$default_value" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+field_path = sys.argv[2]
+default = sys.argv[3]
+
+if not path.exists():
+    print(default)
+    raise SystemExit(0)
+
+data = json.loads(path.read_text(encoding="utf-8"))
+cur = data
+for part in field_path.split('.'):
+    if isinstance(cur, dict) and part in cur:
+        cur = cur[part]
+    else:
+        print(default)
+        raise SystemExit(0)
+
+if isinstance(cur, list):
+    print("\n".join(str(x) for x in cur))
+elif isinstance(cur, dict):
+    print(json.dumps(cur, ensure_ascii=True))
+else:
+    print(cur)
+PY
+}
+tx_update_status() {
+    local tx_file="$1"
+    local status="$2"
+    require_python
+    "${PYTHON_BIN}" - "$tx_file" "$status" "$(timestamp_utc)" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+status = sys.argv[2]
+ended_at = sys.argv[3]
+
+data = json.loads(path.read_text(encoding="utf-8"))
+data["status"] = status
+data["ended_at"] = ended_at
+path.write_text(json.dumps(data, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+tx_set_plan() {
+    local tx_file="$1"
+    local plan_json="$2"
+    require_python
+    "${PYTHON_BIN}" - "$tx_file" "$plan_json" <<'PY'
+import json
+import pathlib
+import sys
+
+tx_file = pathlib.Path(sys.argv[1])
+plan_file = pathlib.Path(sys.argv[2])
+
+tx = json.loads(tx_file.read_text(encoding="utf-8"))
+plan = json.loads(plan_file.read_text(encoding="utf-8"))
+
+tx["promotion_plan"] = plan
+tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+tx_set_resolution_pins() {
+    local tx_file="$1"
+    local pins_file="$2"
+    local status="$3"
+    require_python
+    "${PYTHON_BIN}" - "$tx_file" "$pins_file" "$status" "$(timestamp_utc)" <<'PY'
+import json
+import pathlib
+import sys
+
+tx_file = pathlib.Path(sys.argv[1])
+pins_file = pathlib.Path(sys.argv[2])
+status = sys.argv[3]
+ended_at = sys.argv[4]
+
+tx = json.loads(tx_file.read_text(encoding="utf-8"))
+pins = []
+if pins_file.exists():
+    pins = [line.strip() for line in pins_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+seen = set()
+merged = []
+for item in tx.get("resolution_pins", []) + pins:
+    if item not in seen:
+        seen.add(item)
+        merged.append(item)
+
+tx["resolution_pins"] = merged
+tx["status"] = status
+tx["ended_at"] = ended_at
+tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+tx_set_conflict() {
+    local tx_file="$1"
+    local conflict_path="$2"
+    local status="$3"
+    local pre_snapshot="$4"
+    require_python
+    "${PYTHON_BIN}" - "$tx_file" "$conflict_path" "$status" "$pre_snapshot" "$(timestamp_utc)" <<'PY'
+import json
+import pathlib
+import sys
+
+tx_file = pathlib.Path(sys.argv[1])
+conflict_path = sys.argv[2]
+status = sys.argv[3]
+pre_snapshot = sys.argv[4]
+ended_at = sys.argv[5]
+
+tx = json.loads(tx_file.read_text(encoding="utf-8"))
+tx["status"] = status
+tx["ended_at"] = ended_at
+tx["conflict_report"] = conflict_path
+prom = tx.get("promotion", {})
+prom["status"] = "lock_failed"
+prom["pre_snapshot"] = pre_snapshot
+tx["promotion"] = prom
+tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+tx_set_promoted() {
+    local tx_file="$1"
+    local pre_snapshot="$2"
+    local post_snapshot="$3"
+    local reason="$4"
+    require_python
+    "${PYTHON_BIN}" - "$tx_file" "$pre_snapshot" "$post_snapshot" "$reason" "$(timestamp_utc)" <<'PY'
+import json
+import pathlib
+import sys
+
+tx_file = pathlib.Path(sys.argv[1])
+pre_snapshot = sys.argv[2]
+post_snapshot = sys.argv[3]
+reason = sys.argv[4]
+ended_at = sys.argv[5]
+
+tx = json.loads(tx_file.read_text(encoding="utf-8"))
+tx["status"] = "promoted"
+tx["ended_at"] = ended_at
+prom = tx.get("promotion", {})
+prom["status"] = "promoted"
+prom["pre_snapshot"] = pre_snapshot
+prom["post_snapshot"] = post_snapshot
+prom["reason"] = reason
+tx["promotion"] = prom
+tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+tx_set_promote_failed() {
+    local tx_file="$1"
+    local pre_snapshot="$2"
+    local error_msg="$3"
+    require_python
+    "${PYTHON_BIN}" - "$tx_file" "$pre_snapshot" "$error_msg" "$(timestamp_utc)" <<'PY'
+import json
+import pathlib
+import sys
+
+tx_file = pathlib.Path(sys.argv[1])
+pre_snapshot = sys.argv[2]
+error_msg = sys.argv[3]
+ended_at = sys.argv[4]
+
+tx = json.loads(tx_file.read_text(encoding="utf-8"))
+tx["status"] = "promote_failed"
+tx["ended_at"] = ended_at
+prom = tx.get("promotion", {})
+prom["status"] = "promote_failed"
+prom["pre_snapshot"] = pre_snapshot
+prom["error"] = error_msg
+tx["promotion"] = prom
+tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+extract_promotion_files() {
+    local plan_json="$1"
+    local pins_file="$2"
+    local direct_out="$3"
+    local override_out="$4"
+    require_python
+    "${PYTHON_BIN}" - "$plan_json" "$pins_file" "$direct_out" "$override_out" <<'PY'
+import json
+import pathlib
+import sys
+
+plan_path = pathlib.Path(sys.argv[1])
+pins_path = pathlib.Path(sys.argv[2])
+direct_out = pathlib.Path(sys.argv[3])
+override_out = pathlib.Path(sys.argv[4])
+
+plan = json.loads(plan_path.read_text(encoding="utf-8"))
+direct = [x.strip() for x in plan.get("direct_additions", []) if str(x).strip()]
+overrides = [x.strip() for x in plan.get("override_additions", []) if str(x).strip()]
+
+pins = []
+if pins_path.exists():
+    pins = [line.strip() for line in pins_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+seen = set()
+merged_override = []
+for item in overrides + pins:
+    if item not in seen:
+        seen.add(item)
+        merged_override.append(item)
+
+direct_out.write_text("\n".join(sorted(set(direct))) + ("\n" if direct else ""), encoding="utf-8")
+override_out.write_text("\n".join(merged_override) + ("\n" if merged_override else ""), encoding="utf-8")
+PY
+}
+
+generate_promotion_plan() {
+    local tx_file="$1"
+    local plugin_path="$2"
+    local out_json="$3"
+    require_python
+    "${PYTHON_BIN}" - "$tx_file" "$plugin_path" "$out_json" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+tx_file = pathlib.Path(sys.argv[1])
+plugin_path = pathlib.Path(sys.argv[2])
+out_json = pathlib.Path(sys.argv[3])
+
+tx = json.loads(tx_file.read_text(encoding="utf-8"))
+added = tx.get("diff", {}).get("added", [])
+
+def norm_name(spec: str) -> str:
+    token = re.split(r"[<>=!~;\[]", spec, maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower()
+
+def parse_req_names(base: pathlib.Path):
+    names = set()
+    for f in sorted(base.glob("requirements*.txt")):
+        for raw in f.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith(("-r", "--", "-c")):
+                continue
+            if line.startswith(("git+", "http://", "https://")):
+                continue
+            n = norm_name(line)
+            if n:
+                names.add(n)
+    return names
+
+req_names = parse_req_names(plugin_path) if plugin_path.exists() else set()
+
+name_to_spec = {}
+for spec in added:
+    spec = str(spec).strip()
+    if not spec:
+        continue
+    n = norm_name(spec)
+    if n and n not in name_to_spec:
+        name_to_spec[n] = spec
+
+direct = []
+overrides = []
+for name, spec in sorted(name_to_spec.items()):
+    if name in req_names:
+        direct.append(spec)
+    else:
+        overrides.append(spec)
+
+payload = {
+    "direct_additions": direct,
+    "override_additions": overrides,
+}
+out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+write_conflict_report() {
+    local txid="$1"
+    local node_id="$2"
+    local lock_log="$3"
+    local out_json="${CONFLICT_DIR}/${txid}.json"
+    require_python
+    "${PYTHON_BIN}" - "$out_json" "$txid" "$node_id" "$lock_log" "$(timestamp_utc)" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+out_path = pathlib.Path(sys.argv[1])
+txid = sys.argv[2]
+node_id = sys.argv[3]
+lock_log = pathlib.Path(sys.argv[4])
+created_at = sys.argv[5]
+
+raw = ""
+if lock_log.exists():
+    raw = lock_log.read_text(encoding="utf-8", errors="ignore")
+
+summary_lines = raw.splitlines()[:40]
+packages = sorted(set(re.findall(r"([A-Za-z0-9_.-]+)==", raw)))
+
+payload = {
+    "txid": txid,
+    "node_id": node_id,
+    "created_at": created_at,
+    "raw_log": str(lock_log),
+    "summary": "\n".join(summary_lines),
+    "detected_packages": packages,
+    "input_hint": "Use: pkg==version",
+}
+out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+print(out_path)
+PY
+}
+
+snapshot_prune() {
+    ensure_layout
+    local retention
+    retention="$(snapshot_retention_count)"
+    require_python
+    "${PYTHON_BIN}" - "$SNAPSHOT_INDEX_FILE" "$SNAPSHOT_DIR" "$retention" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+index_path = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+retention = int(sys.argv[3]) if sys.argv[3].isdigit() else 50
+
+if not index_path.exists():
+    raise SystemExit(0)
+
+try:
+    data = json.loads(index_path.read_text(encoding="utf-8"))
+except Exception:
+    data = {"snapshots": []}
+
+items = data.get("snapshots", [])
+if not isinstance(items, list):
+    items = []
+
+items = sorted(items, key=lambda x: x.get("created_at", ""))
+if retention < 1:
+    retention = 1
+
+if len(items) > retention:
+    to_delete = items[:-retention]
+    for entry in to_delete:
+        sid = entry.get("id", "")
+        if not sid:
+            continue
+        target = root / sid
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+    items = items[-retention:]
+
+index_path.write_text(json.dumps({"snapshots": items}, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+snapshot_create() {
+    local reason="$1"
+    local ref="${2:-}"
+    ensure_layout
+    require_python
+
+    local snapshot_id snapshot_path
+    snapshot_id="$(new_snapshot_id)"
+    snapshot_path="${SNAPSHOT_DIR}/${snapshot_id}"
+    mkdir -p "$snapshot_path"
+
+    cp "$PROJECT_FILE" "$snapshot_path/pyproject.toml"
+    if [ -f "$LOCK_FILE" ]; then
+        cp "$LOCK_FILE" "$snapshot_path/uv.lock"
+    fi
+    cp "$PLUGINS_FILE" "$snapshot_path/plugins.json"
+
+    "${PYTHON_BIN}" - "$snapshot_path/meta.json" "$snapshot_id" "$reason" "$ref" "$(timestamp_utc)" <<'PY'
+import json
+import pathlib
+import sys
+
+meta = {
+    "id": sys.argv[2],
+    "created_at": sys.argv[5],
+    "reason": sys.argv[3],
+    "ref": sys.argv[4],
+}
+path = pathlib.Path(sys.argv[1])
+path.write_text(json.dumps(meta, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+
+    "${PYTHON_BIN}" - "$SNAPSHOT_INDEX_FILE" "$snapshot_id" "$reason" "$ref" "$(timestamp_utc)" <<'PY'
+import json
+import pathlib
+import sys
+
+index_path = pathlib.Path(sys.argv[1])
+snapshot_id = sys.argv[2]
+reason = sys.argv[3]
+ref = sys.argv[4]
+created_at = sys.argv[5]
+
+try:
+    data = json.loads(index_path.read_text(encoding="utf-8")) if index_path.exists() else {"snapshots": []}
+except Exception:
+    data = {"snapshots": []}
+
+items = data.get("snapshots", [])
+if not isinstance(items, list):
+    items = []
+
+items.append({
+    "id": snapshot_id,
+    "created_at": created_at,
+    "reason": reason,
+    "ref": ref,
+})
+
+index_path.write_text(json.dumps({"snapshots": items}, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+
+    snapshot_prune
+    echo "$snapshot_id"
+}
+
+snapshot_restore() {
+    local snapshot_id="$1"
+    local snapshot_path="${SNAPSHOT_DIR}/${snapshot_id}"
+    if [ ! -d "$snapshot_path" ]; then
+        echo "ERROR: snapshot not found: $snapshot_id" >&2
+        return 1
+    fi
+    if [ ! -f "$snapshot_path/pyproject.toml" ]; then
+        echo "ERROR: snapshot missing pyproject.toml: $snapshot_id" >&2
+        return 1
+    fi
+    if [ ! -f "$snapshot_path/uv.lock" ]; then
+        echo "ERROR: snapshot missing uv.lock: $snapshot_id" >&2
+        return 1
+    fi
+    if [ ! -f "$snapshot_path/plugins.json" ]; then
+        echo "ERROR: snapshot missing plugins.json: $snapshot_id" >&2
+        return 1
+    fi
+
+    cp "$snapshot_path/pyproject.toml" "$PROJECT_FILE"
+    cp "$snapshot_path/uv.lock" "$LOCK_FILE"
+    cp "$snapshot_path/plugins.json" "$PLUGINS_FILE"
+}
+
+write_tx_file() {
+    local tx_file="$1"
+    local txid="$2"
+    local node_id="$3"
+    local status="$4"
+    local started_at="$5"
+    local ended_at="$6"
+    local candidate_env="$7"
+    local pre_file="$8"
+    local post_file="$9"
+    local stdout_log="${10}"
+    local stderr_log="${11}"
+    local run_exit_code="${12}"
+    local core_csv="${13}"
+    require_python
+
+    "${PYTHON_BIN}" - "$tx_file" "$txid" "$node_id" "$status" "$started_at" "$ended_at" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "$run_exit_code" "$core_csv" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+(
+    tx_file,
+    txid,
+    node_id,
+    status,
+    started_at,
+    ended_at,
+    candidate_env,
+    pre_file,
+    post_file,
+    stdout_log,
+    stderr_log,
+    run_exit_code,
+    core_csv,
+) = sys.argv[1:14]
+
+def read_lines(path: str):
+    p = pathlib.Path(path)
+    if not p.exists():
+        return []
+    return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+def normalize_name(spec: str):
+    token = re.split(r"[<>=!~\[]", spec, maxsplit=1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower()
+
+pre = read_lines(pre_file)
+post = read_lines(post_file)
+added = sorted(set(post) - set(pre))
+removed = sorted(set(pre) - set(post))
+core_set = {x.strip().lower() for x in core_csv.split(",") if x.strip()}
+core_impact = sorted({n for n in [normalize_name(x) for x in added + removed] if n in core_set})
+
+payload = {
+    "txid": txid,
+    "node_id": node_id,
+    "started_at": started_at,
+    "ended_at": ended_at,
+    "candidate_env": candidate_env,
+    "status": status,
+    "pre_freeze": pre,
+    "post_freeze": post,
+    "diff": {
+        "added": added,
+        "removed": removed,
+    },
+    "core_impact": core_impact,
+    "logs": {
+        "stdout": stdout_log,
+        "stderr": stderr_log,
+        "run_exit_code": int(run_exit_code),
+    },
+    "conflict_report": "",
+    "resolution_pins": [],
+    "promotion_plan": {
+        "direct_additions": [],
+        "override_additions": [],
+    },
+    "promotion": {
+        "status": "",
+        "reason": "",
+        "pre_snapshot": "",
+        "post_snapshot": "",
+        "error": "",
+    },
+}
+
+pathlib.Path(tx_file).write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+cmd_init() {
+    require_cmd uv
+    ensure_layout
+
+    local prod_env
+    prod_env="$(prod_env_path)"
+
+    cd "$ROOT_DIR"
+    uv lock
+    UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact
+
+    echo "Initialized."
+    echo "  root: $ROOT_DIR"
+    echo "  prod env: $prod_env"
+    echo "  lock file: $LOCK_FILE"
+}
+
+cmd_node_add() {
+    require_cmd git
+    ensure_layout
+
+    local git_url="${1:-}"
+    shift || true
+    if [ -z "$git_url" ]; then
+        echo "Usage: gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]" >&2
+        exit 1
+    fi
+
+    local ref=""
+    local node_id=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ref)
+                ref="${2:-}"
+                shift 2
+                ;;
+            --id)
+                node_id="${2:-}"
+                shift 2
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ -z "$node_id" ]; then
+        node_id="$(basename "$git_url")"
+        node_id="${node_id%.git}"
+    fi
+
+    local comfyui_dir custom_nodes_dir target_dir
+    comfyui_dir="$(comfyui_dir_path)"
+    custom_nodes_dir="${comfyui_dir}/custom_nodes"
+    target_dir="${custom_nodes_dir}/${node_id}"
+
+    mkdir -p "$custom_nodes_dir"
+    if [ -e "$target_dir" ]; then
+        echo "ERROR: node target already exists: $target_dir" >&2
+        exit 1
+    fi
+
+    git clone "$git_url" "$target_dir"
+    if [ -n "$ref" ]; then
+        git -C "$target_dir" checkout "$ref"
+    fi
+
+    require_python
+    "${PYTHON_BIN}" - "$PLUGINS_FILE" "$node_id" "$git_url" "$ref" "$target_dir" <<'PY'
+import json
+import pathlib
+import sys
+
+plugins_file = pathlib.Path(sys.argv[1])
+node_id = sys.argv[2]
+git_url = sys.argv[3]
+ref = sys.argv[4]
+path = sys.argv[5]
+
+try:
+    data = json.loads(plugins_file.read_text(encoding="utf-8")) if plugins_file.exists() else []
+except Exception:
+    data = []
+
+if not isinstance(data, list):
+    data = []
+
+data = [x for x in data if not (isinstance(x, dict) and x.get("id") == node_id)]
+data.append({
+    "id": node_id,
+    "git_url": git_url,
+    "ref": ref,
+    "path": path,
+    "group": f"node-{node_id}",
+    "enabled": True,
+    "managed_deps": [],
+    "last_txid": "",
+    "last_snapshot": "",
+})
+
+plugins_file.write_text(json.dumps(data, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+
+    echo "Node added."
+    echo "  id: $node_id"
+    echo "  path: $target_dir"
+}
+cmd_node_remove() {
+    require_cmd uv
+    ensure_layout
+
+    local node_id="${1:-}"
+    shift || true
+    if [ -z "$node_id" ]; then
+        echo "Usage: gov node remove <node_id> [--purge-code]" >&2
+        exit 1
+    fi
+
+    local purge_code=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --purge-code)
+                purge_code=true
+                shift
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    local meta_json deps_file
+    meta_json="$(mktemp)"
+    deps_file="$(mktemp)"
+    if ! plugin_get_meta "$node_id" "$meta_json"; then
+        rm -f "$meta_json" "$deps_file"
+        echo "ERROR: node not found: $node_id" >&2
+        exit 2
+    fi
+
+    require_python
+    "${PYTHON_BIN}" - "$meta_json" "$deps_file" <<'PY'
+import json
+import pathlib
+import sys
+
+meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+managed = meta.get("managed_deps", [])
+if not isinstance(managed, list):
+    managed = []
+pathlib.Path(sys.argv[2]).write_text("\n".join(str(x) for x in managed if str(x).strip()) + "\n", encoding="utf-8")
+PY
+
+    local group plugin_path
+    group="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
+import json
+import pathlib
+import sys
+meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(meta.get("group") or f"node-{meta.get('id')}")
+PY
+)"
+    plugin_path="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
+import json
+import pathlib
+import sys
+meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(meta.get("path", ""))
+PY
+)"
+
+    local pre_snapshot
+    pre_snapshot="$(snapshot_create "remove_pre" "$node_id")"
+
+    local workdir lock_log
+    workdir="$(build_workdir_for_tx "remove-${node_id}")"
+    lock_log="${LOG_DIR}/remove-${node_id}.lock.log"
+
+    (
+        cd "$workdir"
+        if [ -s "$deps_file" ]; then
+            while IFS= read -r dep; do
+                [ -z "$dep" ] && continue
+                uv remove --group "$group" "$dep" || true
+            done < "$deps_file"
+        fi
+        uv lock
+    ) >"$lock_log" 2>&1 || {
+        rm -f "$meta_json" "$deps_file"
+        echo "ERROR: node remove lock failed. See $lock_log" >&2
+        exit 1
+    }
+
+    cp "$workdir/pyproject.toml" "$PROJECT_FILE"
+    cp "$workdir/uv.lock" "$LOCK_FILE"
+
+    local prod_env
+    prod_env="$(prod_env_path)"
+    if ! UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact; then
+        echo "ERROR: prod sync failed during node remove, restoring snapshot $pre_snapshot" >&2
+        snapshot_restore "$pre_snapshot"
+        UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact || true
+        rm -f "$meta_json" "$deps_file"
+        exit 1
+    fi
+
+    plugin_remove_record "$node_id"
+
+    if [ "$purge_code" = true ] && [ -n "$plugin_path" ] && [ -d "$plugin_path" ]; then
+        rm -rf "$plugin_path"
+    fi
+
+    rm -f "$meta_json" "$deps_file"
+
+    echo "Node removed."
+    echo "  id: $node_id"
+    echo "  pre_snapshot: $pre_snapshot"
+}
+
+cmd_tx_run() {
+    require_cmd uv
+    ensure_layout
+
+    local node_id="${1:-}"
+    shift || true
+    if [ -z "$node_id" ]; then
+        echo "Usage: gov tx run <node_id> [--timeout <seconds>]" >&2
+        exit 1
+    fi
+
+    local timeout_sec
+    timeout_sec="$(tx_timeout_seconds)"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --timeout)
+                timeout_sec="${2:-}"
+                shift 2
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if ! ensure_plugin_exists "$node_id"; then
+        echo "ERROR: node not found in plugins registry: $node_id" >&2
+        exit 1
+    fi
+
+    local txid candidate_root candidate_env pre_file post_file stdout_log stderr_log started_at ended_at run_exit_code status
+    txid="$(new_txid)"
+    candidate_root="$(candidate_root_path)"
+    candidate_env="${candidate_root}/${txid}"
+    TX_FILE="${TX_DIR}/${txid}.json"
+    pre_file="${TX_DIR}/${txid}.pre.freeze.txt"
+    post_file="${TX_DIR}/${txid}.post.freeze.txt"
+    stdout_log="${LOG_DIR}/${txid}.stdout.log"
+    stderr_log="${LOG_DIR}/${txid}.stderr.log"
+
+    started_at="$(timestamp_utc)"
+    run_exit_code=0
+
+    mkdir -p "$candidate_root"
+    : > "$pre_file"
+    : > "$post_file"
+    : > "$stdout_log"
+    : > "$stderr_log"
+
+    write_tx_file "$TX_FILE" "$txid" "$node_id" "running" "$started_at" "" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "-1" "$(core_packages_csv)"
+
+    cd "$ROOT_DIR"
+    if [ ! -f "$LOCK_FILE" ]; then
+        uv lock
+    fi
+    UV_PROJECT_ENVIRONMENT="$candidate_env" uv sync --locked --exact
+
+    collect_freeze_file "$candidate_env" "$pre_file"
+
+    local comfyui_dir main_py
+    comfyui_dir="$(comfyui_dir_path)"
+    main_py="${comfyui_dir}/main.py"
+
+    set +e
+    if [ -f "$main_py" ]; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "${timeout_sec}s" "$candidate_env/bin/python" "$main_py" >"$stdout_log" 2>"$stderr_log"
+            run_exit_code=$?
+        else
+            "$candidate_env/bin/python" "$main_py" >"$stdout_log" 2>"$stderr_log"
+            run_exit_code=$?
+        fi
+    else
+        echo "ComfyUI entry not found: $main_py" >"$stderr_log"
+        run_exit_code=2
+    fi
+    set -e
+
+    collect_freeze_file "$candidate_env" "$post_file"
+
+    ended_at="$(timestamp_utc)"
+    status="completed"
+    if [ "$run_exit_code" -ne 0 ]; then
+        status="failed"
+    fi
+
+    write_tx_file "$TX_FILE" "$txid" "$node_id" "$status" "$started_at" "$ended_at" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "$run_exit_code" "$(core_packages_csv)"
+
+    echo "Transaction recorded."
+    echo "  txid: $txid"
+    echo "  status: $status"
+    echo "  file: $TX_FILE"
+}
+
+cmd_tx_inspect() {
+    local txid="${1:-}"
+    if [ -z "$txid" ]; then
+        echo "Usage: gov tx inspect <txid>" >&2
+        exit 1
+    fi
+    load_tx "$txid"
+
+    require_python
+    "${PYTHON_BIN}" - "$TX_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+tx = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(f"txid: {tx.get('txid')}")
+print(f"node_id: {tx.get('node_id')}")
+print(f"status: {tx.get('status')}")
+print(f"started_at: {tx.get('started_at')}")
+print(f"ended_at: {tx.get('ended_at')}")
+print(f"candidate_env: {tx.get('candidate_env')}")
+diff = tx.get("diff", {})
+print(f"added_count: {len(diff.get('added', []))}")
+print(f"removed_count: {len(diff.get('removed', []))}")
+core = tx.get("core_impact", [])
+print(f"core_impact: {', '.join(core) if core else '(none)'}")
+print(f"conflict_report: {tx.get('conflict_report') or '(none)'}")
+print(f"resolution_pins: {len(tx.get('resolution_pins', []))}")
+prom = tx.get("promotion", {})
+print(f"promotion_status: {prom.get('status') or '(none)'}")
+logs = tx.get("logs", {})
+print(f"stdout_log: {logs.get('stdout', '')}")
+print(f"stderr_log: {logs.get('stderr', '')}")
+print(f"run_exit_code: {logs.get('run_exit_code', '')}")
+PY
+}
+
+cmd_tx_abort() {
+    local txid="${1:-}"
+    if [ -z "$txid" ]; then
+        echo "Usage: gov tx abort <txid>" >&2
+        exit 1
+    fi
+    load_tx "$txid"
+
+    local candidate_env
+    candidate_env="$(tx_get_field "$TX_FILE" "candidate_env" "")"
+    if [ -n "$candidate_env" ] && [ -d "$candidate_env" ]; then
+        rm -rf "$candidate_env"
+    fi
+
+    tx_update_status "$TX_FILE" "aborted"
+    echo "Transaction aborted."
+    echo "  txid: $txid"
+}
+cmd_resolve() {
+    require_cmd uv
+    require_python
+    ensure_layout
+
+    local txid="${1:-}"
+    if [ -z "$txid" ]; then
+        echo "Usage: gov resolve <txid>" >&2
+        exit 1
+    fi
+
+    load_tx "$txid"
+
+    local status node_id conflict_report
+    status="$(tx_get_field "$TX_FILE" "status" "")"
+    node_id="$(tx_get_field "$TX_FILE" "node_id" "")"
+    conflict_report="$(tx_get_field "$TX_FILE" "conflict_report" "")"
+
+    case "$status" in
+        needs_resolution|promote_failed|resolved)
+            ;;
+        *)
+            echo "ERROR: tx status '$status' is not resolvable" >&2
+            exit 1
+            ;;
+    esac
+
+    if [ -n "$conflict_report" ] && [ -f "$conflict_report" ]; then
+        echo "=== Conflict Summary ==="
+        "${PYTHON_BIN}" - "$conflict_report" <<'PY'
+import json
+import pathlib
+import sys
+r = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(r.get("summary", "(no summary)"))
+PY
+        echo "========================"
+    fi
+
+    local new_pins merged_pins
+    new_pins="$(mktemp)"
+    merged_pins="$(mktemp)"
+
+    echo "Input pins as pkg==version (empty line to finish):"
+    while true; do
+        local line
+        IFS= read -r line || true
+        [ -z "$line" ] && break
+        if [[ ! "$line" =~ ^[A-Za-z0-9_.-]+==[^[:space:]]+$ ]]; then
+            echo "Invalid pin format: $line" >&2
+            continue
+        fi
+        echo "$line" >> "$new_pins"
+    done
+
+    require_python
+    "${PYTHON_BIN}" - "$TX_FILE" "$new_pins" "$merged_pins" <<'PY'
+import json
+import pathlib
+import sys
+
+tx = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+new_pins = pathlib.Path(sys.argv[2])
+out = pathlib.Path(sys.argv[3])
+
+extra = []
+if new_pins.exists():
+    extra = [x.strip() for x in new_pins.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+seen = set()
+merged = []
+for item in tx.get("resolution_pins", []) + extra:
+    if item not in seen:
+        seen.add(item)
+        merged.append(item)
+
+out.write_text("\n".join(merged) + ("\n" if merged else ""), encoding="utf-8")
+PY
+
+    local meta_json plugin_path plan_json workdir direct_file override_file lock_log report
+    meta_json="$(mktemp)"
+    if ! plugin_get_meta "$node_id" "$meta_json"; then
+        rm -f "$meta_json" "$new_pins" "$merged_pins"
+        echo "ERROR: plugin metadata missing for node_id=$node_id" >&2
+        exit 1
+    fi
+
+    plugin_path="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
+import json
+import pathlib
+import sys
+m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(m.get("path", ""))
+PY
+)"
+
+    plan_json="$(mktemp)"
+    generate_promotion_plan "$TX_FILE" "$plugin_path" "$plan_json"
+    tx_set_plan "$TX_FILE" "$plan_json"
+
+    workdir="$(build_workdir_for_tx "$txid")"
+    direct_file="${WORK_DIR}/${txid}.resolve.direct.txt"
+    override_file="${WORK_DIR}/${txid}.resolve.override.txt"
+    extract_promotion_files "$plan_json" "$merged_pins" "$direct_file" "$override_file"
+
+    lock_log="${CONFLICT_DIR}/${txid}.resolve.lock.log"
+    if apply_plan_in_workdir "$workdir" "$node_id" "$direct_file" "$override_file" "$lock_log"; then
+        tx_set_resolution_pins "$TX_FILE" "$merged_pins" "resolved"
+        echo "Resolve succeeded."
+        echo "  txid: $txid"
+        echo "  status: resolved"
+    else
+        report="$(write_conflict_report "$txid" "$node_id" "$lock_log")"
+        tx_set_resolution_pins "$TX_FILE" "$merged_pins" "needs_resolution"
+        tx_set_conflict "$TX_FILE" "$report" "needs_resolution" ""
+        echo "Resolve failed."
+        echo "  txid: $txid"
+        echo "  conflict_report: $report"
+        rm -f "$meta_json" "$new_pins" "$merged_pins" "$plan_json"
+        exit 2
+    fi
+
+    rm -f "$meta_json" "$new_pins" "$merged_pins" "$plan_json"
+}
+
+cmd_tx_promote() {
+    require_cmd uv
+    require_python
+    ensure_layout
+
+    local txid="${1:-}"
+    shift || true
+    if [ -z "$txid" ]; then
+        echo "Usage: gov tx promote <txid> [--approve-core --reason \"...\"] [--allow-failed-run]" >&2
+        exit 1
+    fi
+
+    local approve_core=false
+    local reason=""
+    local allow_failed_run=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --approve-core)
+                approve_core=true
+                shift
+                ;;
+            --reason)
+                reason="${2:-}"
+                shift 2
+                ;;
+            --allow-failed-run)
+                allow_failed_run=true
+                shift
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    load_tx "$txid"
+
+    local status node_id core_count
+    status="$(tx_get_field "$TX_FILE" "status" "")"
+    node_id="$(tx_get_field "$TX_FILE" "node_id" "")"
+    core_count="$(tx_get_field "$TX_FILE" "core_impact" "" | sed '/^$/d' | wc -l | tr -d ' ')"
+
+    case "$status" in
+        completed|resolved)
+            ;;
+        failed)
+            if [ "$allow_failed_run" != true ]; then
+                echo "ERROR: tx status is failed. Use --allow-failed-run to continue." >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "ERROR: tx status '$status' cannot be promoted" >&2
+            exit 1
+            ;;
+    esac
+
+    if [ "$core_count" != "0" ] && [ "$approve_core" != true ]; then
+        echo "ERROR: core package impact detected. Use --approve-core to continue." >&2
+        exit 1
+    fi
+
+    local meta_json plugin_path pre_snapshot workdir plan_json pins_file direct_file override_file lock_log conflict_report
+    meta_json="$(mktemp)"
+    if ! plugin_get_meta "$node_id" "$meta_json"; then
+        rm -f "$meta_json"
+        echo "ERROR: plugin metadata missing for node=$node_id" >&2
+        exit 1
+    fi
+
+    plugin_path="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
+import json
+import pathlib
+import sys
+m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(m.get("path", ""))
+PY
+)"
+
+    pre_snapshot="$(snapshot_create "promote_pre" "$txid")"
+
+    workdir="$(build_workdir_for_tx "$txid")"
+    plan_json="$(mktemp)"
+    generate_promotion_plan "$TX_FILE" "$plugin_path" "$plan_json"
+    tx_set_plan "$TX_FILE" "$plan_json"
+
+    pins_file="$(mktemp)"
+    tx_get_field "$TX_FILE" "resolution_pins" "" > "$pins_file" || true
+
+    direct_file="${WORK_DIR}/${txid}.promote.direct.txt"
+    override_file="${WORK_DIR}/${txid}.promote.override.txt"
+    extract_promotion_files "$plan_json" "$pins_file" "$direct_file" "$override_file"
+
+    lock_log="${CONFLICT_DIR}/${txid}.promote.lock.log"
+    if ! apply_plan_in_workdir "$workdir" "$node_id" "$direct_file" "$override_file" "$lock_log"; then
+        conflict_report="$(write_conflict_report "$txid" "$node_id" "$lock_log")"
+        tx_set_conflict "$TX_FILE" "$conflict_report" "needs_resolution" "$pre_snapshot"
+        echo "Promote blocked by lock conflict."
+        echo "  txid: $txid"
+        echo "  conflict_report: $conflict_report"
+        rm -f "$meta_json" "$plan_json" "$pins_file"
+        exit 2
+    fi
+
+    cp "$workdir/pyproject.toml" "$PROJECT_FILE"
+    cp "$workdir/uv.lock" "$LOCK_FILE"
+
+    local prod_env
+    prod_env="$(prod_env_path)"
+    if ! UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact; then
+        echo "ERROR: prod sync failed, restoring pre snapshot: $pre_snapshot" >&2
+        snapshot_restore "$pre_snapshot"
+        UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact || true
+        tx_set_promote_failed "$TX_FILE" "$pre_snapshot" "prod sync failed"
+        rm -f "$meta_json" "$plan_json" "$pins_file"
+        exit 1
+    fi
+
+    local smoke_cmd
+    smoke_cmd="$(smoke_test_cmd)"
+    if [ -n "$smoke_cmd" ]; then
+        local comfyui_dir
+        comfyui_dir="$(comfyui_dir_path)"
+        if ! (cd "$comfyui_dir" && PATH="$prod_env/bin:$PATH" bash -lc "$smoke_cmd"); then
+            echo "ERROR: smoke test failed, restoring pre snapshot: $pre_snapshot" >&2
+            snapshot_restore "$pre_snapshot"
+            UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact || true
+            tx_set_promote_failed "$TX_FILE" "$pre_snapshot" "smoke test failed"
+            rm -f "$meta_json" "$plan_json" "$pins_file"
+            exit 1
+        fi
+    else
+        if ! "$prod_env/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1; then
+            echo "ERROR: default smoke test failed, restoring pre snapshot: $pre_snapshot" >&2
+            snapshot_restore "$pre_snapshot"
+            UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact || true
+            tx_set_promote_failed "$TX_FILE" "$pre_snapshot" "default smoke test failed"
+            rm -f "$meta_json" "$plan_json" "$pins_file"
+            exit 1
+        fi
+    fi
+
+    local post_snapshot
+    post_snapshot="$(snapshot_create "promote_post" "$txid")"
+
+    tx_set_promoted "$TX_FILE" "$pre_snapshot" "$post_snapshot" "$reason"
+    plugin_update_after_promote "$node_id" "$txid" "$post_snapshot" "$direct_file"
+
+    echo "Promote successful."
+    echo "  txid: $txid"
+    echo "  pre_snapshot: $pre_snapshot"
+    echo "  post_snapshot: $post_snapshot"
+
+    rm -f "$meta_json" "$plan_json" "$pins_file"
+}
+cmd_rollback() {
+    require_cmd uv
+    ensure_layout
+
+    local snapshot_id="${1:-}"
+    if [ -z "$snapshot_id" ]; then
+        echo "Usage: gov rollback <snapshot_id>" >&2
+        exit 1
+    fi
+
+    local rollback_pre
+    rollback_pre="$(snapshot_create "rollback_pre" "$snapshot_id")"
+
+    if ! snapshot_restore "$snapshot_id"; then
+        echo "ERROR: failed to restore target snapshot" >&2
+        exit 1
+    fi
+
+    local prod_env
+    prod_env="$(prod_env_path)"
+    if ! UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact; then
+        echo "ERROR: rollback sync failed; restoring pre-rollback snapshot: $rollback_pre" >&2
+        snapshot_restore "$rollback_pre"
+        UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact || true
+        exit 1
+    fi
+
+    echo "Rollback complete."
+    echo "  snapshot: $snapshot_id"
+    echo "  rollback_pre: $rollback_pre"
+}
+
+cmd_snapshot_list() {
+    ensure_layout
+    require_python
+    "${PYTHON_BIN}" - "$SNAPSHOT_INDEX_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+index = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(index.read_text(encoding="utf-8")) if index.exists() else {"snapshots": []}
+except Exception:
+    data = {"snapshots": []}
+
+items = data.get("snapshots", [])
+items = sorted(items, key=lambda x: x.get("created_at", ""), reverse=True)
+if not items:
+    print("(no snapshots)")
+else:
+    for item in items:
+        sid = item.get("id", "")
+        ts = item.get("created_at", "")
+        reason = item.get("reason", "")
+        ref = item.get("ref", "")
+        print(f"{sid}  {ts}  reason={reason}  ref={ref}")
+PY
+}
+
+cmd_snapshot_inspect() {
+    ensure_layout
+    local snapshot_id="${1:-}"
+    if [ -z "$snapshot_id" ]; then
+        echo "Usage: gov snapshot inspect <snapshot_id>" >&2
+        exit 1
+    fi
+
+    local meta_file="${SNAPSHOT_DIR}/${snapshot_id}/meta.json"
+    if [ ! -f "$meta_file" ]; then
+        echo "ERROR: snapshot not found: $snapshot_id" >&2
+        exit 2
+    fi
+
+    cat "$meta_file"
+}
+
+cmd_status() {
+    ensure_layout
+    local prod_env
+    prod_env="$(prod_env_path)"
+    require_python
+    "${PYTHON_BIN}" - "$prod_env" "$LOCK_FILE" "$TX_DIR" <<'PY'
+import json
+import pathlib
+import sys
+
+prod_env = pathlib.Path(sys.argv[1])
+lock_file = pathlib.Path(sys.argv[2])
+tx_dir = pathlib.Path(sys.argv[3])
+
+records = []
+for f in sorted(tx_dir.glob("*.json")):
+    try:
+        records.append(json.loads(f.read_text(encoding="utf-8")))
+    except Exception:
+        continue
+
+pending_status = {
+    "running",
+    "completed",
+    "failed",
+    "needs_resolution",
+    "resolved",
+    "promote_failed",
+}
+pending = [x for x in records if x.get("status") in pending_status]
+recent = sorted(records, key=lambda x: x.get("started_at", ""), reverse=True)[:8]
+
+print("Comfy Env Status")
+print(f"prod_env_exists: {'yes' if prod_env.exists() else 'no'}")
+print(f"lock_exists: {'yes' if lock_file.exists() else 'no'}")
+print(f"transactions_total: {len(records)}")
+print(f"transactions_pending: {len(pending)}")
+print("recent_transactions:")
+if not recent:
+    print("  (none)")
+else:
+    for item in recent:
+        print(f"  - {item.get('txid')} [{item.get('status')}] node={item.get('node_id')}")
+PY
+}
+
+cmd_run_placeholder() {
+    echo "Batch-1/2/3 scope: 'gov run' launch orchestration is still a placeholder."
+    echo "Use tx promote/remove/rollback workflows to manage production environment state."
+    exit 3
+}
+
+cmd_help() {
+    cat <<'EOF'
+Comfy Env Governance CLI (Batch-3)
+
+Usage:
+  gov init
+  gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]
+  gov node remove <node_id> [--purge-code]
+  gov tx run <node_id> [--timeout <seconds>]
+  gov tx inspect <txid>
+  gov tx abort <txid>
+  gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]
+  gov resolve <txid>
+  gov rollback <snapshot_id>
+  gov snapshot list
+  gov snapshot inspect <snapshot_id>
+  gov status
+  gov run
+
+Notes:
+  - Rollback scope restores dependency truth + plugin registry only.
+  - Snapshot retention defaults to 50.
+  - Resolve pins are persisted in dependency-groups.overrides.
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        init)
+            shift
+            cmd_init "$@"
+            ;;
+        node)
+            shift
+            case "${1:-}" in
+                add)
+                    shift
+                    cmd_node_add "$@"
+                    ;;
+                remove)
+                    shift
+                    cmd_node_remove "$@"
+                    ;;
+                *)
+                    echo "Usage: gov node {add|remove} ..." >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        tx)
+            shift
+            case "${1:-}" in
+                run)
+                    shift
+                    cmd_tx_run "$@"
+                    ;;
+                inspect)
+                    shift
+                    cmd_tx_inspect "$@"
+                    ;;
+                abort)
+                    shift
+                    cmd_tx_abort "$@"
+                    ;;
+                promote)
+                    shift
+                    cmd_tx_promote "$@"
+                    ;;
+                *)
+                    echo "Usage: gov tx {run|inspect|abort|promote} ..." >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        resolve)
+            shift
+            cmd_resolve "$@"
+            ;;
+        rollback)
+            shift
+            cmd_rollback "$@"
+            ;;
+        snapshot)
+            shift
+            case "${1:-}" in
+                list)
+                    shift
+                    cmd_snapshot_list "$@"
+                    ;;
+                inspect)
+                    shift
+                    cmd_snapshot_inspect "$@"
+                    ;;
+                *)
+                    echo "Usage: gov snapshot {list|inspect} ..." >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        status)
+            shift
+            cmd_status "$@"
+            ;;
+        run)
+            shift
+            cmd_run_placeholder "$@"
+            ;;
+        ""|-h|--help|help)
+            cmd_help
+            ;;
+        *)
+            echo "Unknown command: $cmd" >&2
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
