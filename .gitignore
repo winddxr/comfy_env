@@ -1,0 +1,8 @@
+.vscode/
+.anget/
+.codex/
+.agents/
+.gemini/
+.cluade/
+.venv-prod/                
+.venv-candidate/ 
