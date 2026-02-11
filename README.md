@@ -27,28 +27,36 @@ ComfyUI 依赖治理系统。
 
 说明：`gov run` 仍是占位命令。
 
-## 3. 目录结构
+## 3. 目录结构（侧车模式）
 
 ```text
-comfy_env/
-├── bin/
-│   └── gov                     # 主 CLI
-├── config.toml.template        # 配置模板（跟踪）
-├── pyproject.toml.template     # 依赖模板（跟踪）
-├── config.toml                 # 本地配置（不跟踪）
-├── pyproject.toml              # 本地依赖真相（不跟踪）
-├── uv.lock                     # 本地锁文件（不跟踪）
-├── .venv-prod/                 # 生产环境
-├── .venv-candidate/            # 事务候选环境
-├── state/
-│   ├── plugins.json            # 本地插件注册表（v2，不进 Git）
-│   ├── ops/                    # 操作备份与元数据（本地）
-│   ├── transactions/           # 事务记录
-│   ├── conflicts/              # 冲突报告
-│   ├── logs/                   # 运行日志
-│   └── work/                   # 临时工作区
-└── docs/                       # 文档体系
+TopDir/
+├── ComfyUI/                    # 业务运行目录（被治理目标）
+│   ├── main.py
+│   └── custom_nodes/           # node add 的代码落地位置
+└── comfy_env/                  # 侧车治理目录
+    ├── bin/
+    │   └── gov                 # 主 CLI
+    ├── config.toml.template    # 配置模板（跟踪）
+    ├── pyproject.toml.template # 依赖模板（跟踪）
+    ├── config.toml             # 本地配置（不跟踪）
+    ├── pyproject.toml          # 本地依赖真相（不跟踪）
+    ├── uv.lock                 # 本地锁文件（不跟踪）
+    ├── .venv-prod/             # 生产环境
+    ├── .venv-candidate/        # 事务候选环境
+    ├── state/
+    │   ├── plugins.json        # 本地插件注册表（v2，不进 Git）
+    │   ├── ops/                # 操作备份与元数据（本地）
+    │   ├── transactions/       # 事务记录
+    │   ├── conflicts/          # 冲突报告
+    │   ├── logs/               # 运行日志
+    │   └── work/               # 临时工作区
+    └── docs/                   # 文档体系
 ```
+
+1. 默认工作模式是 `ComfyUI/` 与 `comfy_env/` 同级（sidecar）。
+2. `config.toml` 中 `paths.comfyui_dir` 需要指向该 `ComfyUI` 目录（例如：`/home/windy/comfy-hub/ComfyUI`）。
+3. `node add` 会把插件克隆到 `${comfyui_dir}/custom_nodes/<node_id>`。
 
 ## 4. 核心行为
 
@@ -79,11 +87,6 @@ comfy_env/
 2. `managed_deps` 是冗余缓存，权威来源始终是 `pyproject.toml` 的 group。
 3. `--purge-code` 删除插件代码后不可逆；`undo` 不恢复被 purge 的目录。
 
-## 6. Git 跟踪边界
-
-1. 跟踪：`*.template`、`*.example`、代码与文档。
-2. 不跟踪：`config.toml`、`pyproject.toml`、`uv.lock` 与 `state/*` 运行态产物。
-3. `gov init` 在 `pyproject.toml` 缺失时会自动从 `pyproject.toml.template` 生成本地文件。
 
 ## 7. 常用流程
 
