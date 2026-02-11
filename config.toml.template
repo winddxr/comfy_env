@@ -1,0 +1,27 @@
+# ComfyUI environment governance config (Batch-1)
+
+[paths]
+comfyui_dir = "/home/ComfyUI"
+
+[runtime]
+prod_env = ".venv-prod"
+candidate_root = ".venv-candidate"
+
+[tx]
+timeout_seconds = 120
+smoke_test_cmd = ""
+
+[policy]
+core_packages = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "xformers",
+    "triton",
+    "onnxruntime",
+    "onnxruntime-gpu",
+    "numpy",
+]
+
+[ops]
+retention_count = 100

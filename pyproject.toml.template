@@ -1,0 +1,10 @@
+[project]
+name = "comfy-env"
+version = "0.1.0"
+description = "Local dependency truth template for comfy_env"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+core = []
+overrides = []

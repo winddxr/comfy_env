@@ -1,28 +1,85 @@
-# 10 LLM 快速上手（5-10 分钟）
+# 10 给接手 LLM 的快速上手
 
-> 目标：让新接手的 LLM 在最短时间理解项目目的、关键机制和操作路径，避免误改。
+## 1. 先建立心智模型
 
-## 1. 先记住这三句话
+1. 依赖真相是本地文件：`pyproject.toml` 和 `uv.lock`（都不进 Git）。
+2. 仓库只分发模板/范例：`pyproject.toml.template`、`config.toml.template`、`state/plugins.json.example`。
+3. `state/plugins.json` 是本地注册表，不进入 Git，不作为跨机真相。
+4. 恢复模型是 `operation backup + undo`。
+5. `promote/remove` 前会生成 `state/ops/<op_id>/backup/`。
+6. `undo <op_id>` 不是“回到历史某时刻”，而是“撤销某次具体操作”。
 
-1. 这是一个 ComfyUI 依赖治理项目，核心是 **Candidate 事务** 和 **Promote 晋升**。
-2. 生产真相只有三类：`pyproject.toml`、`uv.lock`、`state/plugins.json`。
-3. 任何高风险动作都必须有快照前置，并支持回滚。
+## 2. 首次落地（模板到本地文件）
 
-## 2. 你正在维护什么
+```bash
+cp config.toml.template config.toml
+./bin/gov init
+```
 
-目录：`comfy_env/`  
-核心脚本：`comfy_env/bin/gov`
+说明：
 
-关键子目录：
+1. `gov init` 会在缺失时自动生成 `pyproject.toml`，来源是 `pyproject.toml.template`。
+2. `uv.lock` 不提供模板，由 `uv lock` 自动生成。
 
-1. `state/transactions/`：事务记录
-2. `state/conflicts/`：冲突报告
-3. `state/work/`：临时工作区
-4. `snapshots/`：回滚快照
+## 3. 核心目录与用途
 
-## 3. 关键工作流（最常用）
+1. `bin/gov`：主 CLI。
+2. `state/transactions/`：`tx run` 生成的事务记录。
+3. `state/ops/`：`promote/remove/undo` 操作元数据和备份。
+4. `state/conflicts/`：lock 冲突报告。
+5. `state/logs/`：命令执行日志。
 
-## 3.1 新插件接入
+## 4. 命令速查（用途 + 用法）
+
+### 4.1 环境与状态
+
+1. `./bin/gov init`
+用途：初始化布局；若 `pyproject.toml` 缺失则从 `pyproject.toml.template` 自动生成，再同步 prod 环境。
+2. `./bin/gov status`
+用途：快速看事务总量、待处理数量、最近事务。
+
+### 4.2 插件注册与移除
+
+1. `./bin/gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]`
+用途：克隆插件并写入 `state/plugins.json`。
+2. `./bin/gov node remove <node_id> [--purge-code]`
+用途：移除插件注册并做依赖 GC。
+关键点：
+3. 默认不删插件代码目录。
+4. `--purge-code` 会物理删除目录，undo 不恢复代码目录。
+
+### 4.3 事务与晋升
+
+1. `./bin/gov tx run <node_id> [--timeout <seconds>]`
+用途：在 candidate 环境运行并生成事务。
+2. `./bin/gov tx inspect <txid>`
+用途：查看事务状态、diff、日志路径。
+3. `./bin/gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
+用途：把事务结果晋升到 prod。
+关键点：
+4. 晋升时自动创建 operation backup。
+5. 失败会自动恢复 pre-op 文件并写失败状态。
+
+### 4.4 冲突处理
+
+1. `./bin/gov resolve <txid>`
+用途：输入 `pkg==version` 修复 lock 冲突，然后重试 promote。
+
+### 4.5 操作审计与撤销
+
+1. `./bin/gov op list`
+用途：列出操作记录（`kind/status/ref/undoable`）。
+2. `./bin/gov op inspect <op_id>`
+用途：查看操作详情（哈希、backup 路径、note）。
+3. `./bin/gov undo <op_id>`
+用途：撤销指定成功操作。
+阻断条件：
+4. 目标 op 不是 `success + undoable=true`。
+5. 当前文件哈希与目标 op 的 `post_sha256` 不一致。
+
+## 5. 推荐工作流（标准路径）
+
+### 5.1 新插件接入
 
 ```bash
 ./bin/gov node add <git_url> [--id <node_id>]
@@ -31,76 +88,54 @@
 ./bin/gov tx promote <txid>
 ```
 
-若 promote 冲突：
+成功判定：
+
+1. `tx inspect` 显示 `status: promoted`。
+2. promote 输出含 `op_id`。
+
+### 5.2 冲突修复
 
 ```bash
 ./bin/gov resolve <txid>
 ./bin/gov tx promote <txid>
 ```
 
-## 3.2 卸载插件
+成功判定：
+
+1. `resolve` 输出 `status: resolved`。
+2. 重新 promote 成功并产出 `op_id`。
+
+### 5.3 卸载与撤销
 
 ```bash
 ./bin/gov node remove <node_id>
-# 或删除插件代码目录
-./bin/gov node remove <node_id> --purge-code
+./bin/gov op list
+./bin/gov undo <remove_op_id>
 ```
 
-## 3.3 回滚恢复
+成功判定：
 
-```bash
-./bin/gov snapshot list
-./bin/gov rollback <snapshot_id>
-```
+1. remove 输出 `op_id` 且对应 op `status=success`。
+2. undo 后目标 remove op 变 `status=undone`。
 
-## 4. 你必须遵守的规则
+## 6. 输出字段怎么读
 
-1. 不要直接手改 `state/transactions/*.json`。
-2. 不要绕过 `gov` 直接把试验依赖写进 root 真相文件。
-3. 变更 `gov` 行为时，必须同步更新文档：
-   1. `docs/04_cli_reference.md`
-   2. `docs/05_data_contracts.md`
-   3. `docs/07_test_strategy_and_acceptance.md`
+1. `txid`：事务 ID，对应 `state/transactions/<txid>.json`。
+2. `op_id`：操作 ID，对应 `state/ops/<op_id>/meta.json`。
+3. `promotion.op_id`：某次事务晋升关联的操作 ID。
+4. `undoable`：该 op 当前是否允许执行 undo。
+5. `note`：失败原因或撤销说明。
 
-## 5. 状态机速记
+## 7. 常见失败与处理
 
-常见事务状态：
+1. `tx run` 失败：看 `state/logs/<txid>.stderr.log`。
+2. `tx promote` 失败：先看 `state/conflicts/`，再看 `op inspect <op_id>` 的 `note`。
+3. `node remove` 失败：看 `state/logs/remove-<node_id>.lock.log`。
+4. `undo` 失败且提示 `target operation is not undoable`：说明目标 op 不可撤销，换可撤销 op。
+5. `undo` 失败且提示哈希不一致：当前状态已偏离，先定位后再决定是否继续。
 
-1. `running`
-2. `completed`
-3. `failed`
-4. `needs_resolution`
-5. `resolved`
-6. `promoted`
-7. `promote_failed`
-8. `aborted`
+## 8. 接手时最小核查清单
 
-典型流转：
-
-1. `running -> completed|failed`
-2. `completed -> promoted|needs_resolution`
-3. `needs_resolution -> resolved -> promoted`
-
-## 6. 快速排错路径
-
-1. 先看 `gov` 命令退出码和 stderr。
-2. 再看：
-   1. `state/logs/`
-   2. `state/conflicts/<txid>.json`
-   3. `state/transactions/<txid>.json`
-3. 异常无法快速修复时，优先 `rollback` 到最近稳定 snapshot。
-
-## 7. 最小阅读清单（按优先级）
-
-1. `docs/comfy_env_dev_test_guide.md`（总纲）
-2. `docs/02_architecture_and_mechanisms.md`（机制）
-3. `docs/04_cli_reference.md`（命令）
-4. `docs/05_data_contracts.md`（数据）
-5. `docs/07_test_strategy_and_acceptance.md`（验收）
-
-## 8. 交付前自检（给 LLM）
-
-1. 你改动的命令，`cmd_help` 是否同步更新？
-2. 新增/变更字段，`05_data_contracts.md` 是否同步？
-3. 是否给出至少 1 个成功路径和 1 个失败恢复路径验证步骤？
-4. 是否确认回滚链路没有被破坏？
+1. `./bin/gov help` 包含 `op list/op inspect/undo`。
+2. `docs/04_cli_reference.md` 与 `docs/05_data_contracts.md` 与实现一致。
+3. `.gitignore` 已忽略 `config.toml`、`pyproject.toml`、`uv.lock`、`state/plugins.json` 与运行态目录。

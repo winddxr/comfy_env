@@ -1,31 +1,19 @@
 # 09 发布检查清单
 
-## 1. 文档一致性
+## 1. 功能回归
 
-1. 总纲链接全部可访问。
-2. `04_cli_reference.md` 与 `bin/gov` 命令一致。
-3. `05_data_contracts.md` 与当前 JSON 字段一致。
+1. `init`、`status`、`node add/remove` 可用。
+2. `tx run/inspect/abort/promote/resolve` 链路可用。
+3. `op list/inspect` 与 `undo` 可用。
 
-## 2. 功能验收
+## 2. 关键恢复能力
 
-1. Batch-1 回归通过。
-2. Batch-2 冲突/晋升链路通过。
-3. Batch-3 卸载/回滚链路通过。
-4. Snapshot retention 验证通过。
+1. promote/remove 失败可自动恢复 pre-op。
+2. undo 哈希校验与阻断逻辑正确。
+3. `--purge-code` 场景说明清晰且行为符合不可逆约束。
 
-## 3. 故障恢复验证
+## 3. 契约同步
 
-1. Promote 失败可自动恢复。
-2. Rollback 失败可恢复 rollback_pre。
-
-## 4. 发布前操作
-
-1. 记录版本号与变更摘要。
-2. 保存关键验收日志。
-3. 确认没有未文档化的行为改动。
-
-## 5. 发布后观察
-
-1. 关注冲突率（needs_resolution 次数）。
-2. 关注回滚成功率。
-3. 关注误删依赖/误保留依赖问题。
+1. `docs/04_cli_reference.md` 与实现一致。
+2. `docs/05_data_contracts.md` 与 JSON 字段一致。
+3. `.gitignore` 不跟踪本地真相（`config.toml`、`pyproject.toml`、`uv.lock`）和运行状态。

@@ -7,3 +7,18 @@
 .venv-prod/                
 .venv-candidate/ 
 config.toml
+pyproject.toml
+uv.lock
+
+# local runtime directories
+cache/
+snapshots/
+state/ops/
+state/transactions/
+state/conflicts/
+state/logs/
+state/work/
+
+# local runtime files (not truth layer)
+state/plugins.json
+state/snapshots_index.json

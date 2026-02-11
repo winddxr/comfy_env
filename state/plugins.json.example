@@ -1,0 +1,15 @@
+[
+  {
+    "id": "example_node",
+    "git_url": "https://github.com/example/comfyui-example-node.git",
+    "ref": "main",
+    "install_relpath": "custom_nodes/example_node",
+    "group": "node-example-node",
+    "managed_deps": [
+      "requests==2.32.3"
+    ],
+    "enabled": true,
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:00:00Z"
+  }
+]
