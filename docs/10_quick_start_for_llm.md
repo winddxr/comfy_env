@@ -77,6 +77,13 @@ cp config.toml.template config.toml
 4. 目标 op 不是 `success + undoable=true`。
 5. 当前文件哈希与目标 op 的 `post_sha256` 不一致。
 
+### 4.6 生产启动与停止
+
+1. `./bin/gov run [--sync] [-- <args...>]`
+用途：在 `.venv-prod` 环境中启动 ComfyUI，`--sync` 在启动前尝试强制同步依赖；`--` 后透传 ComfyUI 启动参数。
+2. `./bin/gov stop`
+用途：优雅关闭由 `gov run` 启动的当前运行中的 ComfyUI。
+
 ## 5. 推荐工作流（标准路径）
 
 ### 5.1 新插件接入
@@ -117,6 +124,17 @@ cp config.toml.template config.toml
 
 1. remove 输出 `op_id` 且对应 op `status=success`。
 2. undo 后目标 remove op 变 `status=undone`。
+
+### 5.4 生产启动日志与维护
+
+```bash
+./bin/gov run -- --listen 0.0.0.0 --port 8188 > comfy.log 2>&1 &
+./bin/gov stop
+```
+
+说明：
+1. `gov run` 会在 `state/comfyui.pid` 写进程号。
+2. `gov run` 自身通过 `exec` 替换为 ComfyUI 进程。
 
 ## 6. 输出字段怎么读
 

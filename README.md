@@ -24,8 +24,8 @@ ComfyUI 依赖治理系统。
 10. `./bin/gov op list`
 11. `./bin/gov op inspect <op_id>`
 12. `./bin/gov undo <op_id>`
-
-说明：`gov run` 仍是占位命令。
+13. `./bin/gov run [--sync] [-- <args...>]`
+14. `./bin/gov stop`
 
 ## 3. 目录结构（侧车模式）
 

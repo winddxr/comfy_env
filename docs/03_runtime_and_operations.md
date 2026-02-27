@@ -43,7 +43,19 @@
 ./bin/gov undo <op_id>
 ```
 
-## 5. 运行约束
+## 5. 生产启动与停止
+
+```bash
+./bin/gov run [--sync] [-- <comfyui_args...>]
+./bin/gov stop
+```
+
+说明：
+1. `gov run` 使用 `.venv-prod` 环境启动 ComfyUI。
+2. `--sync` 可选，确保启动前强制做一次依赖同步。
+3. `--` 后的所有参数均透传给 ComfyUI 本身，例如：`./bin/gov run -- --listen 0.0.0.0 --port 8188`。
+
+## 6. 运行约束
 
 1. `undo` 需要哈希一致性，不满足会阻断。
 2. `plugins.json` 为本地状态，不应作为跨环境真相。

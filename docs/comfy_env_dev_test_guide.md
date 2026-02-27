@@ -18,6 +18,7 @@
 4. `resolve`
 5. `op list/inspect`
 6. `undo`
+7. `run`, `stop`
 
 ## 3. 测试重点
 

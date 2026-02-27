@@ -25,3 +25,7 @@ core_packages = [
 
 [ops]
 retention_count = 100
+
+[run]
+extra_args = ""
+sync_before_run = false

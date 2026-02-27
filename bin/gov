@@ -16,6 +16,7 @@ PROJECT_FILE="${ROOT_DIR}/pyproject.toml"
 PROJECT_TEMPLATE_FILE="${ROOT_DIR}/pyproject.toml.template"
 LOCK_FILE="${ROOT_DIR}/uv.lock"
 PLUGINS_FILE="${STATE_DIR}/plugins.json"
+PID_FILE="${STATE_DIR}/comfyui.pid"
 
 TX_FILE=""
 
@@ -1986,10 +1987,117 @@ else:
 PY
 }
 
-cmd_run_placeholder() {
-    echo "Batch-1/2/3 scope: 'gov run' launch orchestration is still a placeholder."
-    echo "Use tx promote/remove/undo workflows to manage production environment state."
-    exit 3
+cmd_run() {
+    ensure_layout
+
+    local sync_before=false
+    local comfyui_args=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sync)
+                sync_before=true
+                shift
+                ;;
+            --)
+                shift
+                comfyui_args=("$@")
+                break
+                ;;
+            *)
+                comfyui_args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    local cfg_sync
+    cfg_sync="$(config_get "run.sync_before_run" "false")"
+    if [ "$cfg_sync" = "true" ]; then
+        sync_before=true
+    fi
+
+    local prod_env comfyui_dir main_py
+    prod_env="$(prod_env_path)"
+    comfyui_dir="$(comfyui_dir_path)"
+    main_py="${comfyui_dir}/main.py"
+
+    if [ ! -d "$prod_env" ]; then
+        echo "ERROR: prod environment not found: $prod_env" >&2
+        echo "Hint: run 'gov init' to create the production environment." >&2
+        exit 1
+    fi
+
+    if [ ! -f "$LOCK_FILE" ]; then
+        echo "ERROR: uv.lock not found. Run 'gov init' first." >&2
+        exit 1
+    fi
+
+    if [ ! -f "$main_py" ]; then
+        echo "ERROR: ComfyUI entry not found: $main_py" >&2
+        exit 1
+    fi
+
+    if [ "$sync_before" = true ]; then
+        require_cmd uv
+        echo "Syncing prod environment..."
+        UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups
+    fi
+
+    local extra_args
+    extra_args="$(config_get "run.extra_args" "")"
+
+    echo "$$" > "$PID_FILE"
+
+    echo "Starting ComfyUI with prod environment..."
+    echo "  python: $prod_env/bin/python"
+    echo "  entry:  $main_py"
+    echo "  pid:    $$"
+
+    if [ ${#comfyui_args[@]} -gt 0 ]; then
+        exec "$prod_env/bin/python" "$main_py" "${comfyui_args[@]}"
+    elif [ -n "$extra_args" ]; then
+        # Word splitting on purpose to pass args
+        # shellcheck disable=SC2086
+        exec "$prod_env/bin/python" "$main_py" $extra_args
+    else
+        exec "$prod_env/bin/python" "$main_py"
+    fi
+}
+
+cmd_stop() {
+    if [ ! -f "$PID_FILE" ]; then
+        echo "ERROR: PID file not found: $PID_FILE" >&2
+        echo "ComfyUI might not be running via 'gov run'." >&2
+        exit 1
+    fi
+
+    local pid
+    pid="$(cat "$PID_FILE")"
+    
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "Process $pid is not running. Cleaning up stale PID file."
+        rm -f "$PID_FILE"
+        exit 0
+    fi
+
+    echo "Stopping ComfyUI (PID: $pid)..."
+    kill -TERM "$pid"
+
+    local wait_time=0
+    local max_wait=30
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        wait_time=$((wait_time + 1))
+        if [ "$wait_time" -ge "$max_wait" ]; then
+            echo "Timeout reached. Force killing process $pid..."
+            kill -KILL "$pid" 2>/dev/null || true
+            break
+        fi
+    done
+
+    rm -f "$PID_FILE"
+    echo "ComfyUI stopped."
 }
 
 cmd_help() {
@@ -2009,7 +2117,8 @@ Usage:
   gov op list
   gov op inspect <op_id>
   gov status
-  gov run
+  gov run [--sync] [-- <args...>]
+  gov stop
 
 Notes:
   - Operation backups are stored in state/ops/<op_id>/backup.
@@ -2099,7 +2208,11 @@ main() {
             ;;
         run)
             shift
-            cmd_run_placeholder "$@"
+            cmd_run "$@"
+            ;;
+        stop)
+            shift
+            cmd_stop "$@"
             ;;
         ""|-h|--help|help)
             cmd_help

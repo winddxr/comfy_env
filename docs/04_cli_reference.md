@@ -77,11 +77,28 @@
 2. 当前 `pyproject.toml`、`uv.lock`、`state/plugins.json` 的哈希必须匹配目标 op 的 `post_sha256`。
 3. 不匹配则阻断，避免覆盖已漂移状态。
 
-## 6. 占位命令
+## 6. 启动与停止
 
-### `gov run`
+### `gov run [--sync] [-- <args...>]`
 
-当前为占位：返回非 0 并提示未完成启动编排。
+用途：在 prod 环境（`.venv-prod`）启动 ComfyUI（会使用 `exec` 替换进程）。
+关键行为：
+
+1. 启动前必须有可用的 `.venv-prod` 和 `uv.lock`。
+2. 包含 `--sync` 时在启动前执行 exact sync 同步。
+3. `--` 后的所有参数原样传给 `ComfyUI/main.py`。
+4. 在 `state/comfyui.pid` 写入当前启动进程号。
+5. 可以通过 `config.toml` 下的 `[run]` 节定义默认 `extra_args` 或 `sync_before_run`。
+
+### `gov stop`
+
+用途：停止由 `gov run` 启动的 ComfyUI。
+关键行为：
+
+1. 读取 `state/comfyui.pid` 并检查进程状态。
+2. 发送 `SIGTERM` 信号。
+3. 等待至多 30 秒，如果进程不退出则发送 `SIGKILL` 信号。
+4. 清理 `state/comfyui.pid` 文件。
 
 ## 7. 错误处理约定
 
