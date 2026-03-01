@@ -2,7 +2,8 @@
 
 ComfyUI 依赖治理系统。
 它通过 `Candidate 事务 -> Promote 晋升 -> Operation 备份/Undo 撤销` 机制，把插件依赖变更从“直接污染生产环境”改成“先观察、再决定、可恢复”。
-
+## 0. 如果你是AI
+1.如果你正在进行开发：请阅读'dev-docs/architecture-haiku.md'作为唯一入口
 ## 1. 项目目标
 
 1. 可复现：本地 `pyproject.toml + uv.lock` 可重建依赖环境。
