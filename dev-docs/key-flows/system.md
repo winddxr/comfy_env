@@ -1,0 +1,66 @@
+# System Key Flows
+
+## Metadata
+
+- Status: Active
+- Last Reviewed: 2026-03-01
+
+## Hero Flow
+
+- Hero flow: onboard one plugin safely into production.
+  - Register source with `node add`.
+  - Observe dependency effect in a candidate transaction with `tx run`.
+  - Inspect diff and core impact with `tx inspect`.
+  - Promote into local truth and `.venv-prod` with `tx promote`.
+
+## SKF List
+
+- SKF-001: Plugin onboarding to production
+- SKF-002: Conflict-driven re-promotion
+- SKF-003: Reversible removal and undo
+
+## SKF Details
+
+### SKF-001
+
+- Module Boundaries:
+  - Application Core -> Source Integration -> State Ledger -> Dependency Sync -> Runtime Executor -> Safety Guards
+- Key Contracts:
+  - CLI command contract
+  - Transaction record contract
+  - Operation backup contract
+- Failure & Recovery Posture:
+  - `tx run` may end `failed` but still records diff.
+  - `tx promote` blocks on core impact unless approved.
+  - Failed prod sync or smoke restores pre-op files before exit.
+
+### SKF-002
+
+- Module Boundaries:
+  - Application Core -> Dependency Sync -> State Ledger -> Safety Guards
+- Key Contracts:
+  - Conflict report contract
+  - Resolution pin contract
+- Failure & Recovery Posture:
+  - Promote lock failure writes `state/conflicts/<txid>.json` and moves transaction to `needs_resolution`.
+  - `resolve` merges new pins, retries workdir lock, and either marks `resolved` or re-emits conflict state.
+
+### SKF-003
+
+- Module Boundaries:
+  - Application Core -> State Ledger -> Dependency Sync -> Safety Guards -> Source Integration
+- Key Contracts:
+  - Operation metadata contract
+  - Undo hash guard contract
+- Failure & Recovery Posture:
+  - `node remove` always starts with an op backup.
+  - `undo` refuses to run if current local truth hashes do not match the target op's post hashes.
+  - `--purge-code` deletes source trees outside the undoable contract.
+
+## Integration Contracts
+
+| Contract | Owner Module | Consumer Module | Link |
+|---|---|---|---|
+| CLI command contract | Application Core | Local operator | [application-core/contracts.md](../application-core/contracts.md) |
+| Transaction and operation records | State Ledger | Application Core, Safety Guards | [state-ledger/contracts.md](../subsystems/state-ledger/contracts.md) |
+| Shared IDs and statuses | Shared docs | All modules | [shared-types.md](../contracts/shared-types.md) |
