@@ -7,22 +7,23 @@
 
 ## Scope & Boundary
 
-The application core is the single CLI entrypoint in `bin/gov`. It parses commands, validates user input, sequences subsystems, and decides when to persist state, block unsafe actions, or exit with errors. It owns the surface decomposition S1-S6:
+The application core is the single CLI entrypoint in `bin/gov`. It parses commands, validates user input, sequences subsystems, and decides when to persist state, block unsafe actions, or exit with errors. It now owns seven user-visible surfaces:
 
-- S1 Environment and state: `init`, `status`
-- S2 Node lifecycle: `node add`, `node remove`
-- S3 Transaction execution: `tx run`, `tx inspect`, `tx abort`
-- S4 Promotion and conflict handling: `tx promote`, `resolve`
-- S5 Audit and reversal: `op list`, `op inspect`, `undo`
-- S6 Runtime orchestration entrypoint: `run`, `stop`
+- S1 Environment bootstrap: `init`
+- S2 Managed dependency install: `install`, `install torch`, `status`
+- S3 Node lifecycle: `node add`, `node remove`
+- S4 Plugin transaction execution: `tx run`, `tx inspect`, `tx abort`
+- S5 Promotion and conflict handling: `tx promote`, `resolve`, `update promote`, `update resolve`
+- S6 Core dependency update transactions: `update run`, `update inspect`, `update abort`
+- S7 Audit, reversal, and runtime control: `op list`, `op inspect`, `undo`, `run`, `stop`
 
 It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns.
 
 ## Domain Model
 
 - Command Session: one CLI invocation routed by `main()`.
-- Use Case: a single command family plus its guarded recovery path.
-- Transaction Intent: a plugin-specific candidate observation and later promotion candidate.
+- Plugin Transaction Intent: a plugin-specific candidate observation and later promotion candidate.
+- Core Update Transaction Intent: a staged `requirements.txt`-driven candidate snapshot for ComfyUI base dependencies.
 - Operation Intent: a backup-protected destructive mutation.
 - Runtime Session: a foreground ComfyUI process launched from `.venv-prod`.
 
@@ -31,33 +32,48 @@ It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns
 - `UC-001` Manage plugin through transaction: add source, run candidate, inspect, promote, and optionally resolve conflicts.
 - `UC-002` Remove plugin with reversible state: remove dependency group, resync prod, optionally purge code, preserve undoable state.
 - `UC-003` Undo successful operation: validate hashes, restore backup, resync prod, mark prior op as undone.
-- `UC-004` Initialize local governance state: create layout, seed local `pyproject.toml`, lock, sync prod.
-- `UC-005` Inspect local governance state: summarize env existence and pending transactions.
+- `UC-004` Initialize local governance state: create layout, write config, seed local `pyproject.toml`, lock, sync prod.
+- `UC-005` Inspect local governance state: summarize config readiness, env readiness, and pending transactions.
 - `UC-006` Run and stop production ComfyUI: optionally sync, exec foreground process, stop through PID file.
+- `UC-007` Bootstrap local runtime prerequisites: persist `paths.comfyui_dir` and `runtime.python`.
+- `UC-008` Install managed runtime dependencies: install torch first, then import ComfyUI `requirements.txt` into dependency truth.
+- `UC-009` Transactional update of ComfyUI core requirements: stage new `requirements.txt`, observe candidate, resolve conflicts, promote, and allow undo.
 
 ## Key Flows & Failure Recovery
 
 - `core#KF-001` Bootstrap local state
   - Trigger: `cmd_init`.
-  - Success: ensure layout, seed `pyproject.toml` if needed, `uv lock`, exact sync into prod env.
-  - Failure: missing `uv` or templates exits before partial runtime state is considered valid.
-- `core#KF-002` Register or remove plugin node
+  - Success: ensure layout, update `config.toml`, seed `pyproject.toml` if needed, `uv lock`, exact sync into prod env.
+  - Failure: missing required init flags or missing tools exits before partial runtime state is considered valid.
+- `core#KF-002` Install managed torch runtime
+  - Trigger: `cmd_install_torch`.
+  - Success: stage `dependency-groups.torch`, copy truth to root, sync prod, run torch import smoke test, record undoable op.
+  - Failure: sync or smoke failure restores pre-op truth.
+- `core#KF-003` Install managed core requirements
+  - Trigger: `cmd_install_core`.
+  - Success: read `requirements.txt`, stage `dependency-groups.core`, sync prod, smoke test, record undoable op.
+  - Failure: sync or smoke failure restores pre-op truth.
+- `core#KF-004` Register or remove plugin node
   - Trigger: `cmd_node_add`, `cmd_node_remove`.
   - Success: clone/register metadata, or remove group-backed dependencies and registry record.
   - Failure: remove path restores from op backup before returning.
-- `core#KF-003` Record transaction
+- `core#KF-005` Record plugin transaction
   - Trigger: `cmd_tx_run`.
-  - Success: materialize candidate env, freeze pre/post package sets, run ComfyUI, write transaction JSON.
+  - Success: materialize candidate env, freeze pre/post package sets, run ComfyUI, write plugin transaction JSON.
   - Failure: runtime failure still yields a persisted transaction with `status=failed`.
-- `core#KF-004` Resolve or abort transaction
-  - Trigger: `cmd_tx_abort`, `cmd_resolve`.
-  - Success: abort removes candidate env and marks `aborted`; resolve merges pins and retries lock.
-  - Failure: unresolved lock leaves transaction in `needs_resolution` with a fresh conflict report.
-- `core#KF-005` Promote guarded diff
-  - Trigger: `cmd_tx_promote`.
-  - Success: validate status, enforce core-impact approval, create backup, apply plan in workdir, sync prod, smoke test, finalize operation and transaction.
+- `core#KF-006` Record core update transaction
+  - Trigger: `cmd_update_run`.
+  - Success: stage a workdir from `requirements.txt`, materialize candidate env, freeze prod vs candidate, run ComfyUI, write `kind=core_update` transaction JSON.
+  - Failure: lock conflicts write a conflict report and `needs_resolution`; candidate sync or runtime failures still persist the transaction.
+- `core#KF-007` Resolve or abort transaction
+  - Trigger: `cmd_tx_abort`, `cmd_resolve`, `cmd_update_abort`, `cmd_update_resolve`.
+  - Success: abort removes candidate artifacts; resolve merges pins and retries lock.
+  - Failure: unresolved lock leaves the transaction in `needs_resolution` with a fresh conflict report.
+- `core#KF-008` Promote guarded diff
+  - Trigger: `cmd_tx_promote`, `cmd_update_promote`.
+  - Success: validate status, enforce core-impact approval, create backup, sync prod, smoke test, finalize operation and transaction.
   - Failure: any lock, sync, or smoke failure restores pre-op truth and marks the transaction with explicit promote failure state.
-- `core#KF-006` Start or stop runtime
+- `core#KF-009` Start or stop runtime
   - Trigger: `cmd_run`, `cmd_stop`.
   - Success: optionally sync prod, write PID, `exec` ComfyUI, later stop via TERM then KILL fallback.
   - Failure: missing env, lock, entrypoint, or PID are explicit command errors.
@@ -71,46 +87,36 @@ It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns
 
 ## State & Lifecycle
 
-- Command sessions are ephemeral and end with process exit.
-- Transactions follow the ledger lifecycle: `running -> completed|failed -> promoted|needs_resolution|resolved|promote_failed`, with `aborted` as explicit termination.
+- Plugin transactions follow: `running -> completed|failed -> promoted|needs_resolution|resolved|promote_failed`, with `aborted` as explicit termination.
+- Core update transactions use the same status family but are distinguished by `kind=core_update`.
 - Operations follow: `running -> success|failed -> undone` for the original op when an undo succeeds.
 - Runtime PID lifecycle is `absent -> running -> stale|removed`.
 
 ## Error Boundary
 
 - Domain/Application errors:
-  - bad command shape, missing IDs, invalid transaction state, missing plugin metadata, missing PID
+  - bad command shape, missing IDs, missing required init flags, invalid transaction kind/state, missing plugin metadata, missing staged workdir, missing PID
 - Infrastructure errors:
   - `uv` non-zero exit, `git` clone failure, missing `main.py`, smoke failure, process timeout
 - Translation rule:
   - infrastructure failures become command failure plus state mutation only when recovery is explicitly completed or a durable artifact is written
 
-## Dependencies
-
-- Allowed:
-  - `bin/gov` shell logic
-  - State Ledger helpers
-  - Safety Guard helpers
-  - `uv`, `git`, shell utilities, Python snippets
-- Forbidden:
-  - Assuming plugin source tree content is authoritative dependency truth
-  - Skipping backup/restore on destructive flows
-
 ## Code Anchors
 
 | Doc ID | path | symbol | line |
 |---|---|---|---|
-| UC-004 | `bin/gov` | `cmd_init` | 1258 |
-| UC-005 | `bin/gov` | `cmd_status` | 1944 |
-| UC-001 | `bin/gov` | `cmd_node_add` | 1276 |
-| UC-002 | `bin/gov` | `cmd_node_remove` | 1369 |
-| UC-001 | `bin/gov` | `cmd_tx_run` | 1484 |
-| UC-001 | `bin/gov` | `cmd_tx_promote` | 1772 |
-| UC-001 | `bin/gov` | `cmd_resolve` | 1634 |
-| UC-003 | `bin/gov` | `cmd_undo` | 1079 |
-| UC-006 | `bin/gov` | `cmd_run` | 1990 |
-| UC-006 | `bin/gov` | `cmd_stop` | 2068 |
-| ROUTE-001 | `bin/gov` | `main` | 2131 |
+| UC-004 | `bin/gov` | `cmd_init` | 1765 |
+| UC-008 | `bin/gov` | `cmd_install_torch` | 2484 |
+| UC-008 | `bin/gov` | `cmd_install_core` | 2554 |
+| UC-009 | `bin/gov` | `cmd_update_run` | 2644 |
+| UC-009 | `bin/gov` | `cmd_update_promote` | 2959 |
+| UC-005 | `bin/gov` | `cmd_status` | 3100 |
+| UC-001 | `bin/gov` | `cmd_node_add` | 1807 |
+| UC-002 | `bin/gov` | `cmd_node_remove` | 1900 |
+| UC-001 | `bin/gov` | `cmd_tx_run` | 2017 |
+| UC-001 | `bin/gov` | `cmd_tx_promote` | 2309 |
+| UC-006 | `bin/gov` | `cmd_run` | 3201 |
+| ROUTE-001 | `bin/gov` | `main` | 3350 |
 
 ## Internal Contracts
 

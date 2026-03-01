@@ -1,9 +1,10 @@
-# ComfyUI environment governance config (Batch-1)
+# ComfyUI environment governance config (Batch-4)
 
 [paths]
 comfyui_dir = "/home/ComfyUI"
 
 [runtime]
+python = "3.12"
 prod_env = ".venv-prod"
 candidate_root = ".venv-candidate"
 

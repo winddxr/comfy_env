@@ -2,158 +2,96 @@
 
 ## 1. 先建立心智模型
 
-1. 依赖真相是本地文件：`pyproject.toml` 和 `uv.lock`（都不进 Git）。
-2. 仓库只分发模板/范例：`pyproject.toml.template`、`config.toml.template`、`state/plugins.json.example`。
-3. `state/plugins.json` 是本地注册表，不进入 Git，不作为跨机真相。
-4. 恢复模型是 `operation backup + undo`。
-5. `promote/remove` 前会生成 `state/ops/<op_id>/backup/`。
-6. `undo <op_id>` 不是“回到历史某时刻”，而是“撤销某次具体操作”。
+1. 依赖真相是本地文件：`pyproject.toml` 和 `uv.lock`。
+2. `config.toml` 现在还承载运行前置条件：`paths.comfyui_dir` 与 `runtime.python`。
+3. `dependency-groups.torch` 和 `dependency-groups.core` 分别治理 torch 与 ComfyUI 基础依赖。
+4. 插件事务和核心依赖升级事务共用 `state/transactions/`，但通过 `kind` 区分。
+5. 破坏性变更仍然依赖 `operation backup + undo`。
 
-## 2. 首次落地（模板到本地文件）
+## 2. 首次落地（新的最小顺序）
 
 ```bash
-cp config.toml.template config.toml
-./bin/gov init
+./bin/gov init --comfyui-dir /abs/path/to/ComfyUI --python 3.12
+./bin/gov install torch --index-url https://download.pytorch.org/whl/cu130
+./bin/gov install
 ```
 
 说明：
 
-1. `gov init` 会在缺失时自动生成 `pyproject.toml`，来源是 `pyproject.toml.template`。
-2. `uv.lock` 不提供模板，由 `uv lock` 自动生成。
+1. `init` 首次执行时必须显式传 `--comfyui-dir` 和 `--python`。
+2. `install torch` 必须先于 `install`。
+3. `install` 默认读取 `${comfyui_dir}/requirements.txt`。
 
 ## 3. 核心目录与用途
 
 1. `bin/gov`：主 CLI。
-2. `state/transactions/`：`tx run` 生成的事务记录。
-3. `state/ops/`：`promote/remove/undo` 操作元数据和备份。
+2. `state/transactions/`：插件事务和 `kind=core_update` 核心升级事务。
+3. `state/ops/`：`install/install torch/promote/remove/update promote/undo` 的操作元数据与备份。
 4. `state/conflicts/`：lock 冲突报告。
-5. `state/logs/`：命令执行日志。
+5. `state/work/`：staged workdir。
 
-## 4. 命令速查（用途 + 用法）
+## 4. 命令速查
 
-### 4.1 环境与状态
+### 4.1 环境与首装
 
-1. `./bin/gov init`
-用途：初始化布局；若 `pyproject.toml` 缺失则从 `pyproject.toml.template` 自动生成，再同步 prod 环境。
-2. `./bin/gov status`
-用途：快速看事务总量、待处理数量、最近事务。
+1. `./bin/gov init --comfyui-dir <abs-path> --python <python-spec>`
+2. `./bin/gov install torch --index-url <url>`
+3. `./bin/gov install [--requirements-file <path>]`
 
-### 4.2 插件注册与移除
+### 4.2 核心依赖升级事务
 
-1. `./bin/gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]`
-用途：克隆插件并写入 `state/plugins.json`。
-2. `./bin/gov node remove <node_id> [--purge-code]`
-用途：移除插件注册并做依赖 GC。
-关键点：
-3. 默认不删插件代码目录。
-4. `--purge-code` 会物理删除目录，undo 不恢复代码目录。
+1. `./bin/gov update run [--requirements-file <path>] [--timeout <seconds>]`
+2. `./bin/gov update inspect <txid>`
+3. `./bin/gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]`
+4. `./bin/gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
+5. `./bin/gov update abort <txid>`
 
-### 4.3 事务与晋升
+### 4.3 插件治理（保持原有路径）
 
-1. `./bin/gov tx run <node_id> [--timeout <seconds>]`
-用途：在 candidate 环境运行并生成事务。
-2. `./bin/gov tx inspect <txid>`
-用途：查看事务状态、diff、日志路径。
-3. `./bin/gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
-用途：把事务结果晋升到 prod。
-关键点：
-4. 晋升时自动创建 operation backup。
-5. 失败会自动恢复 pre-op 文件并写失败状态。
+1. `./bin/gov node add <git_url> [--id <node_id>]`
+2. `./bin/gov tx run <node_id>`
+3. `./bin/gov tx inspect <txid>`
+4. `./bin/gov tx promote <txid>`
+5. `./bin/gov resolve <txid>`
 
-### 4.4 冲突处理
+### 4.4 审计与运行
 
-1. `./bin/gov resolve <txid>`
-用途：输入 `pkg==version` 修复 lock 冲突，然后重试 promote。
+1. `./bin/gov status`
+2. `./bin/gov op list`
+3. `./bin/gov op inspect <op_id>`
+4. `./bin/gov undo <op_id>`
+5. `./bin/gov run [--sync] [-- <args...>]`
+6. `./bin/gov stop`
 
-### 4.5 操作审计与撤销
+## 5. 推荐工作流
 
-1. `./bin/gov op list`
-用途：列出操作记录（`kind/status/ref/undoable`）。
-2. `./bin/gov op inspect <op_id>`
-用途：查看操作详情（哈希、backup 路径、note）。
-3. `./bin/gov undo <op_id>`
-用途：撤销指定成功操作。
-阻断条件：
-4. 目标 op 不是 `success + undoable=true`。
-5. 当前文件哈希与目标 op 的 `post_sha256` 不一致。
+### 5.1 首次安装
 
-### 4.6 生产启动与停止
+```bash
+./bin/gov init --comfyui-dir /abs/path/to/ComfyUI --python 3.12
+./bin/gov install torch --index-url https://download.pytorch.org/whl/cu130
+./bin/gov install
+```
 
-1. `./bin/gov run [--sync] [-- <args...>]`
-用途：在 `.venv-prod` 环境中启动 ComfyUI，`--sync` 在启动前尝试强制同步依赖；`--` 后透传 ComfyUI 启动参数。
-2. `./bin/gov stop`
-用途：优雅关闭由 `gov run` 启动的当前运行中的 ComfyUI。
+### 5.2 核心依赖升级
 
-## 5. 推荐工作流（标准路径）
+```bash
+./bin/gov update run
+./bin/gov update inspect <txid>
+./bin/gov update resolve <txid> --pin pkg==1.2.3
+./bin/gov update promote <txid>
+```
 
-### 5.1 新插件接入
+### 5.3 插件接入
 
 ```bash
 ./bin/gov node add <git_url> [--id <node_id>]
 ./bin/gov tx run <node_id>
-./bin/gov tx inspect <txid>
 ./bin/gov tx promote <txid>
 ```
 
-成功判定：
+## 6. 接手时最小核查清单
 
-1. `tx inspect` 显示 `status: promoted`。
-2. promote 输出含 `op_id`。
-
-### 5.2 冲突修复
-
-```bash
-./bin/gov resolve <txid>
-./bin/gov tx promote <txid>
-```
-
-成功判定：
-
-1. `resolve` 输出 `status: resolved`。
-2. 重新 promote 成功并产出 `op_id`。
-
-### 5.3 卸载与撤销
-
-```bash
-./bin/gov node remove <node_id>
-./bin/gov op list
-./bin/gov undo <remove_op_id>
-```
-
-成功判定：
-
-1. remove 输出 `op_id` 且对应 op `status=success`。
-2. undo 后目标 remove op 变 `status=undone`。
-
-### 5.4 生产启动日志与维护
-
-```bash
-./bin/gov run -- --listen 0.0.0.0 --port 8188 > comfy.log 2>&1 &
-./bin/gov stop
-```
-
-说明：
-1. `gov run` 会在 `state/comfyui.pid` 写进程号。
-2. `gov run` 自身通过 `exec` 替换为 ComfyUI 进程。
-
-## 6. 输出字段怎么读
-
-1. `txid`：事务 ID，对应 `state/transactions/<txid>.json`。
-2. `op_id`：操作 ID，对应 `state/ops/<op_id>/meta.json`。
-3. `promotion.op_id`：某次事务晋升关联的操作 ID。
-4. `undoable`：该 op 当前是否允许执行 undo。
-5. `note`：失败原因或撤销说明。
-
-## 7. 常见失败与处理
-
-1. `tx run` 失败：看 `state/logs/<txid>.stderr.log`。
-2. `tx promote` 失败：先看 `state/conflicts/`，再看 `op inspect <op_id>` 的 `note`。
-3. `node remove` 失败：看 `state/logs/remove-<node_id>.lock.log`。
-4. `undo` 失败且提示 `target operation is not undoable`：说明目标 op 不可撤销，换可撤销 op。
-5. `undo` 失败且提示哈希不一致：当前状态已偏离，先定位后再决定是否继续。
-
-## 8. 接手时最小核查清单
-
-1. `./bin/gov help` 包含 `op list/op inspect/undo`。
-2. `docs/04_cli_reference.md` 与 `docs/05_data_contracts.md` 与实现一致。
-3. `.gitignore` 已忽略 `config.toml`、`pyproject.toml`、`uv.lock`、`state/plugins.json` 与运行态目录。
+1. `./bin/gov help` 包含 `install` 和 `update` 命令族。
+2. `./bin/gov status` 能输出 `config_ready/python/torch_ready/core_ready`。
+3. `pyproject.toml.template` 包含 `core`、`torch`、`overrides` 三个固定组。

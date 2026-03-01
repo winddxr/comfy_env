@@ -18,6 +18,7 @@
 - SKF-001: Plugin onboarding to production
 - SKF-002: Conflict-driven re-promotion
 - SKF-003: Reversible removal and undo
+- SKF-004: Runtime bootstrap and core dependency upgrade
 
 ## SKF Details
 
@@ -56,6 +57,20 @@
   - `node remove` always starts with an op backup.
   - `undo` refuses to run if current local truth hashes do not match the target op's post hashes.
   - `--purge-code` deletes source trees outside the undoable contract.
+
+### SKF-004
+
+- Module Boundaries:
+  - Application Core -> Dependency Sync -> State Ledger -> Safety Guards -> Runtime Executor
+- Key Contracts:
+  - CLI command contract
+  - Transaction record contract (`kind=core_update`)
+  - Operation metadata contract
+- Failure & Recovery Posture:
+  - `init` must persist `paths.comfyui_dir` and `runtime.python` before later commands assume them.
+  - `install torch` must happen before `install`.
+  - `update run` stages a workdir from `requirements.txt`; `update promote` only promotes that staged snapshot.
+  - Failed sync or smoke restores pre-op files before exit.
 
 ## Integration Contracts
 

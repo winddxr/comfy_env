@@ -12,6 +12,7 @@ WORK_DIR="${STATE_DIR}/work"
 CACHE_WHEELS_DIR="${ROOT_DIR}/cache/wheels"
 OPS_DIR="${STATE_DIR}/ops"
 CONFIG_FILE="${ROOT_DIR}/config.toml"
+CONFIG_TEMPLATE_FILE="${ROOT_DIR}/config.toml.template"
 PROJECT_FILE="${ROOT_DIR}/pyproject.toml"
 PROJECT_TEMPLATE_FILE="${ROOT_DIR}/pyproject.toml.template"
 LOCK_FILE="${ROOT_DIR}/uv.lock"
@@ -109,6 +110,132 @@ else:
 PY
 }
 
+ensure_config_file_for_init() {
+    local comfyui_dir_override="${1:-}"
+    local python_override="${2:-}"
+
+    if [ ! -f "$CONFIG_FILE" ] && { [ -z "$comfyui_dir_override" ] || [ -z "$python_override" ]; }; then
+        echo "ERROR: initial setup requires --comfyui-dir <abs-path> and --python <python-spec>" >&2
+        exit 1
+    fi
+
+    require_python
+    "${PYTHON_BIN}" - "$CONFIG_FILE" "$CONFIG_TEMPLATE_FILE" "$comfyui_dir_override" "$python_override" <<'PY'
+import pathlib
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
+
+config_path = pathlib.Path(sys.argv[1])
+template_path = pathlib.Path(sys.argv[2])
+comfyui_override = sys.argv[3].strip()
+python_override = sys.argv[4].strip()
+
+DEFAULT_CORE_PACKAGES = [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "xformers",
+    "triton",
+    "onnxruntime",
+    "onnxruntime-gpu",
+    "numpy",
+]
+
+def load_toml(path: pathlib.Path):
+    if not path.exists() or tomllib is None:
+        return {}
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def get_nested(data, path, default):
+    cur = data
+    for part in path:
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return default
+    return cur
+
+base = load_toml(config_path) if config_path.exists() else load_toml(template_path)
+
+final_comfyui = comfyui_override or str(get_nested(base, ("paths", "comfyui_dir"), "") or "").strip()
+final_python = python_override or str(get_nested(base, ("runtime", "python"), "") or "").strip()
+
+if not final_comfyui:
+    raise SystemExit("ERROR: paths.comfyui_dir is required. Run 'gov init --comfyui-dir <abs-path> --python <python-spec>'.")
+if not pathlib.Path(final_comfyui).is_absolute():
+    raise SystemExit(f"ERROR: ComfyUI path must be absolute: {final_comfyui}")
+if not final_python:
+    raise SystemExit("ERROR: runtime.python is required. Run 'gov init --python <python-spec>'.")
+
+runtime = {
+    "python": final_python,
+    "prod_env": str(get_nested(base, ("runtime", "prod_env"), ".venv-prod") or ".venv-prod"),
+    "candidate_root": str(get_nested(base, ("runtime", "candidate_root"), ".venv-candidate") or ".venv-candidate"),
+}
+tx = {
+    "timeout_seconds": int(get_nested(base, ("tx", "timeout_seconds"), 120) or 120),
+    "smoke_test_cmd": str(get_nested(base, ("tx", "smoke_test_cmd"), "") or ""),
+}
+policy_packages = get_nested(base, ("policy", "core_packages"), DEFAULT_CORE_PACKAGES)
+if not isinstance(policy_packages, list) or not policy_packages:
+    policy_packages = DEFAULT_CORE_PACKAGES
+policy = {
+    "core_packages": [str(item) for item in policy_packages],
+}
+ops = {
+    "retention_count": int(get_nested(base, ("ops", "retention_count"), 100) or 100),
+}
+run = {
+    "extra_args": str(get_nested(base, ("run", "extra_args"), "") or ""),
+    "sync_before_run": bool(get_nested(base, ("run", "sync_before_run"), False)),
+}
+
+sections = [
+    ("paths", {"comfyui_dir": final_comfyui}),
+    ("runtime", runtime),
+    ("tx", tx),
+    ("policy", policy),
+    ("ops", ops),
+    ("run", run),
+]
+
+def fmt_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        parts = ",\n".join(f'    "{str(item)}"' for item in value)
+        return "[\n" + parts + ",\n]"
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+lines = ["# ComfyUI environment governance config (Batch-4)", ""]
+for name, payload in sections:
+    lines.append(f"[{name}]")
+    for key, value in payload.items():
+        rendered = fmt_value(value)
+        if "\n" in rendered:
+            lines.append(f"{key} = {rendered}")
+        else:
+            lines.append(f"{key} = {rendered}")
+    lines.append("")
+
+config_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+PY
+}
+
 ensure_layout() {
     mkdir -p "${STATE_DIR}" "${TX_DIR}" "${LOG_DIR}" "${CONFLICT_DIR}" "${WORK_DIR}" "${CACHE_WHEELS_DIR}" "${OPS_DIR}" "${ROOT_DIR}/.venv-candidate"
     if [ ! -f "${PLUGINS_FILE}" ]; then
@@ -132,6 +259,41 @@ ensure_project_file_for_init() {
     exit 1
 }
 
+configured_python() {
+    local value
+    value="$(config_get "runtime.python" "")"
+    if [ -z "$value" ]; then
+        echo "ERROR: runtime.python is not configured. Run 'gov init --python <python-spec>'." >&2
+        exit 1
+    fi
+    echo "$value"
+}
+
+lock_project_exact() {
+    local project_dir="$1"
+    local py="${2:-}"
+    if [ -z "$py" ]; then
+        py="$(configured_python)"
+    fi
+    (
+        cd "$project_dir"
+        uv lock --python "$py"
+    )
+}
+
+sync_project_env_exact() {
+    local project_dir="$1"
+    local env_path="$2"
+    local py="${3:-}"
+    if [ -z "$py" ]; then
+        py="$(configured_python)"
+    fi
+    (
+        cd "$project_dir"
+        UV_PROJECT_ENVIRONMENT="$env_path" uv sync --python "$py" --locked --exact --all-groups
+    )
+}
+
 prod_env_path() {
     local rel
     rel="$(config_get "runtime.prod_env" ".venv-prod")"
@@ -146,6 +308,12 @@ candidate_root_path() {
 
 comfyui_dir_path() {
     config_get "paths.comfyui_dir" "/opt/comfyui"
+}
+
+default_requirements_file() {
+    local comfyui_dir
+    comfyui_dir="$(comfyui_dir_path)"
+    echo "${comfyui_dir}/requirements.txt"
 }
 
 tx_timeout_seconds() {
@@ -173,6 +341,15 @@ ops_retention_count() {
 
 smoke_test_cmd() {
     config_get "tx.smoke_test_cmd" ""
+}
+
+files_are_identical() {
+    local left="$1"
+    local right="$2"
+    if [ ! -f "$left" ] || [ ! -f "$right" ]; then
+        return 1
+    fi
+    cmp -s "$left" "$right"
 }
 
 normalize_group_name() {
@@ -224,6 +401,184 @@ if not p.exists():
     raise SystemExit(0)
 print(hashlib.sha256(p.read_bytes()).hexdigest())
 PY
+}
+
+dep_name_from_spec() {
+    local spec="$1"
+    require_python
+    "${PYTHON_BIN}" - "$spec" <<'PY'
+import re
+import sys
+
+spec = sys.argv[1].strip()
+if not spec:
+    print("")
+    raise SystemExit(0)
+
+token = re.split(r"[<>=!~;\[]", spec, maxsplit=1)[0].strip()
+if "@" in token:
+    token = token.split("@", 1)[0].strip()
+
+print(token)
+PY
+}
+
+torch_index_name_from_url() {
+    local index_url="$1"
+    require_python
+    "${PYTHON_BIN}" - "$index_url" <<'PY'
+import pathlib
+import re
+import sys
+from urllib.parse import urlparse
+
+url = sys.argv[1].strip()
+parsed = urlparse(url)
+segments = [seg for seg in parsed.path.split("/") if seg]
+tail = segments[-1] if segments else ""
+tail = re.sub(r"[-_.]+", "-", tail.lower()).strip("-")
+
+if tail:
+    print(f"pytorch-{tail}")
+else:
+    print("pytorch-custom")
+PY
+}
+
+read_requirements_file_exact() {
+    local requirements_file="$1"
+    local out_file="$2"
+    require_python
+    "${PYTHON_BIN}" - "$requirements_file" "$out_file" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+out = pathlib.Path(sys.argv[2])
+
+if not path.exists():
+    print(f"ERROR: requirements file not found: {path}", file=sys.stderr)
+    raise SystemExit(1)
+
+deps = []
+filtered = []
+
+def normalize_name(spec: str) -> str:
+    token = re.split(r"[<>=!~;\[]", spec, maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower()
+
+for idx, raw in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith(("-r", "-c")) or line.startswith("--"):
+        print(f"ERROR: unsupported requirements directive at line {idx}: {line}", file=sys.stderr)
+        raise SystemExit(2)
+    name = normalize_name(line)
+    if name in {"torch", "torchvision", "torchaudio"}:
+        filtered.append(line)
+        continue
+    deps.append(line)
+
+out.write_text("\n".join(deps) + ("\n" if deps else ""), encoding="utf-8")
+if filtered:
+    print("Filtered torch-family requirements: " + ", ".join(filtered), file=sys.stderr)
+PY
+}
+
+torch_group_ready() {
+    require_python
+    "${PYTHON_BIN}" - "$PROJECT_FILE" <<'PY'
+import pathlib
+import re
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(1)
+
+try:
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(2)
+
+groups = data.get("dependency-groups", {})
+raw = groups.get("torch", []) if isinstance(groups, dict) else []
+if not isinstance(raw, list):
+    raw = []
+
+def normalize_name(spec: str) -> str:
+    token = re.split(r"[<>=!~;\[]", spec, maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower()
+
+found = {normalize_name(str(item)) for item in raw if str(item).strip()}
+required = {"torch", "torchvision", "torchaudio"}
+raise SystemExit(0 if required.issubset(found) else 3)
+PY
+}
+
+set_dependency_group_exact() {
+    local project_dir="$1"
+    local group_name="$2"
+    local desired_file="$3"
+    local current_file dep spec dep_name py
+
+    current_file="$(mktemp)"
+    py="$(configured_python)"
+    write_group_deps "$project_dir/pyproject.toml" "$group_name" "$current_file"
+
+    if [ -s "$current_file" ]; then
+        while IFS= read -r dep; do
+            [ -z "$dep" ] && continue
+            dep_name="$(dep_name_from_spec "$dep")"
+            [ -z "$dep_name" ] && continue
+            (
+                cd "$project_dir"
+                uv remove --group "$group_name" --python "$py" --no-sync "$dep_name"
+            )
+        done < "$current_file"
+    fi
+
+    if [ -s "$desired_file" ]; then
+        while IFS= read -r spec; do
+            [ -z "$spec" ] && continue
+            (
+                cd "$project_dir"
+                uv add --group "$group_name" --python "$py" --no-sync "$spec"
+            )
+        done < "$desired_file"
+    fi
+
+    rm -f "$current_file"
+}
+
+append_pins_to_overrides_group() {
+    local project_dir="$1"
+    local pins_file="$2"
+    local py pin
+
+    py="$(configured_python)"
+    if [ ! -s "$pins_file" ]; then
+        return 0
+    fi
+
+    while IFS= read -r pin; do
+        [ -z "$pin" ] && continue
+        (
+            cd "$project_dir"
+            uv add --group overrides --python "$py" --no-sync "$pin"
+        )
+    done < "$pins_file"
 }
 
 ops_prune() {
@@ -675,24 +1030,27 @@ apply_plan_in_workdir() {
     local direct_file="$3"
     local override_file="$4"
     local log_file="$5"
+    local py
+
+    py="$(configured_python)"
 
     (
         cd "$workdir"
         if [ -s "$direct_file" ]; then
             while IFS= read -r spec; do
                 [ -z "$spec" ] && continue
-                uv add --group "$group_name" "$spec"
+                uv add --group "$group_name" --python "$py" --no-sync "$spec"
             done < "$direct_file"
         fi
 
         if [ -s "$override_file" ]; then
             while IFS= read -r spec; do
                 [ -z "$spec" ] && continue
-                uv add --group overrides "$spec"
+                uv add --group overrides --python "$py" --no-sync "$spec"
             done < "$override_file"
         fi
 
-        uv lock
+        uv lock --python "$py"
     ) >"$log_file" 2>&1
 }
 
@@ -830,6 +1188,29 @@ prom = tx.get("promotion", {})
 prom["status"] = "lock_failed"
 prom["pre_op_id"] = pre_op_id
 tx["promotion"] = prom
+tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+update_tx_set_conflict() {
+    local tx_file="$1"
+    local conflict_path="$2"
+    local status="$3"
+    require_python
+    "${PYTHON_BIN}" - "$tx_file" "$conflict_path" "$status" "$(timestamp_utc)" <<'PY'
+import json
+import pathlib
+import sys
+
+tx_file = pathlib.Path(sys.argv[1])
+conflict_path = sys.argv[2]
+status = sys.argv[3]
+ended_at = sys.argv[4]
+
+tx = json.loads(tx_file.read_text(encoding="utf-8"))
+tx["status"] = status
+tx["ended_at"] = ended_at
+tx["conflict_report"] = conflict_path
 tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 PY
 }
@@ -1080,6 +1461,8 @@ cmd_undo() {
     require_cmd uv
     ensure_layout
     require_python
+    local py
+    py="$(configured_python)"
 
     local op_id="${1:-}"
     if [ -z "$op_id" ]; then
@@ -1131,9 +1514,9 @@ PY
     fi
 
     prod_env="$(prod_env_path)"
-    if ! UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups; then
+    if ! sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py"; then
         op_restore_backup "$undo_op_id" || true
-        UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups || true
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
         op_finalize "$undo_op_id" "failed" "false" "undo failed: prod sync failed"
         exit 1
     fi
@@ -1219,6 +1602,8 @@ core_impact = sorted({n for n in [normalize_name(x) for x in added + removed] if
 
 payload = {
     "txid": txid,
+    "kind": "plugin",
+    "subject": node_id,
     "node_id": node_id,
     "started_at": started_at,
     "ended_at": ended_at,
@@ -1236,6 +1621,10 @@ payload = {
         "stderr": stderr_log,
         "run_exit_code": int(run_exit_code),
     },
+    "source_requirements_path": "",
+    "source_requirements_sha256": "",
+    "staged_workdir": "",
+    "target_core_deps": [],
     "conflict_report": "",
     "resolution_pins": [],
     "promotion_plan": {
@@ -1255,20 +1644,162 @@ pathlib.Path(tx_file).write_text(json.dumps(payload, indent=2, ensure_ascii=True
 PY
 }
 
+write_update_tx_file() {
+    local tx_file="$1"
+    local txid="$2"
+    local status="$3"
+    local started_at="$4"
+    local ended_at="$5"
+    local candidate_env="$6"
+    local pre_file="$7"
+    local post_file="$8"
+    local stdout_log="$9"
+    local stderr_log="${10}"
+    local run_exit_code="${11}"
+    local core_csv="${12}"
+    local requirements_path="${13}"
+    local requirements_sha="${14}"
+    local staged_workdir="${15}"
+    local target_core_deps_file="${16}"
+    require_python
+
+    "${PYTHON_BIN}" - "$tx_file" "$txid" "$status" "$started_at" "$ended_at" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "$run_exit_code" "$core_csv" "$requirements_path" "$requirements_sha" "$staged_workdir" "$target_core_deps_file" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+(
+    tx_file,
+    txid,
+    status,
+    started_at,
+    ended_at,
+    candidate_env,
+    pre_file,
+    post_file,
+    stdout_log,
+    stderr_log,
+    run_exit_code,
+    core_csv,
+    requirements_path,
+    requirements_sha,
+    staged_workdir,
+    target_core_deps_file,
+) = sys.argv[1:17]
+
+def read_lines(path: str):
+    p = pathlib.Path(path)
+    if not p.exists():
+        return []
+    return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+def normalize_name(spec: str):
+    token = re.split(r"[<>=!~\[]", spec, maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower()
+
+pre = read_lines(pre_file)
+post = read_lines(post_file)
+added = sorted(set(post) - set(pre))
+removed = sorted(set(pre) - set(post))
+core_set = {x.strip().lower() for x in core_csv.split(",") if x.strip()}
+core_impact = sorted({n for n in [normalize_name(x) for x in added + removed] if n in core_set})
+target_core_deps = read_lines(target_core_deps_file)
+
+payload = {
+    "txid": txid,
+    "kind": "core_update",
+    "subject": "core",
+    "node_id": "core",
+    "started_at": started_at,
+    "ended_at": ended_at,
+    "candidate_env": candidate_env,
+    "status": status,
+    "pre_freeze": pre,
+    "post_freeze": post,
+    "diff": {
+        "added": added,
+        "removed": removed,
+    },
+    "core_impact": core_impact,
+    "logs": {
+        "stdout": stdout_log,
+        "stderr": stderr_log,
+        "run_exit_code": int(run_exit_code),
+    },
+    "source_requirements_path": requirements_path,
+    "source_requirements_sha256": requirements_sha,
+    "staged_workdir": staged_workdir,
+    "target_core_deps": target_core_deps,
+    "conflict_report": "",
+    "resolution_pins": [],
+    "promotion_plan": {
+        "direct_additions": [],
+        "override_additions": [],
+    },
+    "promotion": {
+        "status": "",
+        "reason": "",
+        "op_id": "",
+        "pre_op_id": "",
+        "error": "",
+    },
+}
+
+pathlib.Path(tx_file).write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+tx_assert_kind() {
+    local expected="$1"
+    local actual
+    actual="$(tx_get_field "$TX_FILE" "kind" "plugin")"
+    if [ "$actual" != "$expected" ]; then
+        echo "ERROR: transaction kind '$actual' is not supported by this command" >&2
+        exit 1
+    fi
+}
+
 cmd_init() {
     require_cmd uv
+    local comfyui_dir_override=""
+    local python_override=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --comfyui-dir)
+                comfyui_dir_override="${2:-}"
+                shift 2
+                ;;
+            --python)
+                python_override="${2:-}"
+                shift 2
+                ;;
+            *)
+                echo "Usage: gov init --comfyui-dir <abs-path> --python <python-spec>" >&2
+                exit 1
+                ;;
+        esac
+    done
+
     ensure_layout
+    ensure_config_file_for_init "$comfyui_dir_override" "$python_override"
     ensure_project_file_for_init
 
-    local prod_env
+    local prod_env py comfyui_dir
     prod_env="$(prod_env_path)"
+    py="$(configured_python)"
+    comfyui_dir="$(comfyui_dir_path)"
 
-    cd "$ROOT_DIR"
-    uv lock
-    UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups
+    lock_project_exact "$ROOT_DIR" "$py"
+    sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py"
 
     echo "Initialized."
     echo "  root: $ROOT_DIR"
+    echo "  comfyui dir: $comfyui_dir"
+    echo "  python: $py"
     echo "  prod env: $prod_env"
     echo "  lock file: $LOCK_FILE"
 }
@@ -1369,6 +1900,8 @@ PY
 cmd_node_remove() {
     require_cmd uv
     ensure_layout
+    local py
+    py="$(configured_python)"
 
     local node_id="${1:-}"
     shift || true
@@ -1436,10 +1969,10 @@ PY
         if [ -s "$deps_file" ]; then
             while IFS= read -r dep; do
                 [ -z "$dep" ] && continue
-                uv remove --group "$group" "$dep" || true
+                uv remove --group "$group" --python "$py" --no-sync "$dep" || true
             done < "$deps_file"
         fi
-        uv lock
+        uv lock --python "$py"
     ) >"$lock_log" 2>&1 || {
         op_restore_backup "$op_id" || true
         op_finalize "$op_id" "failed" "false" "node remove lock failed"
@@ -1453,10 +1986,10 @@ PY
 
     local prod_env
     prod_env="$(prod_env_path)"
-    if ! UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups; then
+    if ! sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py"; then
         echo "ERROR: prod sync failed during node remove, restoring pre-operation state: $op_id" >&2
         op_restore_backup "$op_id"
-        UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups || true
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
         op_finalize "$op_id" "failed" "false" "prod sync failed"
         rm -f "$meta_json" "$deps_file"
         exit 1
@@ -1484,6 +2017,8 @@ PY
 cmd_tx_run() {
     require_cmd uv
     ensure_layout
+    local py
+    py="$(configured_python)"
 
     local node_id="${1:-}"
     shift || true
@@ -1533,11 +2068,10 @@ cmd_tx_run() {
 
     write_tx_file "$TX_FILE" "$txid" "$node_id" "running" "$started_at" "" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "-1" "$(core_packages_csv)"
 
-    cd "$ROOT_DIR"
     if [ ! -f "$LOCK_FILE" ]; then
-        uv lock
+        lock_project_exact "$ROOT_DIR" "$py"
     fi
-    UV_PROJECT_ENVIRONMENT="$candidate_env" uv sync --locked --exact --all-groups
+    sync_project_env_exact "$ROOT_DIR" "$candidate_env" "$py"
 
     collect_freeze_file "$candidate_env" "$pre_file"
 
@@ -1583,6 +2117,7 @@ cmd_tx_inspect() {
         exit 1
     fi
     load_tx "$txid"
+    tx_assert_kind "plugin"
 
     require_python
     "${PYTHON_BIN}" - "$TX_FILE" <<'PY'
@@ -1620,6 +2155,7 @@ cmd_tx_abort() {
         exit 1
     fi
     load_tx "$txid"
+    tx_assert_kind "plugin"
 
     local candidate_env
     candidate_env="$(tx_get_field "$TX_FILE" "candidate_env" "")"
@@ -1643,6 +2179,7 @@ cmd_resolve() {
     fi
 
     load_tx "$txid"
+    tx_assert_kind "plugin"
 
     local status node_id conflict_report
     status="$(tx_get_field "$TX_FILE" "status" "")"
@@ -1773,6 +2310,8 @@ cmd_tx_promote() {
     require_cmd uv
     require_python
     ensure_layout
+    local py
+    py="$(configured_python)"
 
     local txid="${1:-}"
     shift || true
@@ -1806,6 +2345,7 @@ cmd_tx_promote() {
     done
 
     load_tx "$txid"
+    tx_assert_kind "plugin"
 
     local status node_id core_count
     status="$(tx_get_field "$TX_FILE" "status" "")"
@@ -1894,10 +2434,10 @@ PY
 
     local prod_env
     prod_env="$(prod_env_path)"
-    if ! UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups; then
+    if ! sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py"; then
         echo "ERROR: prod sync failed, restoring pre-operation state: $op_id" >&2
         op_restore_backup "$op_id"
-        UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups || true
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
         tx_set_promote_failed "$TX_FILE" "$op_id" "prod sync failed"
         op_finalize "$op_id" "failed" "false" "prod sync failed"
         rm -f "$meta_json" "$plan_json" "$pins_file"
@@ -1912,7 +2452,7 @@ PY
         if ! (cd "$comfyui_dir" && PATH="$prod_env/bin:$PATH" bash -lc "$smoke_cmd"); then
             echo "ERROR: smoke test failed, restoring pre-operation state: $op_id" >&2
             op_restore_backup "$op_id"
-            UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups || true
+            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
             tx_set_promote_failed "$TX_FILE" "$op_id" "smoke test failed"
             op_finalize "$op_id" "failed" "false" "smoke test failed"
             rm -f "$meta_json" "$plan_json" "$pins_file"
@@ -1922,7 +2462,7 @@ PY
         if ! "$prod_env/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1; then
             echo "ERROR: default smoke test failed, restoring pre-operation state: $op_id" >&2
             op_restore_backup "$op_id"
-            UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups || true
+            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
             tx_set_promote_failed "$TX_FILE" "$op_id" "default smoke test failed"
             op_finalize "$op_id" "failed" "false" "default smoke test failed"
             rm -f "$meta_json" "$plan_json" "$pins_file"
@@ -1941,19 +2481,681 @@ PY
 
     rm -f "$meta_json" "$plan_json" "$pins_file"
 }
+cmd_install_torch() {
+    require_cmd uv
+    ensure_layout
+    ensure_project_file_for_init
+
+    local index_url=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --index-url)
+                index_url="${2:-}"
+                shift 2
+                ;;
+            *)
+                echo "Usage: gov install torch --index-url <url>" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ -z "$index_url" ]; then
+        echo "Usage: gov install torch --index-url <url>" >&2
+        exit 1
+    fi
+
+    local py prod_env workdir index_name op_id
+    py="$(configured_python)"
+    prod_env="$(prod_env_path)"
+    workdir="$(build_workdir_for_tx "install-torch")"
+    index_name="$(torch_index_name_from_url "$index_url")"
+
+    (
+        cd "$workdir"
+        uv add --group torch --python "$py" --index "${index_name}=${index_url}" --no-sync torch torchvision torchaudio
+        uv lock --python "$py"
+    )
+
+    if files_are_identical "$PROJECT_FILE" "$workdir/pyproject.toml" && files_are_identical "$LOCK_FILE" "$workdir/uv.lock"; then
+        echo "No changes."
+        echo "  group: torch"
+        return 0
+    fi
+
+    op_id="$(op_begin "install_torch" "$index_url")"
+    cp "$workdir/pyproject.toml" "$PROJECT_FILE"
+    cp "$workdir/uv.lock" "$LOCK_FILE"
+
+    if ! sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py"; then
+        echo "ERROR: prod sync failed during install torch, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        op_finalize "$op_id" "failed" "false" "install torch failed: prod sync failed"
+        exit 1
+    fi
+
+    if ! "$prod_env/bin/python" -c "import torch, torchvision, torchaudio" >/dev/null 2>&1; then
+        echo "ERROR: torch smoke test failed, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        op_finalize "$op_id" "failed" "false" "install torch failed: smoke test failed"
+        exit 1
+    fi
+
+    op_finalize "$op_id" "success" "true" "install torch succeeded"
+    ops_prune
+
+    echo "Torch dependencies installed."
+    echo "  op_id: $op_id"
+    echo "  index: ${index_name}=${index_url}"
+}
+
+cmd_install_core() {
+    require_cmd uv
+    ensure_layout
+    ensure_project_file_for_init
+
+    local requirements_file=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --requirements-file)
+                requirements_file="${2:-}"
+                shift 2
+                ;;
+            *)
+                echo "Usage: gov install [--requirements-file <path>]" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if ! torch_group_ready; then
+        echo "ERROR: managed torch dependencies are not installed. Run 'gov install torch --index-url <url>' first." >&2
+        exit 1
+    fi
+
+    if [ -z "$requirements_file" ]; then
+        requirements_file="$(default_requirements_file)"
+    fi
+
+    local py prod_env workdir deps_file op_id
+    py="$(configured_python)"
+    prod_env="$(prod_env_path)"
+    deps_file="$(mktemp)"
+    read_requirements_file_exact "$requirements_file" "$deps_file"
+    workdir="$(build_workdir_for_tx "install-core")"
+
+    set_dependency_group_exact "$workdir" "core" "$deps_file"
+    lock_project_exact "$workdir" "$py"
+
+    if files_are_identical "$PROJECT_FILE" "$workdir/pyproject.toml" && files_are_identical "$LOCK_FILE" "$workdir/uv.lock"; then
+        rm -f "$deps_file"
+        echo "No changes."
+        echo "  group: core"
+        return 0
+    fi
+
+    op_id="$(op_begin "install_core" "$requirements_file")"
+    cp "$workdir/pyproject.toml" "$PROJECT_FILE"
+    cp "$workdir/uv.lock" "$LOCK_FILE"
+
+    if ! sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py"; then
+        echo "ERROR: prod sync failed during install, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        op_finalize "$op_id" "failed" "false" "install core failed: prod sync failed"
+        rm -f "$deps_file"
+        exit 1
+    fi
+
+    local smoke_cmd comfyui_dir
+    smoke_cmd="$(smoke_test_cmd)"
+    comfyui_dir="$(comfyui_dir_path)"
+    if [ -n "$smoke_cmd" ]; then
+        if ! (cd "$comfyui_dir" && PATH="$prod_env/bin:$PATH" bash -lc "$smoke_cmd"); then
+            echo "ERROR: smoke test failed during install, restoring pre-operation state: $op_id" >&2
+            op_restore_backup "$op_id"
+            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+            op_finalize "$op_id" "failed" "false" "install core failed: smoke test failed"
+            rm -f "$deps_file"
+            exit 1
+        fi
+    else
+        if ! "$prod_env/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1; then
+            echo "ERROR: default smoke test failed during install, restoring pre-operation state: $op_id" >&2
+            op_restore_backup "$op_id"
+            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+            op_finalize "$op_id" "failed" "false" "install core failed: default smoke test failed"
+            rm -f "$deps_file"
+            exit 1
+        fi
+    fi
+
+    op_finalize "$op_id" "success" "true" "install core succeeded"
+    ops_prune
+    rm -f "$deps_file"
+
+    echo "Core requirements installed."
+    echo "  op_id: $op_id"
+    echo "  requirements: $requirements_file"
+}
+
+cmd_update_run() {
+    require_cmd uv
+    ensure_layout
+    ensure_project_file_for_init
+
+    local requirements_file=""
+    local timeout_sec
+    timeout_sec="$(tx_timeout_seconds)"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --requirements-file)
+                requirements_file="${2:-}"
+                shift 2
+                ;;
+            --timeout)
+                timeout_sec="${2:-}"
+                shift 2
+                ;;
+            *)
+                echo "Usage: gov update run [--requirements-file <path>] [--timeout <seconds>]" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if ! torch_group_ready; then
+        echo "ERROR: managed torch dependencies are not installed. Run 'gov install torch --index-url <url>' first." >&2
+        exit 1
+    fi
+
+    if [ -z "$requirements_file" ]; then
+        requirements_file="$(default_requirements_file)"
+    fi
+
+    local py prod_env txid workdir candidate_root candidate_env pre_file post_file stdout_log stderr_log deps_file started_at ended_at run_exit_code status req_sha lock_log conflict_report main_py comfyui_dir
+    py="$(configured_python)"
+    prod_env="$(prod_env_path)"
+    if [ ! -d "$prod_env" ]; then
+        echo "ERROR: prod environment not found: $prod_env" >&2
+        echo "Hint: run 'gov init --comfyui-dir <abs-path> --python <python-spec>' first." >&2
+        exit 1
+    fi
+
+    txid="$(new_txid)"
+    workdir="$(build_workdir_for_tx "$txid")"
+    candidate_root="$(candidate_root_path)"
+    candidate_env="${candidate_root}/${txid}"
+    TX_FILE="${TX_DIR}/${txid}.json"
+    pre_file="${TX_DIR}/${txid}.pre.freeze.txt"
+    post_file="${TX_DIR}/${txid}.post.freeze.txt"
+    stdout_log="${LOG_DIR}/${txid}.stdout.log"
+    stderr_log="${LOG_DIR}/${txid}.stderr.log"
+    deps_file="$(mktemp)"
+    lock_log="${CONFLICT_DIR}/${txid}.update.lock.log"
+
+    mkdir -p "$candidate_root"
+    : > "$pre_file"
+    : > "$post_file"
+    : > "$stdout_log"
+    : > "$stderr_log"
+
+    read_requirements_file_exact "$requirements_file" "$deps_file"
+    req_sha="$(file_sha256 "$requirements_file")"
+    collect_freeze_file "$prod_env" "$pre_file"
+    cp "$pre_file" "$post_file"
+    started_at="$(timestamp_utc)"
+    run_exit_code=0
+    status="running"
+
+    if ! (
+        set_dependency_group_exact "$workdir" "core" "$deps_file"
+        lock_project_exact "$workdir" "$py"
+    ) >"$lock_log" 2>&1; then
+        conflict_report="$(write_conflict_report "$txid" "core" "$lock_log")"
+        ended_at="$(timestamp_utc)"
+        write_update_tx_file "$TX_FILE" "$txid" "needs_resolution" "$started_at" "$ended_at" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "-1" "$(core_packages_csv)" "$requirements_file" "$req_sha" "$workdir" "$deps_file"
+        update_tx_set_conflict "$TX_FILE" "$conflict_report" "needs_resolution"
+        rm -f "$deps_file"
+        echo "Core update blocked by lock conflict."
+        echo "  txid: $txid"
+        echo "  conflict_report: $conflict_report"
+        exit 2
+    fi
+
+    if files_are_identical "$PROJECT_FILE" "$workdir/pyproject.toml" && files_are_identical "$LOCK_FILE" "$workdir/uv.lock"; then
+        rm -rf "$workdir" "$candidate_env"
+        rm -f "$deps_file" "$pre_file" "$post_file" "$stdout_log" "$stderr_log"
+        echo "No changes; requirements already match local truth."
+        return 0
+    fi
+
+    write_update_tx_file "$TX_FILE" "$txid" "$status" "$started_at" "" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "-1" "$(core_packages_csv)" "$requirements_file" "$req_sha" "$workdir" "$deps_file"
+
+    if ! sync_project_env_exact "$workdir" "$candidate_env" "$py" >"$stdout_log" 2>"$stderr_log"; then
+        ended_at="$(timestamp_utc)"
+        collect_freeze_file "$candidate_env" "$post_file"
+        write_update_tx_file "$TX_FILE" "$txid" "failed" "$started_at" "$ended_at" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "3" "$(core_packages_csv)" "$requirements_file" "$req_sha" "$workdir" "$deps_file"
+        rm -f "$deps_file"
+        echo "Core update transaction recorded."
+        echo "  txid: $txid"
+        echo "  status: failed"
+        return 1
+    fi
+
+    comfyui_dir="$(comfyui_dir_path)"
+    main_py="${comfyui_dir}/main.py"
+    set +e
+    if [ -f "$main_py" ]; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "${timeout_sec}s" "$candidate_env/bin/python" "$main_py" >>"$stdout_log" 2>>"$stderr_log"
+            run_exit_code=$?
+        else
+            "$candidate_env/bin/python" "$main_py" >>"$stdout_log" 2>>"$stderr_log"
+            run_exit_code=$?
+        fi
+    else
+        echo "ComfyUI entry not found: $main_py" >>"$stderr_log"
+        run_exit_code=2
+    fi
+    set -e
+
+    collect_freeze_file "$candidate_env" "$post_file"
+    ended_at="$(timestamp_utc)"
+    status="completed"
+    if [ "$run_exit_code" -ne 0 ]; then
+        status="failed"
+    fi
+
+    write_update_tx_file "$TX_FILE" "$txid" "$status" "$started_at" "$ended_at" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "$run_exit_code" "$(core_packages_csv)" "$requirements_file" "$req_sha" "$workdir" "$deps_file"
+    rm -f "$deps_file"
+
+    echo "Core update transaction recorded."
+    echo "  txid: $txid"
+    echo "  status: $status"
+}
+
+cmd_update_inspect() {
+    local txid="${1:-}"
+    if [ -z "$txid" ]; then
+        echo "Usage: gov update inspect <txid>" >&2
+        exit 1
+    fi
+
+    load_tx "$txid"
+    tx_assert_kind "core_update"
+
+    require_python
+    "${PYTHON_BIN}" - "$TX_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+tx = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(f"txid: {tx.get('txid')}")
+print(f"kind: {tx.get('kind')}")
+print(f"status: {tx.get('status')}")
+print(f"started_at: {tx.get('started_at')}")
+print(f"ended_at: {tx.get('ended_at')}")
+print(f"candidate_env: {tx.get('candidate_env')}")
+print(f"source_requirements_path: {tx.get('source_requirements_path')}")
+print(f"source_requirements_sha256: {tx.get('source_requirements_sha256')}")
+print(f"staged_workdir: {tx.get('staged_workdir')}")
+print(f"target_core_deps: {len(tx.get('target_core_deps', []))}")
+diff = tx.get("diff", {})
+print(f"added_count: {len(diff.get('added', []))}")
+print(f"removed_count: {len(diff.get('removed', []))}")
+core = tx.get("core_impact", [])
+print(f"core_impact: {', '.join(core) if core else '(none)'}")
+print(f"conflict_report: {tx.get('conflict_report') or '(none)'}")
+print(f"resolution_pins: {len(tx.get('resolution_pins', []))}")
+prom = tx.get("promotion", {})
+print(f"promotion_status: {prom.get('status') or '(none)'}")
+logs = tx.get("logs", {})
+print(f"stdout_log: {logs.get('stdout', '')}")
+print(f"stderr_log: {logs.get('stderr', '')}")
+print(f"run_exit_code: {logs.get('run_exit_code', '')}")
+PY
+}
+
+cmd_update_resolve() {
+    require_cmd uv
+    require_python
+    ensure_layout
+
+    local txid="${1:-}"
+    shift || true
+    if [ -z "$txid" ]; then
+        echo "Usage: gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]" >&2
+        exit 1
+    fi
+
+    local pin_values=()
+    local pins_file_path=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --pin)
+                pin_values+=("${2:-}")
+                shift 2
+                ;;
+            --pins-file)
+                pins_file_path="${2:-}"
+                shift 2
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ "${#pin_values[@]}" -eq 0 ] && [ -z "$pins_file_path" ]; then
+        echo "ERROR: provide --pin <pkg==version> and/or --pins-file <path>" >&2
+        exit 1
+    fi
+
+    load_tx "$txid"
+    tx_assert_kind "core_update"
+
+    local status staged_workdir py
+    status="$(tx_get_field "$TX_FILE" "status" "")"
+    staged_workdir="$(tx_get_field "$TX_FILE" "staged_workdir" "")"
+    py="$(configured_python)"
+
+    case "$status" in
+        needs_resolution|promote_failed|resolved)
+            ;;
+        *)
+            echo "ERROR: tx status '$status' is not resolvable" >&2
+            exit 1
+            ;;
+    esac
+
+    if [ -z "$staged_workdir" ] || [ ! -d "$staged_workdir" ]; then
+        echo "ERROR: staged workdir missing for tx=$txid" >&2
+        exit 1
+    fi
+
+    local new_pins merged_pins pin lock_log report
+    new_pins="$(mktemp)"
+    merged_pins="$(mktemp)"
+    lock_log="${CONFLICT_DIR}/${txid}.update.resolve.lock.log"
+
+    for pin in "${pin_values[@]}"; do
+        if [[ ! "$pin" =~ ^[A-Za-z0-9_.-]+==[^[:space:]]+$ ]]; then
+            echo "ERROR: invalid pin format: $pin" >&2
+            rm -f "$new_pins" "$merged_pins"
+            exit 1
+        fi
+        echo "$pin" >> "$new_pins"
+    done
+
+    if [ -n "$pins_file_path" ]; then
+        if [ ! -f "$pins_file_path" ]; then
+            echo "ERROR: pins file not found: $pins_file_path" >&2
+            rm -f "$new_pins" "$merged_pins"
+            exit 1
+        fi
+        while IFS= read -r pin; do
+            pin="$(echo "$pin" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+            [ -z "$pin" ] && continue
+            if [[ ! "$pin" =~ ^[A-Za-z0-9_.-]+==[^[:space:]]+$ ]]; then
+                echo "ERROR: invalid pin format: $pin" >&2
+                rm -f "$new_pins" "$merged_pins"
+                exit 1
+            fi
+            echo "$pin" >> "$new_pins"
+        done < "$pins_file_path"
+    fi
+
+    "${PYTHON_BIN}" - "$TX_FILE" "$new_pins" "$merged_pins" <<'PY'
+import json
+import pathlib
+import sys
+
+tx = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+new_pins = pathlib.Path(sys.argv[2])
+out = pathlib.Path(sys.argv[3])
+
+extra = []
+if new_pins.exists():
+    extra = [x.strip() for x in new_pins.read_text(encoding="utf-8").splitlines() if x.strip()]
+
+seen = set()
+merged = []
+for item in tx.get("resolution_pins", []) + extra:
+    if item not in seen:
+        seen.add(item)
+        merged.append(item)
+
+out.write_text("\n".join(merged) + ("\n" if merged else ""), encoding="utf-8")
+PY
+
+    if ! (
+        append_pins_to_overrides_group "$staged_workdir" "$merged_pins"
+        lock_project_exact "$staged_workdir" "$py"
+    ) >"$lock_log" 2>&1; then
+        report="$(write_conflict_report "$txid" "core" "$lock_log")"
+        tx_set_resolution_pins "$TX_FILE" "$merged_pins" "needs_resolution"
+        update_tx_set_conflict "$TX_FILE" "$report" "needs_resolution"
+        rm -f "$new_pins" "$merged_pins"
+        echo "Resolve failed."
+        echo "  txid: $txid"
+        echo "  conflict_report: $report"
+        exit 2
+    fi
+
+    tx_set_resolution_pins "$TX_FILE" "$merged_pins" "resolved"
+    update_tx_set_conflict "$TX_FILE" "" "resolved"
+
+    rm -f "$new_pins" "$merged_pins"
+    echo "Resolve succeeded."
+    echo "  txid: $txid"
+    echo "  status: resolved"
+}
+
+cmd_update_promote() {
+    require_cmd uv
+    require_python
+    ensure_layout
+
+    local txid="${1:-}"
+    shift || true
+    if [ -z "$txid" ]; then
+        echo "Usage: gov update promote <txid> [--approve-core --reason \"...\"] [--allow-failed-run]" >&2
+        exit 1
+    fi
+
+    local approve_core=false
+    local reason=""
+    local allow_failed_run=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --approve-core)
+                approve_core=true
+                shift
+                ;;
+            --reason)
+                reason="${2:-}"
+                shift 2
+                ;;
+            --allow-failed-run)
+                allow_failed_run=true
+                shift
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    load_tx "$txid"
+    tx_assert_kind "core_update"
+
+    local status core_count staged_workdir py op_id prod_env smoke_cmd comfyui_dir
+    status="$(tx_get_field "$TX_FILE" "status" "")"
+    core_count="$(tx_get_field "$TX_FILE" "core_impact" "" | sed '/^$/d' | wc -l | tr -d ' ')"
+    staged_workdir="$(tx_get_field "$TX_FILE" "staged_workdir" "")"
+    py="$(configured_python)"
+
+    case "$status" in
+        completed|resolved)
+            ;;
+        failed)
+            if [ "$allow_failed_run" != true ]; then
+                echo "ERROR: tx status is failed. Use --allow-failed-run to continue." >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "ERROR: tx status '$status' cannot be promoted" >&2
+            exit 1
+            ;;
+    esac
+
+    if [ "$core_count" != "0" ] && [ "$approve_core" != true ]; then
+        echo "ERROR: core package impact detected. Use --approve-core to continue." >&2
+        exit 1
+    fi
+
+    if [ -z "$staged_workdir" ] || [ ! -d "$staged_workdir" ]; then
+        echo "ERROR: staged workdir missing for tx=$txid" >&2
+        exit 1
+    fi
+
+    op_id="$(op_begin "update_promote" "$txid")"
+    cp "$staged_workdir/pyproject.toml" "$PROJECT_FILE"
+    cp "$staged_workdir/uv.lock" "$LOCK_FILE"
+
+    prod_env="$(prod_env_path)"
+    if ! sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py"; then
+        echo "ERROR: prod sync failed during update promote, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        tx_set_promote_failed "$TX_FILE" "$op_id" "prod sync failed"
+        op_finalize "$op_id" "failed" "false" "update promote failed: prod sync failed"
+        exit 1
+    fi
+
+    smoke_cmd="$(smoke_test_cmd)"
+    comfyui_dir="$(comfyui_dir_path)"
+    if [ -n "$smoke_cmd" ]; then
+        if ! (cd "$comfyui_dir" && PATH="$prod_env/bin:$PATH" bash -lc "$smoke_cmd"); then
+            echo "ERROR: smoke test failed during update promote, restoring pre-operation state: $op_id" >&2
+            op_restore_backup "$op_id"
+            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+            tx_set_promote_failed "$TX_FILE" "$op_id" "smoke test failed"
+            op_finalize "$op_id" "failed" "false" "update promote failed: smoke test failed"
+            exit 1
+        fi
+    else
+        if ! "$prod_env/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1; then
+            echo "ERROR: default smoke test failed during update promote, restoring pre-operation state: $op_id" >&2
+            op_restore_backup "$op_id"
+            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+            tx_set_promote_failed "$TX_FILE" "$op_id" "default smoke test failed"
+            op_finalize "$op_id" "failed" "false" "update promote failed: default smoke test failed"
+            exit 1
+        fi
+    fi
+
+    tx_set_promoted "$TX_FILE" "$op_id" "$reason"
+    op_finalize "$op_id" "success" "true" "update promote succeeded"
+    ops_prune
+
+    echo "Core update promoted."
+    echo "  txid: $txid"
+    echo "  op_id: $op_id"
+}
+
+cmd_update_abort() {
+    local txid="${1:-}"
+    if [ -z "$txid" ]; then
+        echo "Usage: gov update abort <txid>" >&2
+        exit 1
+    fi
+
+    load_tx "$txid"
+    tx_assert_kind "core_update"
+
+    local candidate_env staged_workdir
+    candidate_env="$(tx_get_field "$TX_FILE" "candidate_env" "")"
+    staged_workdir="$(tx_get_field "$TX_FILE" "staged_workdir" "")"
+
+    if [ -n "$candidate_env" ] && [ -d "$candidate_env" ]; then
+        rm -rf "$candidate_env"
+    fi
+    if [ -n "$staged_workdir" ] && [ -d "$staged_workdir" ]; then
+        rm -rf "$staged_workdir"
+    fi
+
+    tx_update_status "$TX_FILE" "aborted"
+    echo "Core update aborted."
+    echo "  txid: $txid"
+}
+
 cmd_status() {
     ensure_layout
     local prod_env
     prod_env="$(prod_env_path)"
     require_python
-    "${PYTHON_BIN}" - "$prod_env" "$LOCK_FILE" "$TX_DIR" <<'PY'
+    "${PYTHON_BIN}" - "$CONFIG_FILE" "$PROJECT_FILE" "$prod_env" "$LOCK_FILE" "$TX_DIR" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
-prod_env = pathlib.Path(sys.argv[1])
-lock_file = pathlib.Path(sys.argv[2])
-tx_dir = pathlib.Path(sys.argv[3])
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+config_file = pathlib.Path(sys.argv[1])
+project_file = pathlib.Path(sys.argv[2])
+prod_env = pathlib.Path(sys.argv[3])
+lock_file = pathlib.Path(sys.argv[4])
+tx_dir = pathlib.Path(sys.argv[5])
+
+def load_toml(path: pathlib.Path):
+    if not path.exists():
+        return {}
+    try:
+        return tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+cfg = load_toml(config_file)
+project = load_toml(project_file)
+groups = project.get("dependency-groups", {}) if isinstance(project, dict) else {}
+if not isinstance(groups, dict):
+    groups = {}
+
+def normalize_name(spec: str) -> str:
+    token = re.split(r"[<>=!~;\[]", spec, maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower()
+
+torch_group = groups.get("torch", [])
+core_group = groups.get("core", [])
+if not isinstance(torch_group, list):
+    torch_group = []
+if not isinstance(core_group, list):
+    core_group = []
+
+torch_names = {normalize_name(str(item)) for item in torch_group if str(item).strip()}
+torch_ready = {"torch", "torchvision", "torchaudio"}.issubset(torch_names)
+core_ready = bool([str(item).strip() for item in core_group if str(item).strip()])
+
+comfyui_dir = ""
+runtime_python = ""
+if isinstance(cfg, dict):
+    comfyui_dir = str((cfg.get("paths") or {}).get("comfyui_dir") or "")
+    runtime_python = str((cfg.get("runtime") or {}).get("python") or "")
+config_ready = bool(comfyui_dir and runtime_python)
 
 records = []
 for f in sorted(tx_dir.glob("*.json")):
@@ -1971,19 +3173,28 @@ pending_status = {
     "promote_failed",
 }
 pending = [x for x in records if x.get("status") in pending_status]
+pending_updates = [x for x in records if x.get("kind", "plugin") == "core_update" and x.get("status") in pending_status]
 recent = sorted(records, key=lambda x: x.get("started_at", ""), reverse=True)[:8]
 
 print("Comfy Env Status")
+print(f"config_ready: {'yes' if config_ready else 'no'}")
+print(f"comfyui_dir: {comfyui_dir or '(unset)'}")
+print(f"python: {runtime_python or '(unset)'}")
 print(f"prod_env_exists: {'yes' if prod_env.exists() else 'no'}")
 print(f"lock_exists: {'yes' if lock_file.exists() else 'no'}")
+print(f"torch_ready: {'yes' if torch_ready else 'no'}")
+print(f"core_ready: {'yes' if core_ready else 'no'}")
 print(f"transactions_total: {len(records)}")
 print(f"transactions_pending: {len(pending)}")
+print(f"update_transactions_pending: {len(pending_updates)}")
 print("recent_transactions:")
 if not recent:
     print("  (none)")
 else:
     for item in recent:
-        print(f"  - {item.get('txid')} [{item.get('status')}] node={item.get('node_id')}")
+        kind = item.get("kind", "plugin")
+        subject = item.get("subject") or item.get("node_id") or "(unknown)"
+        print(f"  - {item.get('txid')} [{item.get('status')}] kind={kind} subject={subject}")
 PY
 }
 
@@ -2041,7 +3252,7 @@ cmd_run() {
     if [ "$sync_before" = true ]; then
         require_cmd uv
         echo "Syncing prod environment..."
-        UV_PROJECT_ENVIRONMENT="$prod_env" uv sync --locked --exact --all-groups
+        sync_project_env_exact "$ROOT_DIR" "$prod_env"
     fi
 
     local extra_args
@@ -2102,10 +3313,17 @@ cmd_stop() {
 
 cmd_help() {
     cat <<'EOF'
-Comfy Env Governance CLI (Batch-3)
+Comfy Env Governance CLI (Batch-4)
 
 Usage:
-  gov init
+  gov init --comfyui-dir <abs-path> --python <python-spec>
+  gov install [--requirements-file <path>]
+  gov install torch --index-url <url>
+  gov update run [--requirements-file <path>] [--timeout <seconds>]
+  gov update inspect <txid>
+  gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]
+  gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]
+  gov update abort <txid>
   gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]
   gov node remove <node_id> [--purge-code]
   gov tx run <node_id> [--timeout <seconds>]
@@ -2125,6 +3343,7 @@ Notes:
   - Undo requires current file hashes to match target operation post hashes.
   - Ops retention defaults to 100.
   - Resolve pins are persisted in dependency-groups.overrides.
+  - Initial setup is: init -> install torch -> install.
 EOF
 }
 
@@ -2134,6 +3353,47 @@ main() {
         init)
             shift
             cmd_init "$@"
+            ;;
+        install)
+            shift
+            case "${1:-}" in
+                torch)
+                    shift
+                    cmd_install_torch "$@"
+                    ;;
+                *)
+                    cmd_install_core "$@"
+                    ;;
+            esac
+            ;;
+        update)
+            shift
+            case "${1:-}" in
+                run)
+                    shift
+                    cmd_update_run "$@"
+                    ;;
+                inspect)
+                    shift
+                    cmd_update_inspect "$@"
+                    ;;
+                resolve)
+                    shift
+                    cmd_update_resolve "$@"
+                    ;;
+                promote)
+                    shift
+                    cmd_update_promote "$@"
+                    ;;
+                abort)
+                    shift
+                    cmd_update_abort "$@"
+                    ;;
+                *)
+                    echo "Usage: gov update {run|inspect|resolve|promote|abort} ..." >&2
+                    exit 1
+                    ;;
+            esac
             ;;
         node)
             shift

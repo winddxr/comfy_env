@@ -10,7 +10,9 @@
 - System Identity: `comfy_env` is a sidecar governance CLI that controls how ComfyUI custom-node dependency changes are observed, promoted, rolled back, and run.
 - Goals:
   - Make local dependency state reproducible from `pyproject.toml` and `uv.lock`.
+  - Make runtime prerequisites explicit through `gov init --comfyui-dir --python`.
   - Force plugin dependency changes through an observable candidate transaction before production promotion.
+  - Handle ComfyUI core requirements through `install` and `update` flows without bypassing local truth.
   - Preserve auditable state for transactions, operations, conflicts, and plugin registration.
   - Prefer automatic recovery before leaving local truth in a partially changed state.
 - Non-Goals:
@@ -54,7 +56,7 @@
 ## 4. Top-Level Decomposition
 
 - Application Core:
-  - [Governance CLI Orchestrator](./application-core/spec.md): command dispatch plus surface use cases S1-S6 (`init/status`, node lifecycle, tx execution, promotion/resolve, audit/undo, run/stop).
+  - [Governance CLI Orchestrator](./application-core/spec.md): command dispatch plus surface use cases for bootstrap/install, plugin lifecycle, plugin tx, core update tx, audit/undo, and runtime control.
 - Peer Subsystems:
   - [State Ledger](./subsystems/state-ledger/spec.md): durable local records for transactions, operations, plugin registry, and conflict artifacts (I1).
   - [Safety Guards](./subsystems/safety-guards/spec.md): core-impact gate, backup discipline, rollback posture, undo hash guard (I5).
@@ -80,14 +82,17 @@
   - [SKF-001](./key-flows/system.md#skf-001) `node add -> tx run -> inspect -> promote`
   - [SKF-002](./key-flows/system.md#skf-002) `promote lock conflict -> resolve -> re-promote`
   - [SKF-003](./key-flows/system.md#skf-003) `node remove/undo with backup restore`
+  - [SKF-004](./key-flows/system.md#skf-004) `init -> install torch -> install -> update run -> update promote`
 - Module KF Index:
-  - Application Core: `core#KF-001..006` in [application-core/spec.md](./application-core/spec.md#key-flows--failure-recovery)
+  - Application Core: `core#KF-001..009` in [application-core/spec.md](./application-core/spec.md#key-flows--failure-recovery)
   - State Ledger: `state-ledger#KF-001..003` in [state-ledger/spec.md](./subsystems/state-ledger/spec.md#key-flows--failure-recovery)
   - Safety Guards: `safety-guards#KF-001..003` in [safety-guards/spec.md](./subsystems/safety-guards/spec.md#key-flows--failure-recovery)
 - UC Index:
   - [UC-001 Manage plugin through transaction](./application-core/use-cases/UC-001-manage-plugin-through-transaction.md)
   - [UC-002 Remove plugin with reversible state](./application-core/use-cases/UC-002-remove-plugin-with-reversible-state.md)
   - [UC-003 Undo successful operation](./application-core/use-cases/UC-003-undo-successful-operation.md)
+  - [UC-008 Install managed runtime dependencies](./application-core/use-cases/UC-008-install-managed-runtime-dependencies.md)
+  - [UC-009 Transactional update of ComfyUI core requirements](./application-core/use-cases/UC-009-transactional-update-of-comfyui-core-requirements.md)
 
 ## 7. Data Sovereignty & Integration
 
@@ -125,7 +130,7 @@
   - No dedicated ADRs yet; reserve [adr/README.md](./adr/README.md).
 - Open Questions:
   - The codebase is a single shell entrypoint; future extraction into separate scripts may require re-drawing module boundaries from logical to physical modules.
-  - `resolve` currently uses interactive stdin only; non-interactive contract is not yet defined.
+  - Plugin `resolve` still uses interactive stdin while `update resolve` is parameterized; the long-term convergence path is still open.
 - Risk Register:
   - No explicit file locking, so overlapping local invocations can race on the same state files.
   - `undo` protects local truth files but intentionally excludes purged source trees.

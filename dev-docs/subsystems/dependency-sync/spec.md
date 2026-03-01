@@ -7,10 +7,10 @@
 
 ## Scope & External System Profile
 
-This adapter translates governance intent into `uv` operations across local truth files and virtual environments. It is the only logical module that should decide how to perform:
+This adapter translates governance intent into `uv` operations across local truth files and virtual environments. It owns:
 
-- `uv lock`
-- `uv sync --locked --exact --all-groups`
+- `uv lock --python ...`
+- `uv sync --python ... --locked --exact --all-groups`
 - `uv add --group ...`
 - `uv remove --group ...`
 - `uv pip freeze`
@@ -23,8 +23,11 @@ The external system is the `uv` CLI plus the filesystem locations for `.venv-pro
   - root `pyproject.toml`
   - root `uv.lock`
   - workdir copies of those files
-  - dependency-group names
-  - promotion plan files (`direct_additions`, `override_additions`)
+  - `runtime.python`
+  - dependency-group names (`core`, `torch`, plugin groups, `overrides`)
+  - ComfyUI `requirements.txt`
+  - torch index URL
+  - promotion/update staged workdirs
   - environment paths returned by `prod_env_path()` and `candidate_root_path()`
 - Output ports:
   - updated lock file
@@ -34,8 +37,8 @@ The external system is the `uv` CLI plus the filesystem locations for `.venv-pro
 
 ## Error Translation (Infra -> Domain/Application)
 
-- `uv lock` failure in promote/remove workdirs becomes:
-  - conflict when promotion plan cannot solve
+- `uv lock` failure in promote/remove/update workdirs becomes:
+  - conflict when a plan cannot solve
   - failed remove when dependency GC cannot lock
 - `uv sync` failure in prod becomes:
   - restore-required destructive failure
@@ -45,19 +48,25 @@ The external system is the `uv` CLI plus the filesystem locations for `.venv-pro
 ## Integration Behaviors / Key Flows
 
 - `dependency-sync#KF-001` Initialize prod environment
-  - Root `uv lock`, then exact sync into prod env.
-- `dependency-sync#KF-002` Materialize candidate observation env
+  - Root `uv lock --python`, then exact sync into prod env.
+- `dependency-sync#KF-002` Install managed torch group
+  - Stage `dependency-groups.torch` via `uv add`, then sync prod.
+- `dependency-sync#KF-003` Install managed core group
+  - Read `requirements.txt`, rewrite `dependency-groups.core`, then sync prod.
+- `dependency-sync#KF-004` Materialize plugin candidate observation env
   - Create candidate env path, exact sync, freeze before and after runtime execution.
-- `dependency-sync#KF-003` Apply promotion/remove plan in workdir
+- `dependency-sync#KF-005` Materialize core update candidate observation env
+  - Build a staged workdir from `requirements.txt`, exact sync it into a candidate env, then freeze prod vs candidate.
+- `dependency-sync#KF-006` Apply promotion/remove plan in workdir
   - Clone current truth into a workdir, mutate through `uv add/remove`, then `uv lock`.
-- `dependency-sync#KF-004` Rebuild prod after guarded mutation
+- `dependency-sync#KF-007` Rebuild prod after guarded mutation
   - Exact sync into prod after new truth is copied back to root.
 
 ## Runtime / Connectivity Constraints
 
 - Requires `uv` to be installed and on `PATH`.
 - Candidate and prod envs are local filesystem directories, not remote or shared runtimes.
-- Lock/sync cost is proportional to local resolver and package install behavior; the adapter does not promise low latency.
+- Python selection is explicit and driven by `runtime.python`.
 
 ## Schema / DDL
 
@@ -67,12 +76,14 @@ The external system is the `uv` CLI plus the filesystem locations for `.venv-pro
 
 | Doc ID | path | symbol | line |
 |---|---|---|---|
-| DS-001 | `bin/gov` | `write_group_deps` | 361 |
-| DS-002 | `bin/gov` | `collect_freeze_file` | 487 |
-| DS-003 | `bin/gov` | `build_workdir_for_tx` | 660 |
-| DS-004 | `bin/gov` | `apply_plan_in_workdir` | 672 |
-| DS-005 | `bin/gov` | `cmd_init` | 1258 |
-| DS-006 | `bin/gov` | `cmd_node_remove` | 1369 |
-| DS-007 | `bin/gov` | `cmd_tx_run` | 1484 |
-| DS-008 | `bin/gov` | `cmd_tx_promote` | 1772 |
-| DS-009 | `bin/gov` | `cmd_run` | 1990 |
+| DS-001 | `bin/gov` | `configured_python` | 262 |
+| DS-002 | `bin/gov` | `lock_project_exact` | 272 |
+| DS-003 | `bin/gov` | `sync_project_env_exact` | 284 |
+| DS-004 | `bin/gov` | `set_dependency_group_exact` | 530 |
+| DS-005 | `bin/gov` | `apply_plan_in_workdir` | 1027 |
+| DS-006 | `bin/gov` | `cmd_init` | 1765 |
+| DS-007 | `bin/gov` | `cmd_install_torch` | 2484 |
+| DS-008 | `bin/gov` | `cmd_install_core` | 2554 |
+| DS-009 | `bin/gov` | `cmd_update_run` | 2644 |
+| DS-010 | `bin/gov` | `cmd_tx_promote` | 2309 |
+| DS-011 | `bin/gov` | `cmd_run` | 3201 |

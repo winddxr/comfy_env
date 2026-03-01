@@ -7,4 +7,5 @@ dependencies = []
 
 [dependency-groups]
 core = []
+torch = []
 overrides = []
