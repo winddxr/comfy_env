@@ -1,15 +1,18 @@
 # Comfy Environment Governance (`comfy_env`)
 
 ComfyUI 依赖治理系统。
-它现在同时覆盖两类依赖面：
+完全切换到切换到的高速UV并且具备更好缓存策略的依赖管理，同时并且不破坏项目本体pyptoject.toml避免每次git时候的合并操作。支持本体和插件的依赖事务管理，可以精确回滚，保证不炸环境。放心升级和折腾，
+现在同时覆盖两类依赖面：
 
 1. 插件依赖：继续使用 `tx run -> tx promote -> undo`
 2. ComfyUI 本地核心依赖：使用 `init -> install torch -> install` 完成首装，后续使用 `update run -> update promote -> undo`
 
+面向AI使用和coding优化。
+
 ## 0. 如果你是 AI
 
-1. 开发或审计时，先读 `dev-docs/architecture-haiku.md`，把它当作唯一入口导航。
-
+1. 开发或审计时，阅读 `dev-docs/architecture-haiku.md`，把它当作唯一入口导航。
+2. 使用时，阅读：`docs/04_cli_reference.md`
 ## 1. 项目目标
 
 1. 可复现：本地 `pyproject.toml + uv.lock` 可重建依赖环境。
