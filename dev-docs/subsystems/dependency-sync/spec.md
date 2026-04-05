@@ -10,7 +10,9 @@
 This adapter translates governance intent into `uv` operations across local truth files and virtual environments. It owns:
 
 - `uv lock --python ...`
+- `uv lock --check --python ...`
 - `uv sync --python ... --locked --exact --all-groups`
+- `uv export --format pylock.toml --locked --all-groups`
 - `uv add --group ...`
 - `uv remove --group ...`
 - `uv pip freeze`
@@ -61,6 +63,10 @@ The external system is the `uv` CLI plus the filesystem locations for `.venv-pro
   - Clone current truth into a workdir, mutate through `uv add/remove`, then `uv lock`.
 - `dependency-sync#KF-007` Rebuild prod after guarded mutation
   - Exact sync into prod after new truth is copied back to root.
+- `dependency-sync#KF-008` Export bundle lock payload
+  - Export `pylock.toml` from the current locked truth without re-locking.
+- `dependency-sync#KF-009` Verify and stage imported truth
+  - Copy bundle truth into a staging workdir, run lock check, then exact sync prod from staging truth.
 
 ## Runtime / Connectivity Constraints
 

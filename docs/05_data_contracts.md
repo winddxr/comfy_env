@@ -64,7 +64,7 @@
 `state/ops/<op_id>/meta.json`：
 
 1. `op_id`
-2. `kind`（`promote` / `remove` / `manual`）
+2. `kind`（如 `promote` / `remove` / `manual` / `env_import`）
 3. `ref`
 4. `status`（`running` / `success` / `failed` / `undone`）
 5. `started_at`
@@ -113,3 +113,24 @@
 
 1. `uv sync --locked --exact --all-groups`
 2. `dependency-groups` 中受管依赖属于重建范围。
+
+## 8. Bundle 交付物契约
+
+环境迁移 bundle 是交付物，不是本地真相层。v1 目录结构至少包含：
+
+1. `manifest.json`
+2. `pyproject.toml`
+3. `uv.lock`
+4. `pylock.toml`
+5. `state/plugins.json`
+6. `custom_nodes/<node_id>/`
+7. `audit/prod-freeze.txt`
+8. `audit/export-summary.json`
+
+语义约束：
+
+1. `pyproject.toml + uv.lock` 仍是导入后的本地依赖真相。
+2. `pylock.toml` 是标准化导出物与审计辅助，不替代导入后的本地真相。
+3. `paths.comfyui_dir` 不属于 bundle 真相；目标机路径必须由 `env import --comfyui-dir` 指定。
+4. `env import` 默认执行 exact restore；导入后目标机的 `custom_nodes/*` 目录集合应与 bundle registry 一致。
+5. v1 不支持 partial import、nodes-only import 或按节点依赖增量导入。

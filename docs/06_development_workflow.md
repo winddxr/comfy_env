@@ -12,6 +12,9 @@
 2. 仅在确认后替换 root 真相文件。
 3. destructive 前创建 op backup。
 4. 失败第一动作：恢复 pre-op backup。
+5. `env import` 这类整体恢复路径，必须先校验 bundle 完整性与 staging lock，再改写 root truth。
+6. 若 destructive 同时覆盖了 `custom_nodes` 源码目录，也必须有对应的失败恢复路径。
+7. 若 `env import` 默认会清理 bundle 外节点目录，则被清理的目录也属于必须可回滚的恢复范围。
 
 ## 3. 评审清单
 

@@ -129,11 +129,11 @@ v1 先不做 `nodes-only import` 或 `partial import`。
 
 ### 6.2 Import
 
-1. 导入只针对空白环境或明确允许覆盖的目标目录。
+1. 导入默认按 bundle 对目标机做精确恢复，不区分“空白目标”和“允许覆盖”两种模式。
 2. 先解包并校验 `manifest.json` 与关键文件完整性。
 3. 失败即退出，不提前改写 root truth。
 4. 将 `pyproject.toml`、`uv.lock`、`state/plugins.json` 复制到 staging workdir。
-5. 将 `custom_nodes` 源码复制到目标 `ComfyUI/custom_nodes/`。
+5. 先清理目标 `ComfyUI/custom_nodes/` 下 bundle 未声明的节点目录，再将 bundle 中的节点源码恢复到目标路径。
 6. 用 staging truth 执行依赖重建，优先验证：
    - `uv lock --check` 或等效“锁文件不漂移”校验
    - `uv pip sync pylock.toml` 或继续复用现有 `sync_project_env_exact` 路径
@@ -207,8 +207,8 @@ v1 先不做 `nodes-only import` 或 `partial import`。
 
 1. `uv.lock` 过期时 export 应失败，不自动 re-lock。
 2. bundle 缺文件或 hash 不一致时 import 应失败。
-3. 目标目录已有冲突节点目录时 import 应失败或要求显式覆盖。
-4. 依赖同步失败时应回滚 root truth，不留下半完成状态。
+3. 依赖同步失败时应回滚 root truth，不留下半完成状态。
+4. 若 import 已清理 bundle 外节点目录，失败回滚时应恢复这些目录。
 
 ### 9.3 边界路径
 

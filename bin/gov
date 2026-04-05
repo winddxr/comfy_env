@@ -236,12 +236,20 @@ config_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 PY
 }
 
-ensure_layout() {
+ensure_state_dirs() {
     mkdir -p "${STATE_DIR}" "${TX_DIR}" "${LOG_DIR}" "${CONFLICT_DIR}" "${WORK_DIR}" "${CACHE_WHEELS_DIR}" "${OPS_DIR}" "${ROOT_DIR}/.venv-candidate"
+}
+
+ensure_plugins_registry() {
     if [ ! -f "${PLUGINS_FILE}" ]; then
         printf '[]\n' > "${PLUGINS_FILE}"
     fi
     migrate_plugins_registry
+}
+
+ensure_layout() {
+    ensure_state_dirs
+    ensure_plugins_registry
 }
 
 ensure_project_file_for_init() {
@@ -374,7 +382,7 @@ new_txid() {
     "${PYTHON_BIN}" - <<'PY'
 import datetime
 import uuid
-print(datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8])
+print(datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8])
 PY
 }
 
@@ -383,7 +391,7 @@ new_op_id() {
     "${PYTHON_BIN}" - <<'PY'
 import datetime
 import uuid
-print(datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-op-" + uuid.uuid4().hex[:8])
+print(datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ") + "-op-" + uuid.uuid4().hex[:8])
 PY
 }
 
@@ -401,6 +409,46 @@ if not p.exists():
     raise SystemExit(0)
 print(hashlib.sha256(p.read_bytes()).hexdigest())
 PY
+}
+
+backup_file_with_marker() {
+    local src="$1"
+    local backup="$2"
+    local marker="$3"
+    if [ -e "$src" ]; then
+        cp -a "$src" "$backup"
+        printf '1\n' > "$marker"
+    else
+        : > "$backup"
+        printf '0\n' > "$marker"
+    fi
+}
+
+restore_file_with_marker() {
+    local backup="$1"
+    local dst="$2"
+    local marker="$3"
+    local existed="0"
+    if [ -f "$marker" ]; then
+        existed="$(tr -d '\n' < "$marker")"
+    fi
+    if [ "$existed" = "1" ]; then
+        cp -a "$backup" "$dst"
+    else
+        rm -f "$dst"
+    fi
+}
+
+run_smoke_test_in_env() {
+    local env_path="$1"
+    local comfyui_dir="$2"
+    local smoke_cmd
+    smoke_cmd="$(smoke_test_cmd)"
+    if [ -n "$smoke_cmd" ]; then
+        (cd "$comfyui_dir" && PATH="$env_path/bin:$PATH" bash -lc "$smoke_cmd")
+    else
+        "$env_path/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1
+    fi
 }
 
 dep_name_from_spec() {
@@ -611,7 +659,7 @@ PY
 op_begin() {
     local kind="$1"
     local ref="$2"
-    ensure_layout
+    ensure_state_dirs
     require_python
 
     local op_id op_dir backup_dir
@@ -620,13 +668,9 @@ op_begin() {
     backup_dir="${op_dir}/backup"
     mkdir -p "$backup_dir"
 
-    cp "$PROJECT_FILE" "${backup_dir}/pyproject.toml"
-    if [ -f "$LOCK_FILE" ]; then
-        cp "$LOCK_FILE" "${backup_dir}/uv.lock"
-    else
-        : > "${backup_dir}/uv.lock"
-    fi
-    cp "$PLUGINS_FILE" "${backup_dir}/plugins.json"
+    backup_file_with_marker "$PROJECT_FILE" "${backup_dir}/pyproject.toml" "${backup_dir}/pyproject.toml.present"
+    backup_file_with_marker "$LOCK_FILE" "${backup_dir}/uv.lock" "${backup_dir}/uv.lock.present"
+    backup_file_with_marker "$PLUGINS_FILE" "${backup_dir}/plugins.json" "${backup_dir}/plugins.json.present"
 
     "${PYTHON_BIN}" - "$op_dir/meta.json" "$op_id" "$kind" "$ref" "$(timestamp_utc)" "$backup_dir" \
         "$(file_sha256 "$PROJECT_FILE")" "$(file_sha256 "$LOCK_FILE")" "$(file_sha256 "$PLUGINS_FILE")" <<'PY'
@@ -665,9 +709,9 @@ op_restore_backup() {
         echo "ERROR: op backup missing: $op_id" >&2
         return 1
     fi
-    cp "${backup_dir}/pyproject.toml" "$PROJECT_FILE"
-    cp "${backup_dir}/uv.lock" "$LOCK_FILE"
-    cp "${backup_dir}/plugins.json" "$PLUGINS_FILE"
+    restore_file_with_marker "${backup_dir}/pyproject.toml" "$PROJECT_FILE" "${backup_dir}/pyproject.toml.present"
+    restore_file_with_marker "${backup_dir}/uv.lock" "$LOCK_FILE" "${backup_dir}/uv.lock.present"
+    restore_file_with_marker "${backup_dir}/plugins.json" "$PLUGINS_FILE" "${backup_dir}/plugins.json.present"
 }
 
 op_finalize() {
@@ -711,6 +755,549 @@ plugin_install_abs_path() {
     local comfyui_dir
     comfyui_dir="$(comfyui_dir_path)"
     echo "${comfyui_dir}/${rel_path}"
+}
+
+plugin_install_abs_path_for() {
+    local comfyui_dir="$1"
+    local rel_path="$2"
+    echo "${comfyui_dir}/${rel_path}"
+}
+
+bundle_export_pylock() {
+    local bundle_dir="$1"
+    local pylock_file="${bundle_dir}/pylock.toml"
+    (
+        cd "$ROOT_DIR"
+        uv export --format pylock.toml --locked --all-groups --output-file "$pylock_file"
+    )
+}
+
+bundle_copy_custom_nodes() {
+    local bundle_dir="$1"
+    local comfyui_dir="$2"
+    local plugins_file="${3:-$PLUGINS_FILE}"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$comfyui_dir" "$plugins_file" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1])
+comfyui_dir = pathlib.Path(sys.argv[2]).resolve()
+plugins_path = pathlib.Path(sys.argv[3])
+custom_nodes_root = bundle_dir / "custom_nodes"
+custom_nodes_root.mkdir(parents=True, exist_ok=True)
+
+try:
+    data = json.loads(plugins_path.read_text(encoding="utf-8")) if plugins_path.exists() else []
+except Exception as exc:
+    raise SystemExit(f"ERROR: failed to read plugins registry: {exc}")
+
+if not isinstance(data, list):
+    raise SystemExit("ERROR: plugins registry must be a JSON array")
+
+def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
+    rel_path = pathlib.Path(rel)
+    if rel_path.is_absolute():
+        raise SystemExit(f"ERROR: {label} must be relative: {rel}")
+    target = (base / rel_path).resolve()
+    try:
+        target.relative_to(base)
+    except Exception:
+        raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
+    return target
+
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    node_id = str(item.get("id") or "").strip()
+    if not node_id:
+        raise SystemExit("ERROR: plugins registry contains item without id")
+    rel = str(item.get("install_relpath") or f"custom_nodes/{node_id}").strip()
+    source_dir = resolve_under(comfyui_dir, rel, f"install_relpath for node '{node_id}'")
+    if not source_dir.exists() or not source_dir.is_dir():
+        raise SystemExit(f"ERROR: plugin source directory missing for node '{node_id}': {source_dir}")
+    dest_dir = custom_nodes_root / node_id
+    if dest_dir.exists():
+        shutil.rmtree(dest_dir)
+    shutil.copytree(source_dir, dest_dir)
+PY
+}
+
+bundle_write_export_summary() {
+    local bundle_dir="$1"
+    local created_at="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$created_at" "$(configured_python)" <<'PY'
+import json
+import pathlib
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1])
+created_at = sys.argv[2]
+python_spec = sys.argv[3]
+plugins_path = bundle_dir / "state" / "plugins.json"
+project_path = bundle_dir / "pyproject.toml"
+
+try:
+    plugins = json.loads(plugins_path.read_text(encoding="utf-8")) if plugins_path.exists() else []
+except Exception:
+    plugins = []
+
+node_ids = []
+for item in plugins:
+    if isinstance(item, dict) and str(item.get("id") or "").strip():
+        node_ids.append(str(item["id"]).strip())
+
+summary = {
+    "created_at": created_at,
+    "python_spec": python_spec,
+    "node_ids": sorted(node_ids),
+    "node_count": len(node_ids),
+    "has_pyproject": project_path.exists(),
+    "has_uv_lock": (bundle_dir / "uv.lock").exists(),
+    "has_pylock": (bundle_dir / "pylock.toml").exists(),
+}
+
+out_path = bundle_dir / "audit" / "export-summary.json"
+out_path.parent.mkdir(parents=True, exist_ok=True)
+out_path.write_text(json.dumps(summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+bundle_manifest_write() {
+    local bundle_dir="$1"
+    local created_at="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$created_at" "$(configured_python)" <<'PY'
+import getpass
+import hashlib
+import json
+import pathlib
+import platform
+import socket
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+created_at = sys.argv[2]
+python_spec = sys.argv[3]
+manifest_path = bundle_dir / "manifest.json"
+plugins_path = bundle_dir / "state" / "plugins.json"
+
+try:
+    plugins = json.loads(plugins_path.read_text(encoding="utf-8")) if plugins_path.exists() else []
+except Exception:
+    plugins = []
+
+node_ids = []
+for item in plugins:
+    if isinstance(item, dict) and str(item.get("id") or "").strip():
+        node_ids.append(str(item["id"]).strip())
+
+files = {}
+for path in sorted(p for p in bundle_dir.rglob("*") if p.is_file() and p != manifest_path):
+    rel = str(path.relative_to(bundle_dir)).replace("\\", "/")
+    files[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+payload = {
+    "bundle_format_version": "1",
+    "created_at": created_at,
+    "created_by": f"{getpass.getuser()}@{socket.gethostname()}",
+    "python_spec": python_spec,
+    "python_version": platform.python_version(),
+    "platform_system": platform.system(),
+    "platform_machine": platform.machine(),
+    "node_ids": sorted(node_ids),
+    "files": {
+        "sha256": files,
+    },
+}
+
+manifest_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+bundle_manifest_verify() {
+    local bundle_dir="$1"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+manifest_path = bundle_dir / "manifest.json"
+if not bundle_dir.exists() or not bundle_dir.is_dir():
+    raise SystemExit(f"ERROR: bundle directory not found: {bundle_dir}")
+if not manifest_path.exists():
+    raise SystemExit(f"ERROR: bundle manifest missing: {manifest_path}")
+
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+required_top = [
+    "bundle_format_version",
+    "created_at",
+    "created_by",
+    "python_spec",
+    "python_version",
+    "platform_system",
+    "platform_machine",
+    "node_ids",
+    "files",
+]
+for key in required_top:
+    if key not in manifest:
+        raise SystemExit(f"ERROR: manifest missing field: {key}")
+
+sha_map = (manifest.get("files") or {}).get("sha256")
+if not isinstance(sha_map, dict):
+    raise SystemExit("ERROR: manifest files.sha256 must be a mapping")
+
+required_files = [
+    "pyproject.toml",
+    "uv.lock",
+    "pylock.toml",
+    "state/plugins.json",
+    "audit/prod-freeze.txt",
+    "audit/export-summary.json",
+]
+for rel in required_files:
+    if rel not in sha_map:
+        raise SystemExit(f"ERROR: manifest missing checksum entry for {rel}")
+
+for rel, expected in sha_map.items():
+    path = bundle_dir / rel
+    if not path.exists() or not path.is_file():
+        raise SystemExit(f"ERROR: bundle file missing: {rel}")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != expected:
+        raise SystemExit(f"ERROR: bundle checksum mismatch: {rel}")
+PY
+}
+
+bundle_check_import_conflicts() {
+    local bundle_dir="$1"
+    local comfyui_dir="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$comfyui_dir" <<'PY'
+import json
+import pathlib
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+raw_comfyui_dir = pathlib.Path(sys.argv[2])
+if not raw_comfyui_dir.is_absolute():
+    raise SystemExit(f"ERROR: ComfyUI path must be absolute: {raw_comfyui_dir}")
+comfyui_dir = raw_comfyui_dir.resolve()
+bundle_plugins = bundle_dir / "state" / "plugins.json"
+
+if not comfyui_dir.exists() or not comfyui_dir.is_dir():
+    raise SystemExit(f"ERROR: ComfyUI directory not found: {comfyui_dir}")
+
+try:
+    data = json.loads(bundle_plugins.read_text(encoding="utf-8"))
+except Exception as exc:
+    raise SystemExit(f"ERROR: failed to read bundle plugins registry: {exc}")
+
+if not isinstance(data, list):
+    raise SystemExit("ERROR: bundle plugins registry must be a JSON array")
+
+def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
+    rel_path = pathlib.Path(rel)
+    if rel_path.is_absolute():
+        raise SystemExit(f"ERROR: {label} must be relative: {rel}")
+    target = (base / rel_path).resolve()
+    try:
+        target.relative_to(base)
+    except Exception:
+        raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
+    return target
+
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    node_id = str(item.get("id") or "").strip()
+    if not node_id:
+        raise SystemExit("ERROR: bundle plugins registry contains item without id")
+    rel = str(item.get("install_relpath") or f"custom_nodes/{node_id}").strip()
+    resolve_under(comfyui_dir, rel, f"install_relpath for node '{node_id}'")
+PY
+}
+
+bundle_stage_truth() {
+    local bundle_dir="$1"
+    local workdir="$2"
+    mkdir -p "$workdir/state"
+    cp "${bundle_dir}/pyproject.toml" "${workdir}/pyproject.toml"
+    cp "${bundle_dir}/uv.lock" "${workdir}/uv.lock"
+    cp "${bundle_dir}/state/plugins.json" "${workdir}/state/plugins.json"
+}
+
+bundle_lock_check() {
+    local workdir="$1"
+    local py="$2"
+    (
+        cd "$workdir"
+        uv lock --check --python "$py"
+    )
+}
+
+bundle_restore_plugins_registry() {
+    local bundle_dir="$1"
+    cp "${bundle_dir}/state/plugins.json" "$PLUGINS_FILE"
+}
+
+bundle_backup_custom_nodes() {
+    local bundle_dir="$1"
+    local op_id="$2"
+    local comfyui_dir="$3"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "${OPS_DIR}/${op_id}/backup" "$comfyui_dir" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+backup_dir = pathlib.Path(sys.argv[2]).resolve()
+comfyui_dir = pathlib.Path(sys.argv[3]).resolve()
+plugins_path = bundle_dir / "state" / "plugins.json"
+backup_root = backup_dir / "custom_nodes"
+manifest_path = backup_dir / "custom_nodes_manifest.json"
+custom_nodes_root = comfyui_dir / "custom_nodes"
+backup_root.mkdir(parents=True, exist_ok=True)
+
+try:
+    data = json.loads(plugins_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    raise SystemExit(f"ERROR: failed to read bundle plugins registry: {exc}")
+
+if not isinstance(data, list):
+    raise SystemExit("ERROR: bundle plugins registry must be a JSON array")
+
+def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
+    rel_path = pathlib.Path(rel)
+    if rel_path.is_absolute():
+        raise SystemExit(f"ERROR: {label} must be relative: {rel}")
+    target = (base / rel_path).resolve()
+    try:
+        target.relative_to(base)
+    except Exception:
+        raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
+    return target
+
+if custom_nodes_root.exists() and not custom_nodes_root.is_dir():
+    raise SystemExit(f"ERROR: target custom_nodes root is not a directory: {custom_nodes_root}")
+
+records = []
+expected_custom_node_dirs = set()
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    node_id = str(item.get("id") or "").strip()
+    if not node_id:
+        raise SystemExit("ERROR: bundle plugins registry contains item without id")
+    rel = str(item.get("install_relpath") or f"custom_nodes/{node_id}").strip()
+    rel_path = pathlib.Path(rel)
+    if len(rel_path.parts) >= 2 and rel_path.parts[0] == "custom_nodes":
+        expected_custom_node_dirs.add(rel_path.parts[1])
+    target = resolve_under(comfyui_dir, rel, f"install_relpath for node '{node_id}'")
+    existed = target.exists()
+    if existed and not target.is_dir():
+        raise SystemExit(f"ERROR: target path is not a directory for node '{node_id}': {target}")
+    backup_name = ""
+    if existed:
+        backup_name = f"entry-{len(records):04d}"
+        dest = backup_root / backup_name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(target, dest)
+    records.append({
+        "node_id": node_id,
+        "install_relpath": rel,
+        "existed": existed,
+        "backup_name": backup_name,
+    })
+
+if custom_nodes_root.exists():
+    for child in sorted(custom_nodes_root.iterdir(), key=lambda p: p.name):
+        if not child.is_dir():
+            continue
+        if child.name in expected_custom_node_dirs:
+            continue
+        rel = str(child.relative_to(comfyui_dir)).replace("\\", "/")
+        backup_name = f"entry-{len(records):04d}"
+        dest = backup_root / backup_name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(child, dest)
+        records.append({
+            "node_id": child.name,
+            "install_relpath": rel,
+            "existed": True,
+            "backup_name": backup_name,
+        })
+
+manifest_path.write_text(json.dumps({"records": records}, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+bundle_apply_custom_nodes() {
+    local bundle_dir="$1"
+    local comfyui_dir="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$comfyui_dir" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+comfyui_dir = pathlib.Path(sys.argv[2]).resolve()
+plugins_path = bundle_dir / "state" / "plugins.json"
+custom_nodes_root = comfyui_dir / "custom_nodes"
+
+try:
+    data = json.loads(plugins_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    raise SystemExit(f"ERROR: failed to read bundle plugins registry: {exc}")
+
+if not isinstance(data, list):
+    raise SystemExit("ERROR: bundle plugins registry must be a JSON array")
+
+def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
+    rel_path = pathlib.Path(rel)
+    if rel_path.is_absolute():
+        raise SystemExit(f"ERROR: {label} must be relative: {rel}")
+    target = (base / rel_path).resolve()
+    try:
+        target.relative_to(base)
+    except Exception:
+        raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
+    return target
+
+if custom_nodes_root.exists() and not custom_nodes_root.is_dir():
+    raise SystemExit(f"ERROR: target custom_nodes root is not a directory: {custom_nodes_root}")
+
+expected_custom_node_dirs = set()
+entries = []
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    node_id = str(item.get("id") or "").strip()
+    if not node_id:
+        raise SystemExit("ERROR: bundle plugins registry contains item without id")
+    rel = str(item.get("install_relpath") or f"custom_nodes/{node_id}").strip()
+    rel_path = pathlib.Path(rel)
+    if len(rel_path.parts) >= 2 and rel_path.parts[0] == "custom_nodes":
+        expected_custom_node_dirs.add(rel_path.parts[1])
+    source = bundle_dir / "custom_nodes" / node_id
+    if not source.exists() or not source.is_dir():
+        raise SystemExit(f"ERROR: bundle custom_nodes payload missing for node '{node_id}': {source}")
+    target = resolve_under(comfyui_dir, rel, f"install_relpath for node '{node_id}'")
+    entries.append((node_id, source, target))
+
+if custom_nodes_root.exists():
+    for child in sorted(custom_nodes_root.iterdir(), key=lambda p: p.name):
+        if child.is_dir() and child.name not in expected_custom_node_dirs:
+            shutil.rmtree(child)
+
+for node_id, source, target in entries:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if not target.is_dir():
+            raise SystemExit(f"ERROR: target path is not a directory for node '{node_id}': {target}")
+        shutil.rmtree(target)
+    shutil.copytree(source, target)
+PY
+}
+
+bundle_restore_custom_nodes() {
+    local op_id="$1"
+    local comfyui_dir="$2"
+    require_python
+    "${PYTHON_BIN}" - "${OPS_DIR}/${op_id}/backup" "$comfyui_dir" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+backup_dir = pathlib.Path(sys.argv[1]).resolve()
+comfyui_dir = pathlib.Path(sys.argv[2]).resolve()
+manifest_path = backup_dir / "custom_nodes_manifest.json"
+backup_root = backup_dir / "custom_nodes"
+if not manifest_path.exists():
+    raise SystemExit(0)
+
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+records = manifest.get("records", [])
+
+def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
+    rel_path = pathlib.Path(rel)
+    if rel_path.is_absolute():
+        raise SystemExit(f"ERROR: {label} must be relative: {rel}")
+    target = (base / rel_path).resolve()
+    try:
+        target.relative_to(base)
+    except Exception:
+        raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
+    return target
+
+for record in records:
+    if not isinstance(record, dict):
+        continue
+    node_id = str(record.get("node_id") or "").strip()
+    rel = str(record.get("install_relpath") or f"custom_nodes/{node_id}").strip()
+    backup_name = str(record.get("backup_name") or "").strip()
+    target = resolve_under(comfyui_dir, rel, f"install_relpath for node '{node_id}'")
+    if target.exists():
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    if record.get("existed"):
+        if not backup_name:
+            raise SystemExit(f"ERROR: custom_nodes backup marker missing for node '{node_id}'")
+        source = backup_root / backup_name
+        if not source.exists() or not source.is_dir():
+            raise SystemExit(f"ERROR: custom_nodes backup missing for node '{node_id}': {source}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, target)
+PY
+}
+
+bundle_backup_config() {
+    local op_id="$1"
+    local backup_dir="${OPS_DIR}/${op_id}/backup"
+    backup_file_with_marker "$CONFIG_FILE" "${backup_dir}/config.toml" "${backup_dir}/config.toml.present"
+}
+
+bundle_restore_config() {
+    local op_id="$1"
+    local backup_dir="${OPS_DIR}/${op_id}/backup"
+    restore_file_with_marker "${backup_dir}/config.toml" "$CONFIG_FILE" "${backup_dir}/config.toml.present"
+}
+
+bundle_node_count() {
+    local plugins_file="$1"
+    require_python
+    "${PYTHON_BIN}" - "$plugins_file" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+except Exception:
+    data = []
+count = 0
+for item in data:
+    if isinstance(item, dict) and str(item.get("id") or "").strip():
+        count += 1
+print(count)
+PY
 }
 
 write_group_deps() {
@@ -3097,6 +3684,193 @@ cmd_update_abort() {
     echo "  txid: $txid"
 }
 
+env_import_restore_after_failure() {
+    local op_id="$1"
+    local comfyui_dir="$2"
+    local restore_py="$3"
+
+    bundle_restore_config "$op_id" || true
+    bundle_restore_custom_nodes "$op_id" "$comfyui_dir" || true
+    op_restore_backup "$op_id" || true
+
+    local prod_env
+    prod_env="$(prod_env_path)"
+    if [ -f "$PROJECT_FILE" ]; then
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$restore_py" || true
+    else
+        rm -rf "$prod_env"
+    fi
+}
+
+cmd_env_export() {
+    require_cmd uv
+    ensure_layout
+
+    local output_dir="${1:-}"
+    if [ -z "$output_dir" ]; then
+        echo "Usage: gov env export <output_dir>" >&2
+        exit 1
+    fi
+
+    if [ ! -f "$PROJECT_FILE" ]; then
+        echo "ERROR: missing $PROJECT_FILE" >&2
+        exit 1
+    fi
+    if [ ! -f "$LOCK_FILE" ]; then
+        echo "ERROR: missing $LOCK_FILE" >&2
+        exit 1
+    fi
+    if [ ! -f "$PLUGINS_FILE" ]; then
+        echo "ERROR: missing $PLUGINS_FILE" >&2
+        exit 1
+    fi
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "ERROR: missing $CONFIG_FILE" >&2
+        exit 1
+    fi
+
+    local comfyui_dir
+    comfyui_dir="$(comfyui_dir_path)"
+    if [ ! -d "$comfyui_dir" ]; then
+        echo "ERROR: ComfyUI directory not found: $comfyui_dir" >&2
+        exit 1
+    fi
+
+    if [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; then
+        echo "ERROR: export path exists and is not a directory: $output_dir" >&2
+        exit 1
+    fi
+    if [ -d "$output_dir" ] && [ -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+        echo "ERROR: export directory is not empty: $output_dir" >&2
+        exit 1
+    fi
+
+    mkdir -p "$output_dir/state" "$output_dir/audit" "$output_dir/custom_nodes"
+
+    cp "$PROJECT_FILE" "$output_dir/pyproject.toml"
+    cp "$LOCK_FILE" "$output_dir/uv.lock"
+    cp "$PLUGINS_FILE" "$output_dir/state/plugins.json"
+    bundle_export_pylock "$output_dir"
+    bundle_copy_custom_nodes "$output_dir" "$comfyui_dir" "$PLUGINS_FILE"
+
+    local prod_env created_at node_count
+    prod_env="$(prod_env_path)"
+    collect_freeze_file "$prod_env" "$output_dir/audit/prod-freeze.txt"
+    created_at="$(timestamp_utc)"
+    bundle_write_export_summary "$output_dir" "$created_at"
+    bundle_manifest_write "$output_dir" "$created_at"
+    node_count="$(bundle_node_count "$output_dir/state/plugins.json")"
+
+    echo "Environment bundle exported."
+    echo "  output_dir: $output_dir"
+    echo "  python: $(configured_python)"
+    echo "  node_count: $node_count"
+    echo "  manifest: $output_dir/manifest.json"
+}
+
+cmd_env_import() {
+    require_cmd uv
+
+    local bundle_dir="${1:-}"
+    shift || true
+    if [ -z "$bundle_dir" ]; then
+        echo "Usage: gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>" >&2
+        exit 1
+    fi
+
+    local comfyui_dir=""
+    local python_spec=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --comfyui-dir)
+                comfyui_dir="${2:-}"
+                shift 2
+                ;;
+            --python)
+                python_spec="${2:-}"
+                shift 2
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ -z "$comfyui_dir" ] || [ -z "$python_spec" ]; then
+        echo "Usage: gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>" >&2
+        exit 1
+    fi
+
+    bundle_manifest_verify "$bundle_dir"
+
+    local pre_restore_py current_prod_env
+    pre_restore_py="$(config_get "runtime.python" "$python_spec")"
+    current_prod_env="$(prod_env_path)"
+    bundle_check_import_conflicts "$bundle_dir" "$comfyui_dir"
+
+    local op_id
+    op_id="$(op_begin "env_import" "$bundle_dir")"
+    bundle_backup_config "$op_id"
+    bundle_backup_custom_nodes "$bundle_dir" "$op_id" "$comfyui_dir"
+
+    local workdir
+    workdir="${WORK_DIR}/env-import-${op_id}"
+    rm -rf "$workdir"
+    mkdir -p "$workdir"
+    bundle_stage_truth "$bundle_dir" "$workdir"
+
+    if ! bundle_lock_check "$workdir" "$python_spec"; then
+        echo "ERROR: bundle lock check failed" >&2
+        env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
+        op_finalize "$op_id" "failed" "false" "env import failed: bundle lock check failed"
+        exit 1
+    fi
+
+    if ! sync_project_env_exact "$workdir" "$current_prod_env" "$python_spec"; then
+        echo "ERROR: prod sync failed during env import" >&2
+        env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
+        op_finalize "$op_id" "failed" "false" "env import failed: prod sync failed"
+        exit 1
+    fi
+
+    if ! bundle_apply_custom_nodes "$bundle_dir" "$comfyui_dir"; then
+        echo "ERROR: failed to restore custom_nodes payload" >&2
+        env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
+        op_finalize "$op_id" "failed" "false" "env import failed: custom_nodes restore failed"
+        exit 1
+    fi
+
+    cp "${workdir}/pyproject.toml" "$PROJECT_FILE"
+    cp "${workdir}/uv.lock" "$LOCK_FILE"
+    bundle_restore_plugins_registry "$bundle_dir"
+
+    if ! ensure_config_file_for_init "$comfyui_dir" "$python_spec"; then
+        echo "ERROR: failed to update config.toml during env import" >&2
+        env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
+        op_finalize "$op_id" "failed" "false" "env import failed: config update failed"
+        exit 1
+    fi
+
+    local final_prod_env
+    final_prod_env="$(prod_env_path)"
+    if ! run_smoke_test_in_env "$final_prod_env" "$comfyui_dir"; then
+        echo "ERROR: smoke test failed during env import" >&2
+        env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
+        op_finalize "$op_id" "failed" "false" "env import failed: smoke test failed"
+        exit 1
+    fi
+
+    op_finalize "$op_id" "success" "false" "env import succeeded"
+    ops_prune
+
+    echo "Environment bundle imported."
+    echo "  bundle_dir: $bundle_dir"
+    echo "  comfyui_dir: $comfyui_dir"
+    echo "  python: $python_spec"
+    echo "  op_id: $op_id"
+}
+
 cmd_status() {
     ensure_layout
     local prod_env
@@ -3324,6 +4098,8 @@ Usage:
   gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]
   gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]
   gov update abort <txid>
+  gov env export <output_dir>
+  gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>
   gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]
   gov node remove <node_id> [--purge-code]
   gov tx run <node_id> [--timeout <seconds>]
@@ -3391,6 +4167,23 @@ main() {
                     ;;
                 *)
                     echo "Usage: gov update {run|inspect|resolve|promote|abort} ..." >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        env)
+            shift
+            case "${1:-}" in
+                export)
+                    shift
+                    cmd_env_export "$@"
+                    ;;
+                import)
+                    shift
+                    cmd_env_import "$@"
+                    ;;
+                *)
+                    echo "Usage: gov env {export|import} ..." >&2
                     exit 1
                     ;;
             esac

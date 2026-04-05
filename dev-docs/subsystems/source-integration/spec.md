@@ -42,11 +42,16 @@ The external systems are:
   - convert `install_relpath` into an absolute path under configured ComfyUI root
 - `source-integration#KF-003` Purge source on explicit request
   - delete the plugin path only when `--purge-code` is passed during remove
+- `source-integration#KF-004` Export source snapshot bundle
+  - copy each registered node source tree into bundle `custom_nodes/<node_id>/`
+- `source-integration#KF-005` Restore source snapshot from bundle
+  - restore each bundled node snapshot to target `install_relpath`, and purge bundle 外的 `custom_nodes/*` 目录 during exact import
 
 ## Runtime / Connectivity Constraints
 
 - Requires `git` on `PATH` for add flows.
 - Assumes the configured ComfyUI directory is writable by the local operator.
+- `comfyui_dir` is target-machine local configuration and is never restored from bundle payload.
 - The adapter does not validate plugin code safety or contents.
 
 ## Schema / DDL

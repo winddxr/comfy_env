@@ -13,6 +13,7 @@
 | Transaction Control Contract | Application Core | State Ledger + Adapters | Stable, additive fields only |
 | Promotion Approval Contract | Local operator + Application Core | Safety Guards | Stable policy surface |
 | Runtime Control Contract | Local operator | Application Core + Runtime Executor | Stable |
+| Environment Handoff Contract | Local operator | Application Core + Dependency Sync + Source Integration | Stable for v1 bundle shape |
 
 ## Input / Output Semantics
 
@@ -28,6 +29,9 @@
 - Runtime Control Contract
   - Input: optional `--sync`, passthrough ComfyUI args, PID file presence.
   - Output: foreground exec into ComfyUI or explicit stop result.
+- Environment Handoff Contract
+  - Input: `env export <output_dir>` or `env import <bundle_dir> --comfyui-dir --python`.
+  - Output: a verified directory bundle for export, or a staged-and-committed environment restore for import.
 
 ## Error Taxonomy
 
@@ -35,6 +39,7 @@
   - Missing required identifiers or unknown flags.
 - State precondition errors:
   - Missing transaction, missing operation, invalid transaction status, missing plugin metadata, missing PID file.
+  - Missing bundle manifest, bundle checksum mismatch, invalid bundle registry, invalid absolute target path.
 - Policy errors:
   - Core package impact without explicit approval.
   - Undo target is not `success && undoable`.

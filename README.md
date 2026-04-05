@@ -30,19 +30,21 @@ ComfyUI 依赖治理系统。
 6. `./bin/gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]`
 7. `./bin/gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
 8. `./bin/gov update abort <txid>`
-9. `./bin/gov status`
-10. `./bin/gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]`
-11. `./bin/gov node remove <node_id> [--purge-code]`
-12. `./bin/gov tx run <node_id> [--timeout <seconds>]`
-13. `./bin/gov tx inspect <txid>`
-14. `./bin/gov tx abort <txid>`
-15. `./bin/gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
-16. `./bin/gov resolve <txid>`
-17. `./bin/gov op list`
-18. `./bin/gov op inspect <op_id>`
-19. `./bin/gov undo <op_id>`
-20. `./bin/gov run [--sync] [-- <args...>]`
-21. `./bin/gov stop`
+9. `./bin/gov env export <output_dir>`
+10. `./bin/gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>`
+11. `./bin/gov status`
+12. `./bin/gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]`
+13. `./bin/gov node remove <node_id> [--purge-code]`
+14. `./bin/gov tx run <node_id> [--timeout <seconds>]`
+15. `./bin/gov tx inspect <txid>`
+16. `./bin/gov tx abort <txid>`
+17. `./bin/gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
+18. `./bin/gov resolve <txid>`
+19. `./bin/gov op list`
+20. `./bin/gov op inspect <op_id>`
+21. `./bin/gov undo <op_id>`
+22. `./bin/gov run [--sync] [-- <args...>]`
+23. `./bin/gov stop`
 
 ## 3. 目录结构（侧车模式）
 
@@ -135,7 +137,23 @@ TopDir/
 5. `core_ready`
 6. `update_transactions_pending`
 
-## 8. 文档导航
+## 8. 环境交付
+
+```bash
+./bin/gov env export /abs/path/to/bundle-dir
+./bin/gov env import /abs/path/to/bundle-dir --comfyui-dir /abs/path/to/ComfyUI --python 3.12
+```
+
+说明：
+
+1. `env export` 导出目录型 bundle，包含 `pyproject.toml`、`uv.lock`、`pylock.toml`、`state/plugins.json`、`custom_nodes` 源码快照和审计文件。
+2. `env import` 只接受目录 bundle，不支持 tarball。
+3. `comfyui_dir` 是目标机本地配置，不属于 bundle 真相；导入时必须显式传入。
+4. 导入后的本地依赖真相仍然是 `pyproject.toml + uv.lock`；`pylock.toml` 是标准化交付物，不替代本地真相。
+5. `env import` 默认执行精确恢复：覆盖目标 root truth、prod env、插件注册，并清理 bundle 外的 `custom_nodes/*` 目录，使结果与 bundle 一致。
+6. v1 不支持 partial import、nodes-only import 或按节点依赖增量导入。
+
+## 9. 文档导航
 
 1. `dev-docs/architecture-haiku.md`
 2. `docs/04_cli_reference.md`
