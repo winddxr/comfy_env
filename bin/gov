@@ -757,12 +757,6 @@ plugin_install_abs_path() {
     echo "${comfyui_dir}/${rel_path}"
 }
 
-plugin_install_abs_path_for() {
-    local comfyui_dir="$1"
-    local rel_path="$2"
-    echo "${comfyui_dir}/${rel_path}"
-}
-
 bundle_export_pylock() {
     local bundle_dir="$1"
     local pylock_file="${bundle_dir}/pylock.toml"
