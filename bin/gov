@@ -230,10 +230,7 @@ for name, payload in sections:
     lines.append(f"[{name}]")
     for key, value in payload.items():
         rendered = fmt_value(value)
-        if "\n" in rendered:
-            lines.append(f"{key} = {rendered}")
-        else:
-            lines.append(f"{key} = {rendered}")
+        lines.append(f"{key} = {rendered}")
     lines.append("")
 
 config_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -556,38 +553,31 @@ group_name_for_node() {
     echo "node-${norm}"
 }
 
+_random_hex8() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr -d '-' | head -c 8 | tr '[:upper:]' '[:lower:]'
+    elif [ -r /proc/sys/kernel/random/uuid ]; then
+        tr -d '-' < /proc/sys/kernel/random/uuid | head -c 8
+    else
+        od -An -tx1 -N4 /dev/urandom | tr -d ' \n' | head -c 8
+    fi
+}
+
 new_txid() {
-    require_python
-    "${PYTHON_BIN}" - <<'PY'
-import datetime
-import uuid
-print(datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8])
-PY
+    echo "$(date -u +"%Y%m%dT%H%M%SZ")-$(_random_hex8)"
 }
 
 new_op_id() {
-    require_python
-    "${PYTHON_BIN}" - <<'PY'
-import datetime
-import uuid
-print(datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ") + "-op-" + uuid.uuid4().hex[:8])
-PY
+    echo "$(date -u +"%Y%m%dT%H%M%SZ")-op-$(_random_hex8)"
 }
 
 file_sha256() {
     local file_path="$1"
-    require_python
-    "${PYTHON_BIN}" - "$file_path" <<'PY'
-import hashlib
-import pathlib
-import sys
-
-p = pathlib.Path(sys.argv[1])
-if not p.exists():
-    print("")
-    raise SystemExit(0)
-print(hashlib.sha256(p.read_bytes()).hexdigest())
-PY
+    if [ ! -f "$file_path" ]; then
+        echo ""
+        return 0
+    fi
+    sha256sum "$file_path" | cut -d' ' -f1
 }
 
 backup_file_with_marker() {
@@ -1712,6 +1702,54 @@ PY
 
 migrate_plugins_registry() {
     require_python
+    # Guard: skip migration if all entries already match the target schema.
+    # This check must stay in sync with the migration output shape below.
+    if "${PYTHON_BIN}" - "$PLUGINS_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(0)
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(data, list):
+    raise SystemExit(1)
+if not data:
+    raise SystemExit(0)
+
+REQUIRED_TYPED = {
+    "id": str, "install_relpath": str, "group": str,
+    "enabled": bool, "created_at": str, "updated_at": str,
+    "git_url": str, "ref": str, "managed_deps": list,
+}
+for item in data:
+    if not isinstance(item, dict):
+        raise SystemExit(1)
+    for key, expected_type in REQUIRED_TYPED.items():
+        if key not in item or not isinstance(item[key], expected_type):
+            raise SystemExit(1)
+    if not item["id"].strip():
+        raise SystemExit(1)
+    if not item["install_relpath"].strip():
+        raise SystemExit(1)
+    if not item["group"].strip():
+        raise SystemExit(1)
+    if not item["created_at"].strip():
+        raise SystemExit(1)
+    if not item["updated_at"].strip():
+        raise SystemExit(1)
+    for dep in item["managed_deps"]:
+        if not isinstance(dep, str) or not dep.strip():
+            raise SystemExit(1)
+raise SystemExit(0)
+PY
+    then
+        return 0
+    fi
     "${PYTHON_BIN}" - "$PLUGINS_FILE" "$PROJECT_FILE" "$(comfyui_dir_path)" "$(timestamp_utc)" <<'PY'
 import json
 import pathlib
@@ -1878,6 +1916,20 @@ for item in data:
         raise SystemExit(0)
 
 raise SystemExit(1)
+PY
+}
+
+plugin_meta_fields() {
+    local meta_json="$1"
+    require_python
+    "${PYTHON_BIN}" - "$meta_json" <<'PY'
+import json
+import pathlib
+import sys
+
+m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(m.get("install_relpath") or f"custom_nodes/{m.get('id', '')}")
+print(m.get("group") or f"node-{m.get('id', '')}")
 PY
 }
 
@@ -2131,9 +2183,10 @@ tx_set_conflict() {
     local tx_file="$1"
     local conflict_path="$2"
     local status="$3"
-    local pre_op_id="$4"
+    local update_promotion="${4:-false}"
+    local pre_op_id="${5:-}"
     require_python
-    "${PYTHON_BIN}" - "$tx_file" "$conflict_path" "$status" "$pre_op_id" "$(timestamp_utc)" <<'PY'
+    "${PYTHON_BIN}" - "$tx_file" "$conflict_path" "$status" "$update_promotion" "$pre_op_id" "$(timestamp_utc)" <<'PY'
 import json
 import pathlib
 import sys
@@ -2141,40 +2194,19 @@ import sys
 tx_file = pathlib.Path(sys.argv[1])
 conflict_path = sys.argv[2]
 status = sys.argv[3]
-pre_op_id = sys.argv[4]
-ended_at = sys.argv[5]
+update_promotion = sys.argv[4] == "true"
+pre_op_id = sys.argv[5]
+ended_at = sys.argv[6]
 
 tx = json.loads(tx_file.read_text(encoding="utf-8"))
 tx["status"] = status
 tx["ended_at"] = ended_at
 tx["conflict_report"] = conflict_path
-prom = tx.get("promotion", {})
-prom["status"] = "lock_failed"
-prom["pre_op_id"] = pre_op_id
-tx["promotion"] = prom
-tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
-PY
-}
-
-update_tx_set_conflict() {
-    local tx_file="$1"
-    local conflict_path="$2"
-    local status="$3"
-    require_python
-    "${PYTHON_BIN}" - "$tx_file" "$conflict_path" "$status" "$(timestamp_utc)" <<'PY'
-import json
-import pathlib
-import sys
-
-tx_file = pathlib.Path(sys.argv[1])
-conflict_path = sys.argv[2]
-status = sys.argv[3]
-ended_at = sys.argv[4]
-
-tx = json.loads(tx_file.read_text(encoding="utf-8"))
-tx["status"] = status
-tx["ended_at"] = ended_at
-tx["conflict_report"] = conflict_path
+if update_promotion:
+    prom = tx.get("promotion", {})
+    prom["status"] = "lock_failed"
+    prom["pre_op_id"] = pre_op_id
+    tx["promotion"] = prom
 tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 PY
 }
@@ -2554,7 +2586,9 @@ def read_lines(path: str):
     return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 def normalize_name(spec: str):
-    token = re.split(r"[<>=!~\[]", spec, maxsplit=1)[0].strip()
+    token = re.split(r"[<>=!~;\[]", spec, maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
     return re.sub(r"[-_.]+", "-", token).lower()
 
 pre = read_lines(pre_file)
@@ -2659,7 +2693,7 @@ def read_lines(path: str):
     return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 def normalize_name(spec: str):
-    token = re.split(r"[<>=!~\[]", spec, maxsplit=1)[0].strip()
+    token = re.split(r"[<>=!~;\[]", spec, maxsplit=1)[0].strip()
     if "@" in token:
         token = token.split("@", 1)[0].strip()
     return re.sub(r"[-_.]+", "-", token).lower()
@@ -2906,26 +2940,11 @@ cmd_node_remove() {
     fi
 
     local group plugin_relpath plugin_path
-    group="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(meta.get("group") or f"node-{meta.get('id')}")
-PY
-)"
+    { read -r plugin_relpath; read -r group; } < <(plugin_meta_fields "$meta_json")
     group="$(normalize_group_name "$group")"
     if [ -z "$group" ]; then
         group="$(group_name_for_node "$node_id")"
     fi
-    plugin_relpath="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(meta.get("install_relpath") or f"custom_nodes/{meta.get('id', '')}")
-PY
-)"
     plugin_path="$(plugin_install_abs_path "$plugin_relpath")"
 
     local op_id
@@ -3120,24 +3139,37 @@ print(f"run_exit_code: {logs.get('run_exit_code', '')}")
 PY
 }
 
+_cmd_abort_impl() {
+    local txid="$1"
+    local expected_kind="$2"
+    local label="$3"
+
+    load_tx "$txid"
+    tx_assert_kind "$expected_kind"
+
+    local candidate_env staged_workdir
+    candidate_env="$(tx_get_field "$TX_FILE" "candidate_env" "")"
+    staged_workdir="$(tx_get_field "$TX_FILE" "staged_workdir" "")"
+
+    if [ -n "$candidate_env" ] && [ -d "$candidate_env" ]; then
+        rm -rf "$candidate_env"
+    fi
+    if [ -n "$staged_workdir" ] && [ -d "$staged_workdir" ]; then
+        rm -rf "$staged_workdir"
+    fi
+
+    tx_update_status "$TX_FILE" "aborted"
+    echo "${label} aborted."
+    echo "  txid: $txid"
+}
+
 cmd_tx_abort() {
     local txid="${1:-}"
     if [ -z "$txid" ]; then
         echo "Usage: gov tx abort <txid>" >&2
         exit 1
     fi
-    load_tx "$txid"
-    tx_assert_kind "plugin"
-
-    local candidate_env
-    candidate_env="$(tx_get_field "$TX_FILE" "candidate_env" "")"
-    if [ -n "$candidate_env" ] && [ -d "$candidate_env" ]; then
-        rm -rf "$candidate_env"
-    fi
-
-    tx_update_status "$TX_FILE" "aborted"
-    echo "Transaction aborted."
-    echo "  txid: $txid"
+    _cmd_abort_impl "$txid" "plugin" "Transaction"
 }
 cmd_resolve() {
     require_cmd uv
@@ -3227,23 +3259,8 @@ PY
         exit 1
     fi
 
-    plugin_relpath="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(m.get("install_relpath") or f"custom_nodes/{m.get('id', '')}")
-PY
-)"
+    { read -r plugin_relpath; read -r group; } < <(plugin_meta_fields "$meta_json")
     plugin_path="$(plugin_install_abs_path "$plugin_relpath")"
-    group="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(m.get("group") or f"node-{m.get('id', '')}")
-PY
-)"
     group="$(normalize_group_name "$group")"
     if [ -z "$group" ]; then
         group="$(group_name_for_node "$node_id")"
@@ -3267,7 +3284,7 @@ PY
     else
         report="$(write_conflict_report "$txid" "$node_id" "$lock_log")"
         tx_set_resolution_pins "$TX_FILE" "$merged_pins" "needs_resolution"
-        tx_set_conflict "$TX_FILE" "$report" "needs_resolution" ""
+        tx_set_conflict "$TX_FILE" "$report" "needs_resolution" "true" ""
         echo "Resolve failed."
         echo "  txid: $txid"
         echo "  conflict_report: $report"
@@ -3352,23 +3369,8 @@ cmd_tx_promote() {
         exit 1
     fi
 
-    plugin_relpath="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(m.get("install_relpath") or f"custom_nodes/{m.get('id', '')}")
-PY
-)"
+    { read -r plugin_relpath; read -r group; } < <(plugin_meta_fields "$meta_json")
     plugin_path="$(plugin_install_abs_path "$plugin_relpath")"
-    group="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(m.get("group") or f"node-{m.get('id', '')}")
-PY
-)"
     group="$(normalize_group_name "$group")"
     if [ -z "$group" ]; then
         group="$(group_name_for_node "$node_id")"
@@ -3391,7 +3393,7 @@ PY
     lock_log="${CONFLICT_DIR}/${txid}.promote.lock.log"
     if ! apply_plan_in_workdir "$workdir" "$group" "$direct_file" "$override_file" "$lock_log"; then
         conflict_report="$(write_conflict_report "$txid" "$node_id" "$lock_log")"
-        tx_set_conflict "$TX_FILE" "$conflict_report" "needs_resolution" "$op_id"
+        tx_set_conflict "$TX_FILE" "$conflict_report" "needs_resolution" "true" "$op_id"
         op_restore_backup "$op_id" || true
         op_finalize "$op_id" "failed" "false" "promote lock conflict"
         echo "Promote blocked by lock conflict."
@@ -3416,30 +3418,16 @@ PY
         exit 1
     fi
 
-    local smoke_cmd
-    smoke_cmd="$(smoke_test_cmd)"
-    if [ -n "$smoke_cmd" ]; then
-        local comfyui_dir
-        comfyui_dir="$(comfyui_dir_path)"
-        if ! (cd "$comfyui_dir" && PATH="$prod_env/bin:$PATH" bash -lc "$smoke_cmd"); then
-            echo "ERROR: smoke test failed, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            tx_set_promote_failed "$TX_FILE" "$op_id" "smoke test failed"
-            op_finalize "$op_id" "failed" "false" "smoke test failed"
-            rm -f "$meta_json" "$plan_json" "$pins_file"
-            exit 1
-        fi
-    else
-        if ! "$prod_env/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1; then
-            echo "ERROR: default smoke test failed, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            tx_set_promote_failed "$TX_FILE" "$op_id" "default smoke test failed"
-            op_finalize "$op_id" "failed" "false" "default smoke test failed"
-            rm -f "$meta_json" "$plan_json" "$pins_file"
-            exit 1
-        fi
+    local comfyui_dir
+    comfyui_dir="$(comfyui_dir_path)"
+    if ! run_smoke_test_in_env "$prod_env" "$comfyui_dir"; then
+        echo "ERROR: smoke test failed, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        tx_set_promote_failed "$TX_FILE" "$op_id" "smoke test failed"
+        op_finalize "$op_id" "failed" "false" "smoke test failed"
+        rm -f "$meta_json" "$plan_json" "$pins_file"
+        exit 1
     fi
 
     tx_set_promoted "$TX_FILE" "$op_id" "$reason"
@@ -3581,27 +3569,15 @@ cmd_install_core() {
         exit 1
     fi
 
-    local smoke_cmd comfyui_dir
-    smoke_cmd="$(smoke_test_cmd)"
+    local comfyui_dir
     comfyui_dir="$(comfyui_dir_path)"
-    if [ -n "$smoke_cmd" ]; then
-        if ! (cd "$comfyui_dir" && PATH="$prod_env/bin:$PATH" bash -lc "$smoke_cmd"); then
-            echo "ERROR: smoke test failed during install, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            op_finalize "$op_id" "failed" "false" "install core failed: smoke test failed"
-            rm -f "$deps_file"
-            exit 1
-        fi
-    else
-        if ! "$prod_env/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1; then
-            echo "ERROR: default smoke test failed during install, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            op_finalize "$op_id" "failed" "false" "install core failed: default smoke test failed"
-            rm -f "$deps_file"
-            exit 1
-        fi
+    if ! run_smoke_test_in_env "$prod_env" "$comfyui_dir"; then
+        echo "ERROR: smoke test failed during install, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        op_finalize "$op_id" "failed" "false" "install core failed: smoke test failed"
+        rm -f "$deps_file"
+        exit 1
     fi
 
     op_finalize "$op_id" "success" "true" "install core succeeded"
@@ -3689,7 +3665,7 @@ cmd_update_run() {
         conflict_report="$(write_conflict_report "$txid" "core" "$lock_log")"
         ended_at="$(timestamp_utc)"
         write_update_tx_file "$TX_FILE" "$txid" "needs_resolution" "$started_at" "$ended_at" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "-1" "$(core_packages_csv)" "$requirements_file" "$req_sha" "$workdir" "$deps_file"
-        update_tx_set_conflict "$TX_FILE" "$conflict_report" "needs_resolution"
+        tx_set_conflict "$TX_FILE" "$conflict_report" "needs_resolution" "false"
         rm -f "$deps_file"
         echo "Core update blocked by lock conflict."
         echo "  txid: $txid"
@@ -3911,7 +3887,7 @@ PY
     ) >"$lock_log" 2>&1; then
         report="$(write_conflict_report "$txid" "core" "$lock_log")"
         tx_set_resolution_pins "$TX_FILE" "$merged_pins" "needs_resolution"
-        update_tx_set_conflict "$TX_FILE" "$report" "needs_resolution"
+        tx_set_conflict "$TX_FILE" "$report" "needs_resolution" "false"
         rm -f "$new_pins" "$merged_pins"
         echo "Resolve failed."
         echo "  txid: $txid"
@@ -3920,7 +3896,7 @@ PY
     fi
 
     tx_set_resolution_pins "$TX_FILE" "$merged_pins" "resolved"
-    update_tx_set_conflict "$TX_FILE" "" "resolved"
+    tx_set_conflict "$TX_FILE" "" "resolved" "false"
 
     rm -f "$new_pins" "$merged_pins"
     echo "Resolve succeeded."
@@ -3967,7 +3943,7 @@ cmd_update_promote() {
     load_tx "$txid"
     tx_assert_kind "core_update"
 
-    local status core_count staged_workdir py op_id prod_env smoke_cmd comfyui_dir
+    local status core_count staged_workdir py op_id prod_env comfyui_dir
     status="$(tx_get_field "$TX_FILE" "status" "")"
     core_count="$(tx_get_field "$TX_FILE" "core_impact" "" | sed '/^$/d' | wc -l | tr -d ' ')"
     staged_workdir="$(tx_get_field "$TX_FILE" "staged_workdir" "")"
@@ -4012,26 +3988,14 @@ cmd_update_promote() {
         exit 1
     fi
 
-    smoke_cmd="$(smoke_test_cmd)"
     comfyui_dir="$(comfyui_dir_path)"
-    if [ -n "$smoke_cmd" ]; then
-        if ! (cd "$comfyui_dir" && PATH="$prod_env/bin:$PATH" bash -lc "$smoke_cmd"); then
-            echo "ERROR: smoke test failed during update promote, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            tx_set_promote_failed "$TX_FILE" "$op_id" "smoke test failed"
-            op_finalize "$op_id" "failed" "false" "update promote failed: smoke test failed"
-            exit 1
-        fi
-    else
-        if ! "$prod_env/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1; then
-            echo "ERROR: default smoke test failed during update promote, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            tx_set_promote_failed "$TX_FILE" "$op_id" "default smoke test failed"
-            op_finalize "$op_id" "failed" "false" "update promote failed: default smoke test failed"
-            exit 1
-        fi
+    if ! run_smoke_test_in_env "$prod_env" "$comfyui_dir"; then
+        echo "ERROR: smoke test failed during update promote, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        tx_set_promote_failed "$TX_FILE" "$op_id" "smoke test failed"
+        op_finalize "$op_id" "failed" "false" "update promote failed: smoke test failed"
+        exit 1
     fi
 
     tx_set_promoted "$TX_FILE" "$op_id" "$reason"
@@ -4049,24 +4013,7 @@ cmd_update_abort() {
         echo "Usage: gov update abort <txid>" >&2
         exit 1
     fi
-
-    load_tx "$txid"
-    tx_assert_kind "core_update"
-
-    local candidate_env staged_workdir
-    candidate_env="$(tx_get_field "$TX_FILE" "candidate_env" "")"
-    staged_workdir="$(tx_get_field "$TX_FILE" "staged_workdir" "")"
-
-    if [ -n "$candidate_env" ] && [ -d "$candidate_env" ]; then
-        rm -rf "$candidate_env"
-    fi
-    if [ -n "$staged_workdir" ] && [ -d "$staged_workdir" ]; then
-        rm -rf "$staged_workdir"
-    fi
-
-    tx_update_status "$TX_FILE" "aborted"
-    echo "Core update aborted."
-    echo "  txid: $txid"
+    _cmd_abort_impl "$txid" "core_update" "Core update"
 }
 
 env_import_restore_after_failure() {
