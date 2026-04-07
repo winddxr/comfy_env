@@ -58,6 +58,10 @@ require_cmd() {
     fi
 }
 
+uv_cache_dir() {
+    echo "${ROOT_DIR}/cache/uv"
+}
+
 config_get() {
     local key="$1"
     local default_value="$2"
@@ -233,6 +237,149 @@ for name, payload in sections:
     lines.append("")
 
 config_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+PY
+}
+
+normalize_python_minor() {
+    local request="${1:-}"
+    if [ -z "$request" ]; then
+        echo "ERROR: python request is required" >&2
+        exit 1
+    fi
+
+    require_cmd uv
+    mkdir -p "$(uv_cache_dir)"
+
+    local resolved
+    if ! resolved="$(uv --cache-dir "$(uv_cache_dir)" python find --show-version --no-python-downloads "$request")"; then
+        echo "ERROR: failed to resolve python request: $request" >&2
+        exit 1
+    fi
+
+    require_python
+    "${PYTHON_BIN}" - "$resolved" <<'PY'
+import re
+import sys
+
+value = sys.argv[1].strip()
+match = re.match(r"^(\d+)\.(\d+)", value)
+if not match:
+    raise SystemExit(f"ERROR: unsupported python version resolved from request: {value}")
+
+print(f"{match.group(1)}.{match.group(2)}")
+PY
+}
+
+current_uv_environment_marker() {
+    require_python
+    "${PYTHON_BIN}" - <<'PY'
+import platform
+import sys
+
+print(f"sys_platform == '{sys.platform}' and platform_machine == '{platform.machine()}'")
+PY
+}
+
+sync_project_runtime_constraints() {
+    local project_file="$1"
+    local python_minor="$2"
+    local environment_marker="$3"
+
+    require_python
+    "${PYTHON_BIN}" - "$project_file" "$python_minor" "$environment_marker" <<'PY'
+import pathlib
+import re
+import sys
+
+project_path = pathlib.Path(sys.argv[1])
+python_minor = sys.argv[2].strip()
+environment_marker = sys.argv[3].strip()
+requires_python = f"=={python_minor}.*"
+
+if not project_path.exists():
+    raise SystemExit(f"ERROR: project file not found: {project_path}")
+
+lines = project_path.read_text(encoding="utf-8").splitlines()
+
+def find_section(header: str):
+    start = None
+    for idx, line in enumerate(lines):
+        if line.strip() == header:
+            start = idx
+            break
+    if start is None:
+        return None, None
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        if re.match(r"^\[", lines[idx]):
+            end = idx
+            break
+    return start, end
+
+def value_block_end(start_idx: int) -> int:
+    line = lines[start_idx]
+    bracket_balance = line.count("[") - line.count("]")
+    idx = start_idx + 1
+    while bracket_balance > 0 and idx < len(lines):
+        bracket_balance += lines[idx].count("[") - lines[idx].count("]")
+        idx += 1
+    return idx
+
+def set_key(section_header: str, key: str, new_block_lines: list[str]):
+    start, end = find_section(section_header)
+    if start is None:
+        raise SystemExit(f"ERROR: required TOML section missing: {section_header}")
+
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    for idx in range(start + 1, end):
+        if key_re.match(lines[idx]):
+            block_end = value_block_end(idx)
+            lines[idx:block_end] = new_block_lines
+            return
+
+    insert_at = end
+    while insert_at > start + 1 and lines[insert_at - 1].strip() == "":
+        insert_at -= 1
+    lines[insert_at:insert_at] = new_block_lines
+
+project_start, _ = find_section("[project]")
+if project_start is None:
+    raise SystemExit("ERROR: pyproject.toml is missing [project]")
+
+tool_uv_start, tool_uv_end = find_section("[tool.uv]")
+if tool_uv_start is None:
+    insert_at = len(lines)
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[tool.uv.") or stripped.startswith("[[tool.uv."):
+            insert_at = idx
+            break
+    block = []
+    if insert_at > 0 and lines[insert_at - 1].strip() != "":
+        block.append("")
+    block.extend([
+        "[tool.uv]",
+        "environments = [",
+        f"    \"{environment_marker}\",",
+        "]",
+    ])
+    if insert_at < len(lines) and lines[insert_at].strip() != "":
+        block.append("")
+    lines[insert_at:insert_at] = block
+else:
+    set_key(
+        "[tool.uv]",
+        "environments",
+        [
+            "environments = [",
+            f"    \"{environment_marker}\",",
+            "]",
+        ],
+    )
+
+set_key("[project]", "requires-python", [f'requires-python = "{requires_python}"'])
+
+project_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 PY
 }
 
@@ -1035,6 +1182,206 @@ bundle_lock_check() {
         cd "$workdir"
         uv lock --check --python "$py"
     )
+}
+
+bundle_check_runtime_compatibility() {
+    local bundle_dir="$1"
+    local target_python="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$target_python" <<'PY'
+import ast
+import json
+import os
+import pathlib
+import platform
+import re
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+target_python = sys.argv[2].strip()
+bundle_project = bundle_dir / "pyproject.toml"
+manifest_path = bundle_dir / "manifest.json"
+
+match = re.fullmatch(r"(\d+)\.(\d+)", target_python)
+if not match:
+    raise SystemExit(f"ERROR: target python must be a canonical minor version, got: {target_python}")
+
+target_minor = (match.group(1), match.group(2))
+target_requires = f"=={target_minor[0]}.{target_minor[1]}.*"
+
+def implementation_version() -> str:
+    version = sys.implementation.version
+    value = f"{version.major}.{version.minor}.{version.micro}"
+    if version.releaselevel != "final":
+        suffix = {
+            "alpha": "a",
+            "beta": "b",
+            "candidate": "rc",
+        }.get(version.releaselevel, version.releaselevel)
+        value += f"{suffix}{version.serial}"
+    return value
+
+def current_marker_environment() -> dict[str, str]:
+    python_full_version = platform.python_version()
+    return {
+        "extra": "",
+        "implementation_name": sys.implementation.name,
+        "implementation_version": implementation_version(),
+        "os_name": os.name,
+        "platform_machine": platform.machine(),
+        "platform_python_implementation": platform.python_implementation(),
+        "platform_release": platform.release(),
+        "platform_system": platform.system(),
+        "platform_version": platform.version(),
+        "python_full_version": python_full_version,
+        "python_version": ".".join(python_full_version.split(".")[:2]),
+        "sys_platform": sys.platform,
+    }
+
+MARKER_ENV = current_marker_environment()
+VERSION_FIELDS = {"implementation_version", "python_full_version", "python_version"}
+
+def exact_minor_tuple(value: str):
+    exact_minor = re.fullmatch(r"==\s*(\d+)\.(\d+)\.\*", value)
+    if not exact_minor:
+        return None
+    return exact_minor.group(1), exact_minor.group(2)
+
+def normalized_version_parts(value: str):
+    parts = []
+    for token in re.split(r"[._-]", str(value).strip()):
+        if not token:
+            continue
+        parts.append(int(token) if token.isdigit() else token.lower())
+    return tuple(parts)
+
+def compare_marker_values(left, right, op, left_name: str | None, right_name: str | None) -> bool:
+    if isinstance(op, ast.In):
+        return str(left) in str(right)
+    if isinstance(op, ast.NotIn):
+        return str(left) not in str(right)
+
+    if left_name in VERSION_FIELDS or right_name in VERSION_FIELDS:
+        left_value = normalized_version_parts(left)
+        right_value = normalized_version_parts(right)
+    else:
+        left_value = str(left)
+        right_value = str(right)
+
+    if isinstance(op, ast.Eq):
+        return left_value == right_value
+    if isinstance(op, ast.NotEq):
+        return left_value != right_value
+    if isinstance(op, ast.Lt):
+        return left_value < right_value
+    if isinstance(op, ast.LtE):
+        return left_value <= right_value
+    if isinstance(op, ast.Gt):
+        return left_value > right_value
+    if isinstance(op, ast.GtE):
+        return left_value >= right_value
+    raise ValueError(f"unsupported marker operator: {ast.dump(op)}")
+
+def marker_name(node) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+def marker_value(node):
+    if isinstance(node, ast.Name):
+        if node.id not in MARKER_ENV:
+            raise ValueError(f"unsupported marker variable: {node.id}")
+        return MARKER_ENV[node.id]
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    raise ValueError(f"unsupported marker expression: {ast.dump(node)}")
+
+def eval_marker_ast(node) -> bool:
+    if isinstance(node, ast.Expression):
+        return eval_marker_ast(node.body)
+    if isinstance(node, ast.BoolOp):
+        values = [eval_marker_ast(value) for value in node.values]
+        if isinstance(node.op, ast.And):
+            return all(values)
+        if isinstance(node.op, ast.Or):
+            return any(values)
+        raise ValueError(f"unsupported boolean operator: {ast.dump(node.op)}")
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not eval_marker_ast(node.operand)
+    if isinstance(node, ast.Compare):
+        left_node = node.left
+        left_value = marker_value(left_node)
+        left_name = marker_name(left_node)
+        for op, comparator in zip(node.ops, node.comparators):
+            right_value = marker_value(comparator)
+            right_name = marker_name(comparator)
+            if not compare_marker_values(left_value, right_value, op, left_name, right_name):
+                return False
+            left_value = right_value
+            left_name = right_name
+        return True
+    raise ValueError(f"unsupported marker syntax: {ast.dump(node)}")
+
+def marker_matches_environment(marker: str) -> bool:
+    marker = marker.strip()
+    if not marker:
+        return False
+
+    try:
+        from packaging.markers import Marker
+    except ModuleNotFoundError:
+        Marker = None
+
+    if Marker is not None:
+        try:
+            return bool(Marker(marker).evaluate(environment=MARKER_ENV))
+        except Exception:
+            pass
+
+    parsed = ast.parse(marker, mode="eval")
+    return eval_marker_ast(parsed)
+
+project = {}
+if bundle_project.exists():
+    project = tomllib.loads(bundle_project.read_text(encoding="utf-8"))
+
+requires_python = str((project.get("project") or {}).get("requires-python") or "").strip()
+bundle_minor = exact_minor_tuple(requires_python)
+if bundle_minor and bundle_minor != target_minor:
+    raise SystemExit(
+        f"ERROR: bundle requires-python is {requires_python}, but target python resolves to {target_requires}"
+    )
+
+tool_uv = (project.get("tool") or {}).get("uv") or {}
+environments = tool_uv.get("environments") or []
+if isinstance(environments, str):
+    environments = [environments]
+normalized_envs = [str(item).strip() for item in environments if str(item).strip()]
+if normalized_envs:
+    if not any(marker_matches_environment(marker) for marker in normalized_envs):
+        raise SystemExit(
+            "ERROR: bundle environments do not support this host: "
+            f"markers={normalized_envs}, host={MARKER_ENV['sys_platform']}/{MARKER_ENV['platform_machine']}"
+        )
+elif manifest_path.exists():
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_system = str(manifest.get("platform_system") or "").strip()
+    manifest_machine = str(manifest.get("platform_machine") or "").strip()
+    current_system = platform.system()
+    current_machine = platform.machine()
+    if manifest_system and manifest_machine and (
+        manifest_system != current_system or manifest_machine != current_machine
+    ):
+        raise SystemExit(
+            "ERROR: bundle platform does not match this host: "
+            f"bundle={manifest_system}/{manifest_machine}, host={current_system}/{current_machine}"
+        )
+PY
 }
 
 bundle_restore_plugins_registry() {
@@ -2369,10 +2716,13 @@ cmd_init() {
     ensure_config_file_for_init "$comfyui_dir_override" "$python_override"
     ensure_project_file_for_init
 
-    local prod_env py comfyui_dir
-    prod_env="$(prod_env_path)"
-    py="$(configured_python)"
+    local prod_env py comfyui_dir environment_marker
     comfyui_dir="$(comfyui_dir_path)"
+    py="$(normalize_python_minor "$(configured_python)")"
+    ensure_config_file_for_init "$comfyui_dir" "$py"
+    environment_marker="$(current_uv_environment_marker)"
+    sync_project_runtime_constraints "$PROJECT_FILE" "$py" "$environment_marker"
+    prod_env="$(prod_env_path)"
 
     lock_project_exact "$ROOT_DIR" "$py"
     sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py"
@@ -3796,10 +4146,14 @@ cmd_env_import() {
         exit 1
     fi
 
+    local normalized_python
+    normalized_python="$(normalize_python_minor "$python_spec")"
+
     bundle_manifest_verify "$bundle_dir"
+    bundle_check_runtime_compatibility "$bundle_dir" "$normalized_python"
 
     local pre_restore_py current_prod_env
-    pre_restore_py="$(config_get "runtime.python" "$python_spec")"
+    pre_restore_py="$(config_get "runtime.python" "$normalized_python")"
     current_prod_env="$(prod_env_path)"
     bundle_check_import_conflicts "$bundle_dir" "$comfyui_dir"
 
@@ -3814,14 +4168,14 @@ cmd_env_import() {
     mkdir -p "$workdir"
     bundle_stage_truth "$bundle_dir" "$workdir"
 
-    if ! bundle_lock_check "$workdir" "$python_spec"; then
+    if ! bundle_lock_check "$workdir" "$normalized_python"; then
         echo "ERROR: bundle lock check failed" >&2
         env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
         op_finalize "$op_id" "failed" "false" "env import failed: bundle lock check failed"
         exit 1
     fi
 
-    if ! sync_project_env_exact "$workdir" "$current_prod_env" "$python_spec"; then
+    if ! sync_project_env_exact "$workdir" "$current_prod_env" "$normalized_python"; then
         echo "ERROR: prod sync failed during env import" >&2
         env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
         op_finalize "$op_id" "failed" "false" "env import failed: prod sync failed"
@@ -3839,7 +4193,7 @@ cmd_env_import() {
     cp "${workdir}/uv.lock" "$LOCK_FILE"
     bundle_restore_plugins_registry "$bundle_dir"
 
-    if ! ensure_config_file_for_init "$comfyui_dir" "$python_spec"; then
+    if ! ensure_config_file_for_init "$comfyui_dir" "$normalized_python"; then
         echo "ERROR: failed to update config.toml during env import" >&2
         env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
         op_finalize "$op_id" "failed" "false" "env import failed: config update failed"
@@ -3861,7 +4215,7 @@ cmd_env_import() {
     echo "Environment bundle imported."
     echo "  bundle_dir: $bundle_dir"
     echo "  comfyui_dir: $comfyui_dir"
-    echo "  python: $python_spec"
+    echo "  python: $normalized_python"
     echo "  op_id: $op_id"
 }
 

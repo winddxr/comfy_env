@@ -126,19 +126,21 @@ v1 先不做 `nodes-only import` 或 `partial import`。
    - `node_ids`
    - `files.sha256`
 7. 输出 bundle 路径和摘要信息。
+8. bundle 中导出的 `pyproject.toml` 应已收紧到单一 Python minor 与单一平台；导入侧以它作为兼容性判定依据。
 
 ### 6.2 Import
 
 1. 导入默认按 bundle 对目标机做精确恢复，不区分“空白目标”和“允许覆盖”两种模式。
 2. 先解包并校验 `manifest.json` 与关键文件完整性。
 3. 失败即退出，不提前改写 root truth。
-4. 将 `pyproject.toml`、`uv.lock`、`state/plugins.json` 复制到 staging workdir。
-5. 先清理目标 `ComfyUI/custom_nodes/` 下 bundle 未声明的节点目录，再将 bundle 中的节点源码恢复到目标路径。
-6. 用 staging truth 执行依赖重建，优先验证：
+4. 先校验目标机 `--python` 归一化后的 minor 线是否与 bundle `requires-python` 兼容，并校验当前主机是否落在 bundle `[tool.uv].environments` 内。
+5. 将 `pyproject.toml`、`uv.lock`、`state/plugins.json` 复制到 staging workdir。
+6. 先清理目标 `ComfyUI/custom_nodes/` 下 bundle 未声明的节点目录，再将 bundle 中的节点源码恢复到目标路径。
+7. 用 staging truth 执行依赖重建，优先验证：
    - `uv lock --check` 或等效“锁文件不漂移”校验
    - `uv pip sync pylock.toml` 或继续复用现有 `sync_project_env_exact` 路径
-7. 只有 staging 成功后才切换到 root truth 并完成 `.venv-prod` 重建。
-8. 导入后做 smoke test，并输出导入摘要。
+8. 只有 staging 成功后才切换到 root truth 并完成 `.venv-prod` 重建。
+9. 导入后做 smoke test，并输出导入摘要。
 
 ## 7. 实现建议
 

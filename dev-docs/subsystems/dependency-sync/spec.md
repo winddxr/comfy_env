@@ -25,7 +25,9 @@ The external system is the `uv` CLI plus the filesystem locations for `.venv-pro
   - root `pyproject.toml`
   - root `uv.lock`
   - workdir copies of those files
-  - `runtime.python`
+  - `runtime.python` as a canonical minor line
+  - `project.requires-python`
+  - `[tool.uv].environments`
   - dependency-group names (`core`, `torch`, plugin groups, `overrides`)
   - ComfyUI `requirements.txt`
   - torch index URL
@@ -50,7 +52,7 @@ The external system is the `uv` CLI plus the filesystem locations for `.venv-pro
 ## Integration Behaviors / Key Flows
 
 - `dependency-sync#KF-001` Initialize prod environment
-  - Root `uv lock --python`, then exact sync into prod env.
+  - Normalize the requested Python to a minor line, sync `pyproject.toml` runtime constraints, then root `uv lock --python` and exact sync into prod env.
 - `dependency-sync#KF-002` Install managed torch group
   - Stage `dependency-groups.torch` via `uv add`, then sync prod.
 - `dependency-sync#KF-003` Install managed core group
@@ -66,13 +68,13 @@ The external system is the `uv` CLI plus the filesystem locations for `.venv-pro
 - `dependency-sync#KF-008` Export bundle lock payload
   - Export `pylock.toml` from the current locked truth without re-locking.
 - `dependency-sync#KF-009` Verify and stage imported truth
-  - Copy bundle truth into a staging workdir, run lock check, then exact sync prod from staging truth.
+  - Copy bundle truth into a staging workdir, validate bundle Python/platform compatibility, run lock check, then exact sync prod from staging truth.
 
 ## Runtime / Connectivity Constraints
 
 - Requires `uv` to be installed and on `PATH`.
 - Candidate and prod envs are local filesystem directories, not remote or shared runtimes.
-- Python selection is explicit and driven by `runtime.python`.
+- Python selection is explicit and driven by `runtime.python`, while lock breadth is constrained by `project.requires-python` and `[tool.uv].environments`.
 
 ## Schema / DDL
 

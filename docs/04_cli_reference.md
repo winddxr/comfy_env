@@ -6,13 +6,16 @@
 
 ### `gov init --comfyui-dir <abs-path> --python <python-spec>`
 
-用途：幂等初始化本地治理配置，写入 `paths.comfyui_dir` 和 `runtime.python`，并创建/同步最小 prod 环境。
+用途：幂等初始化本地治理配置，写入 `paths.comfyui_dir` 和规范化后的 `runtime.python`，同步收紧 `pyproject.toml` 的 Python / 平台约束，并创建/同步最小 prod 环境。
 
 关键行为：
 
 1. 首次初始化时，两个参数都必填。
 2. 已有 `config.toml` 时，未传参数沿用现值，传入参数覆盖现值。
 3. 若 `pyproject.toml` 缺失，则从 `pyproject.toml.template` 生成。
+4. `--python` 会先解析到可用解释器，再规范化为 minor 线写入 `runtime.python`；例如 `3.13.12` 最终会写成 `3.13`。
+5. `init` 会把 `pyproject.toml` 中的 `project.requires-python` 收紧为 `==<major>.<minor>.*`。
+6. `init` 会按当前主机自动写入 `[tool.uv].environments`，把 lock 收敛到单一目标平台。
 
 ### `gov install torch --index-url <url>`
 
@@ -108,9 +111,9 @@
 关键行为：
 
 1. 只支持目录 bundle，不支持 tarball。
-2. 先校验 `manifest.json` 与关键文件 SHA256，再进入 staging 恢复。
+2. 先校验 `manifest.json` 与关键文件 SHA256，再校验 bundle 的 Python / 平台约束是否与目标机兼容，然后才进入 staging 恢复。
 3. 导入后的本地依赖真相仍然是 `pyproject.toml + uv.lock`；`pylock.toml` 仅作为交付物与审计文件保留。
-4. `--comfyui-dir` 和 `--python` 始终来自目标机 CLI 参数，不从 bundle 恢复。
+4. `--comfyui-dir` 和 `--python` 始终来自目标机 CLI 参数，不从 bundle 恢复；其中 `--python` 会先规范化为 minor 线再参与 lock/sync。
 5. 导入默认执行 exact restore：覆盖目标 root truth、prod env、插件注册，并清理 bundle 外的 `custom_nodes/*` 目录，使目标机与 bundle 一致。
 6. 失败会恢复 root truth，并恢复本次导入覆盖或清理过的节点目录。
 

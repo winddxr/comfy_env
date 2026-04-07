@@ -43,7 +43,7 @@ It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns
 
 - `core#KF-001` Bootstrap local state
   - Trigger: `cmd_init`.
-  - Success: ensure layout, update `config.toml`, seed `pyproject.toml` if needed, `uv lock`, exact sync into prod env.
+  - Success: ensure layout, normalize `runtime.python` to a canonical minor line, seed `pyproject.toml` if needed, sync `project.requires-python` plus `[tool.uv].environments`, `uv lock`, exact sync into prod env.
   - Failure: missing required init flags or missing tools exits before partial runtime state is considered valid.
 - `core#KF-002` Install managed torch runtime
   - Trigger: `cmd_install_torch`.

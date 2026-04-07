@@ -44,6 +44,10 @@ cat >"$FAKE_BIN/uv" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
+while [ "${1:-}" = "--cache-dir" ]; do
+    shift 2
+done
+
 cmd="${1:-}"
 shift || true
 
@@ -71,7 +75,43 @@ case "$cmd" in
             fi
             exit 0
         fi
-        : > uv.lock
+        requires_python="$(python3 - <<'PY'
+import pathlib
+import re
+
+text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+match = re.search(r'^requires-python\s*=\s*"([^"]+)"', text, flags=re.MULTILINE)
+print(match.group(1) if match else "")
+PY
+)"
+        env_marker="$(python3 - <<'PY'
+import pathlib
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+data = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+tool_uv = (data.get("tool") or {}).get("uv") or {}
+envs = tool_uv.get("environments") or []
+if isinstance(envs, str):
+    envs = [envs]
+print(envs[0] if envs else "")
+PY
+)"
+        {
+            echo 'version = 1'
+            echo 'revision = 3'
+            if [ -n "$requires_python" ]; then
+                echo "requires-python = \"$requires_python\""
+            fi
+            if [ -n "$env_marker" ]; then
+                echo 'resolution-markers = ['
+                echo "    \"$env_marker\","
+                echo ']'
+            fi
+        } > uv.lock
         ;;
     sync)
         if [ "${FAKE_UV_SYNC_FAIL:-0}" = "1" ]; then
@@ -124,6 +164,39 @@ PYLOCK
         case "$subcmd" in
             freeze)
                 printf 'demo==1.0.0\n'
+                ;;
+            *)
+                ;;
+        esac
+        ;;
+    python)
+        subcmd="${1:-}"
+        shift || true
+        case "$subcmd" in
+            find)
+                request=""
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        --show-version|--no-python-downloads|--system)
+                            shift
+                            ;;
+                        *)
+                            request="$1"
+                            shift
+                            ;;
+                    esac
+                done
+                case "$request" in
+                    *.*.*)
+                        echo "$request"
+                        ;;
+                    *.*)
+                        echo "${request}.9"
+                        ;;
+                    *)
+                        echo "${request}.0"
+                        ;;
+                esac
                 ;;
             *)
                 ;;
@@ -192,6 +265,15 @@ PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" init --comfyui-dir "$TMP_ROOT/Co
 
 assert_contains "$WORK_DIR/config.toml" "comfyui_dir = \"$TMP_ROOT/ComfyUI\""
 assert_contains "$WORK_DIR/config.toml" "python = \"3.12\""
+assert_contains "$WORK_DIR/pyproject.toml" "requires-python = \"==3.12.*\""
+assert_contains "$WORK_DIR/pyproject.toml" "[tool.uv]"
+assert_contains "$WORK_DIR/pyproject.toml" "sys_platform == 'linux' and platform_machine == 'x86_64'"
+assert_contains "$WORK_DIR/uv.lock" "requires-python = \"==3.12.*\""
+assert_contains "$WORK_DIR/uv.lock" "sys_platform == 'linux' and platform_machine == 'x86_64'"
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" init --comfyui-dir "$TMP_ROOT/ComfyUI" --python 3.12.9 >"$TMP_ROOT/init-patch.out"
+assert_contains "$WORK_DIR/config.toml" "python = \"3.12\""
+assert_not_contains "$WORK_DIR/config.toml" "python = \"3.12.9\""
 
 status_out="$TMP_ROOT/status.out"
 bash "$WORK_DIR/bin/gov" status >"$status_out"
@@ -275,6 +357,127 @@ assert_file_exists "$IMPORT_COMFY/custom_nodes/demo-node/__init__.py"
 assert_contains "$IMPORT_WORK_DIR/config.toml" "comfyui_dir = \"$IMPORT_COMFY\""
 assert_contains "$IMPORT_WORK_DIR/config.toml" "python = \"3.12\""
 assert_contains "$IMPORT_WORK_DIR/state/plugins.json" "\"demo-node\""
+
+copy_fresh_workspace "$TMP_ROOT/import-python-mismatch-work"
+PY_MISMATCH_WORK_DIR="$TMP_ROOT/import-python-mismatch-work"
+reset_local_state "$PY_MISMATCH_WORK_DIR"
+PY_MISMATCH_COMFY="$TMP_ROOT/ComfyUI-import-python-mismatch"
+mkdir -p "$PY_MISMATCH_COMFY"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$PY_MISMATCH_WORK_DIR/bin/gov" env import "$BUNDLE_DIR" --comfyui-dir "$PY_MISMATCH_COMFY" --python 3.11 >"$TMP_ROOT/env-import-python-mismatch.out" 2>"$TMP_ROOT/env-import-python-mismatch.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected env import failure for python minor mismatch" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/env-import-python-mismatch.err" "bundle requires-python is ==3.12.*"
+assert_not_exists "$PY_MISMATCH_WORK_DIR/state/plugins.json"
+
+cp -a "$BUNDLE_DIR" "$TMP_ROOT/bundle-python-spacing"
+python3 - "$TMP_ROOT/bundle-python-spacing" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+bundle = pathlib.Path(sys.argv[1])
+project_path = bundle / "pyproject.toml"
+text = project_path.read_text(encoding="utf-8")
+text = re.sub(
+    r'requires-python\s*=\s*"==3\.12\.\*"',
+    'requires-python = "== 3.12.*"',
+    text,
+    count=1,
+)
+project_path.write_text(text, encoding="utf-8")
+
+manifest_path = bundle / "manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest["files"]["sha256"]["pyproject.toml"] = __import__("hashlib").sha256(project_path.read_bytes()).hexdigest()
+manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+copy_fresh_workspace "$TMP_ROOT/import-python-spacing-work"
+PY_SPACING_WORK_DIR="$TMP_ROOT/import-python-spacing-work"
+reset_local_state "$PY_SPACING_WORK_DIR"
+PY_SPACING_COMFY="$TMP_ROOT/ComfyUI-import-python-spacing"
+mkdir -p "$PY_SPACING_COMFY"
+PATH="$FAKE_BIN:$PATH" bash "$PY_SPACING_WORK_DIR/bin/gov" env import "$TMP_ROOT/bundle-python-spacing" --comfyui-dir "$PY_SPACING_COMFY" --python 3.12 >"$TMP_ROOT/env-import-python-spacing.out"
+assert_file_exists "$PY_SPACING_WORK_DIR/state/plugins.json"
+assert_file_exists "$PY_SPACING_COMFY/custom_nodes/demo-node/__init__.py"
+
+cp -a "$BUNDLE_DIR" "$TMP_ROOT/bundle-platform-subset"
+python3 - "$TMP_ROOT/bundle-platform-subset" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+bundle = pathlib.Path(sys.argv[1])
+project_path = bundle / "pyproject.toml"
+text = project_path.read_text(encoding="utf-8")
+text = re.sub(
+    r"(environments\s*=\s*\[\s*\")([^\"]+)(\",\s*\])",
+    rf"\1sys_platform == '{sys.platform}'\3",
+    text,
+    count=1,
+    flags=re.MULTILINE | re.DOTALL,
+)
+project_path.write_text(text, encoding="utf-8")
+
+manifest_path = bundle / "manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest["files"]["sha256"]["pyproject.toml"] = __import__("hashlib").sha256(project_path.read_bytes()).hexdigest()
+manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+copy_fresh_workspace "$TMP_ROOT/import-platform-subset-work"
+PLATFORM_SUBSET_WORK_DIR="$TMP_ROOT/import-platform-subset-work"
+reset_local_state "$PLATFORM_SUBSET_WORK_DIR"
+PLATFORM_SUBSET_COMFY="$TMP_ROOT/ComfyUI-import-platform-subset"
+mkdir -p "$PLATFORM_SUBSET_COMFY"
+PATH="$FAKE_BIN:$PATH" bash "$PLATFORM_SUBSET_WORK_DIR/bin/gov" env import "$TMP_ROOT/bundle-platform-subset" --comfyui-dir "$PLATFORM_SUBSET_COMFY" --python 3.12 >"$TMP_ROOT/env-import-platform-subset.out"
+assert_file_exists "$PLATFORM_SUBSET_WORK_DIR/state/plugins.json"
+assert_file_exists "$PLATFORM_SUBSET_COMFY/custom_nodes/demo-node/__init__.py"
+
+cp -a "$BUNDLE_DIR" "$TMP_ROOT/bundle-platform-mismatch"
+python3 - "$TMP_ROOT/bundle-platform-mismatch" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+bundle = pathlib.Path(sys.argv[1])
+project_path = bundle / "pyproject.toml"
+text = project_path.read_text(encoding="utf-8")
+text = re.sub(
+    r"(environments\s*=\s*\[\s*\")([^\"]+)(\",\s*\])",
+    r"\1sys_platform == 'darwin' and platform_machine == 'arm64'\3",
+    text,
+    count=1,
+    flags=re.MULTILINE | re.DOTALL,
+)
+project_path.write_text(text, encoding="utf-8")
+
+manifest_path = bundle / "manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest["files"]["sha256"]["pyproject.toml"] = __import__("hashlib").sha256(project_path.read_bytes()).hexdigest()
+manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+copy_fresh_workspace "$TMP_ROOT/import-platform-mismatch-work"
+PLATFORM_MISMATCH_WORK_DIR="$TMP_ROOT/import-platform-mismatch-work"
+reset_local_state "$PLATFORM_MISMATCH_WORK_DIR"
+PLATFORM_MISMATCH_COMFY="$TMP_ROOT/ComfyUI-import-platform-mismatch"
+mkdir -p "$PLATFORM_MISMATCH_COMFY"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$PLATFORM_MISMATCH_WORK_DIR/bin/gov" env import "$TMP_ROOT/bundle-platform-mismatch" --comfyui-dir "$PLATFORM_MISMATCH_COMFY" --python 3.12 >"$TMP_ROOT/env-import-platform-mismatch.out" 2>"$TMP_ROOT/env-import-platform-mismatch.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected env import failure for platform mismatch" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/env-import-platform-mismatch.err" "bundle environments do not support this host"
+assert_not_exists "$PLATFORM_MISMATCH_WORK_DIR/state/plugins.json"
 
 cp -a "$BUNDLE_DIR" "$TMP_ROOT/bundle-corrupt"
 printf '\n# corrupt\n' >>"$TMP_ROOT/bundle-corrupt/pyproject.toml"
