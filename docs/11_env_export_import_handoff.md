@@ -84,7 +84,9 @@ bundle/
    - 用于恢复节点注册元数据。
    - 明确它不是依赖真相，只是导入后辅助恢复节点记录。
 6. `custom_nodes/<node_id>/`：
-   - 保存当前工作站上的节点源码快照。
+   - 保存当前工作站上的节点运行时源码快照。
+   - 保留工作树中的未提交修改与未跟踪文件。
+   - 过滤 `.git/` 目录与 `.git` 指针文件，不导出 Git 管理元数据。
    - 不依赖远端 `git_url/ref` 在云端重新获取。
 7. `audit/prod-freeze.txt`：
    - 用 `uv pip freeze` 导出，只用于审计和导入后比对，不作为导入真相。
@@ -113,7 +115,7 @@ v1 先不做 `nodes-only import` 或 `partial import`。
    - `state/plugins.json` 存在
    - `config.toml` 存在且 `paths.comfyui_dir` 可解析
 3. 用 `--locked` 导出 `pylock.toml`；若 lock 已过期则直接失败，不自动刷新。
-4. 从 `state/plugins.json` 枚举已注册节点，并复制每个 `install_relpath` 对应目录到 bundle。
+4. 从 `state/plugins.json` 枚举已注册节点，并把每个 `install_relpath` 对应目录导出为运行时快照；保留未提交修改与未跟踪文件，但排除 `.git` 元数据。
 5. 导出 `prod-freeze.txt` 作为审计文件。
 6. 生成 `manifest.json`，至少包含：
    - `created_at`

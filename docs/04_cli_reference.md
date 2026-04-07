@@ -100,9 +100,10 @@
 
 1. 要求 `pyproject.toml`、`uv.lock`、`state/plugins.json`、`config.toml` 存在。
 2. 使用 `uv export --format pylock.toml --locked --all-groups` 导出 `pylock.toml`；不会自动 re-lock。
-3. 从 `state/plugins.json` 枚举节点，并把每个节点当前源码目录复制到 bundle 的 `custom_nodes/<node_id>/`。
-4. bundle 至少包含：`manifest.json`、`pyproject.toml`、`uv.lock`、`pylock.toml`、`state/plugins.json`、`audit/prod-freeze.txt`、`audit/export-summary.json`。
-5. `paths.comfyui_dir` 只用于定位当前源码目录，不会被当成迁移真相写回目标机。
+3. 从 `state/plugins.json` 枚举节点，并把每个节点当前运行态源码快照导出到 bundle 的 `custom_nodes/<node_id>/`。
+4. 节点快照保留工作树中的已修改文件和未跟踪文件，但会过滤 `.git/` 目录与 `.git` 指针文件，不把 Git 管理元数据带入 bundle。
+5. bundle 至少包含：`manifest.json`、`pyproject.toml`、`uv.lock`、`pylock.toml`、`state/plugins.json`、`audit/prod-freeze.txt`、`audit/export-summary.json`。
+6. `paths.comfyui_dir` 只用于定位当前源码目录，不会被当成迁移真相写回目标机。
 
 ### `gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>`
 

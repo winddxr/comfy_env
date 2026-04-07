@@ -30,6 +30,9 @@ copy_fresh_workspace "$TMP_ROOT/work"
 WORK_DIR="$TMP_ROOT/work"
 FAKE_BIN="$TMP_ROOT/fake-bin"
 mkdir -p "$FAKE_BIN"
+FAKE_PY_RESOLVERS="$TMP_ROOT/fake-python"
+mkdir -p "$FAKE_PY_RESOLVERS"
+export FAKE_PY_RESOLVERS
 
 reset_local_state() {
     local dir="$1"
@@ -186,17 +189,36 @@ PYLOCK
                             ;;
                     esac
                 done
+                if [ "${FAKE_UV_PYTHON_FIND_FAIL_REQUEST:-}" = "$request" ]; then
+                    echo "python not found: $request" >&2
+                    exit 1
+                fi
                 case "$request" in
                     *.*.*)
-                        echo "$request"
+                        version="$request"
                         ;;
                     *.*)
-                        echo "${request}.9"
+                        version="${request}.9"
                         ;;
                     *)
-                        echo "${request}.0"
+                        version="${request}.0"
                         ;;
                 esac
+                resolved_path="$FAKE_PY_RESOLVERS/${version}"
+                cat >"$resolved_path" <<PYEOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "-c" ]; then
+    if [ "\${2:-}" = 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")' ]; then
+        echo "${version%.*}"
+        exit 0
+    fi
+    exit 1
+else
+    exit 0
+fi
+PYEOF
+                chmod +x "$resolved_path"
+                echo "$resolved_path"
                 ;;
             *)
                 ;;
@@ -275,6 +297,16 @@ PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" init --comfyui-dir "$TMP_ROOT/Co
 assert_contains "$WORK_DIR/config.toml" "python = \"3.12\""
 assert_not_contains "$WORK_DIR/config.toml" "python = \"3.12.9\""
 
+set +e
+FAKE_UV_PYTHON_FIND_FAIL_REQUEST=3.12.8 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" init --comfyui-dir "$TMP_ROOT/ComfyUI" --python 3.12.8 >"$TMP_ROOT/init-missing-patch.out" 2>"$TMP_ROOT/init-missing-patch.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected init to fail when exact python patch cannot be resolved" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/init-missing-patch.err" "failed to resolve python request: 3.12.8"
+
 status_out="$TMP_ROOT/status.out"
 bash "$WORK_DIR/bin/gov" status >"$status_out"
 assert_contains "$status_out" "config_ready: yes"
@@ -295,6 +327,27 @@ mkdir -p "$TMP_ROOT/ComfyUI/custom_nodes/demo-node"
 cat >"$TMP_ROOT/ComfyUI/custom_nodes/demo-node/__init__.py" <<'EOF'
 print("demo")
 EOF
+(
+    cd "$TMP_ROOT/ComfyUI/custom_nodes/demo-node"
+    git init >/dev/null 2>&1
+    git config user.email "tests@example.invalid"
+    git config user.name "Test User"
+    git add __init__.py
+    git commit -m "init" >/dev/null 2>&1
+)
+cat >"$TMP_ROOT/ComfyUI/custom_nodes/demo-node/__init__.py" <<'EOF'
+print("demo runtime snapshot")
+EOF
+cat >"$TMP_ROOT/ComfyUI/custom_nodes/demo-node/runtime-extra.txt" <<'EOF'
+present in working tree but not committed
+EOF
+mkdir -p "$TMP_ROOT/ComfyUI/custom_nodes/linked-node"
+cat >"$TMP_ROOT/ComfyUI/custom_nodes/linked-node/__init__.py" <<'EOF'
+print("linked")
+EOF
+cat >"$TMP_ROOT/ComfyUI/custom_nodes/linked-node/.git" <<'EOF'
+gitdir: /tmp/fake-linked-node
+EOF
 cat >"$WORK_DIR/state/plugins.json" <<'EOF'
 [
   {
@@ -303,6 +356,17 @@ cat >"$WORK_DIR/state/plugins.json" <<'EOF'
     "ref": "main",
     "install_relpath": "custom_nodes/demo-node",
     "group": "node-demo-node",
+    "managed_deps": [],
+    "enabled": true,
+    "created_at": "2026-04-04T00:00:00Z",
+    "updated_at": "2026-04-04T00:00:00Z"
+  },
+  {
+    "id": "linked-node",
+    "git_url": "https://example.invalid/linked-node.git",
+    "ref": "main",
+    "install_relpath": "custom_nodes/linked-node",
+    "group": "node-linked-node",
     "managed_deps": [],
     "enabled": true,
     "created_at": "2026-04-04T00:00:00Z",
@@ -319,6 +383,10 @@ assert_file_exists "$BUNDLE_DIR/uv.lock"
 assert_file_exists "$BUNDLE_DIR/pylock.toml"
 assert_file_exists "$BUNDLE_DIR/state/plugins.json"
 assert_file_exists "$BUNDLE_DIR/custom_nodes/demo-node/__init__.py"
+assert_file_exists "$BUNDLE_DIR/custom_nodes/demo-node/runtime-extra.txt"
+assert_not_exists "$BUNDLE_DIR/custom_nodes/demo-node/.git"
+assert_file_exists "$BUNDLE_DIR/custom_nodes/linked-node/__init__.py"
+assert_not_exists "$BUNDLE_DIR/custom_nodes/linked-node/.git"
 assert_file_exists "$BUNDLE_DIR/audit/prod-freeze.txt"
 assert_file_exists "$BUNDLE_DIR/audit/export-summary.json"
 
@@ -354,9 +422,21 @@ assert_file_exists "$IMPORT_WORK_DIR/uv.lock"
 assert_file_exists "$IMPORT_WORK_DIR/state/plugins.json"
 assert_file_exists "$IMPORT_WORK_DIR/.venv-prod/bin/python"
 assert_file_exists "$IMPORT_COMFY/custom_nodes/demo-node/__init__.py"
+assert_file_exists "$IMPORT_COMFY/custom_nodes/demo-node/runtime-extra.txt"
+assert_file_exists "$IMPORT_COMFY/custom_nodes/linked-node/__init__.py"
+assert_not_exists "$IMPORT_COMFY/custom_nodes/linked-node/.git"
 assert_contains "$IMPORT_WORK_DIR/config.toml" "comfyui_dir = \"$IMPORT_COMFY\""
 assert_contains "$IMPORT_WORK_DIR/config.toml" "python = \"3.12\""
 assert_contains "$IMPORT_WORK_DIR/state/plugins.json" "\"demo-node\""
+assert_contains "$IMPORT_WORK_DIR/state/plugins.json" "\"linked-node\""
+
+REEXPORT_DIR="$TMP_ROOT/bundle-reexport"
+PATH="$FAKE_BIN:$PATH" bash "$IMPORT_WORK_DIR/bin/gov" env export "$REEXPORT_DIR" >"$TMP_ROOT/env-reexport.out"
+assert_file_exists "$REEXPORT_DIR/custom_nodes/demo-node/__init__.py"
+assert_file_exists "$REEXPORT_DIR/custom_nodes/demo-node/runtime-extra.txt"
+assert_file_exists "$REEXPORT_DIR/custom_nodes/linked-node/__init__.py"
+assert_not_exists "$REEXPORT_DIR/custom_nodes/demo-node/.git"
+assert_not_exists "$REEXPORT_DIR/custom_nodes/linked-node/.git"
 
 copy_fresh_workspace "$TMP_ROOT/import-python-mismatch-work"
 PY_MISMATCH_WORK_DIR="$TMP_ROOT/import-python-mismatch-work"

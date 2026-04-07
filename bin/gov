@@ -240,7 +240,7 @@ config_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 PY
 }
 
-normalize_python_minor() {
+canonicalize_python_minor() {
     local request="${1:-}"
     if [ -z "$request" ]; then
         echo "ERROR: python request is required" >&2
@@ -256,6 +256,19 @@ normalize_python_minor() {
 
     if [[ "$request" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]]; then
         echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    echo "$request"
+}
+
+resolve_python_minor() {
+    local request canonical_request
+    request="${1:-}"
+    canonical_request="$(canonicalize_python_minor "$request")"
+
+    if [[ "$request" =~ ^[[:space:]]*[0-9]+\.[0-9]+[[:space:]]*$ ]]; then
+        echo "$canonical_request"
         return 0
     fi
 
@@ -968,6 +981,10 @@ def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
         raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
     return target
 
+def ignore_vcs_admin(_dir: str, names):
+    # Export the runtime snapshot, not repository admin state.
+    return {name for name in names if name == ".git"}
+
 for item in data:
     if not isinstance(item, dict):
         continue
@@ -981,7 +998,7 @@ for item in data:
     dest_dir = custom_nodes_root / node_id
     if dest_dir.exists():
         shutil.rmtree(dest_dir)
-    shutil.copytree(source_dir, dest_dir)
+    shutil.copytree(source_dir, dest_dir, ignore=ignore_vcs_admin)
 PY
 }
 
@@ -2731,13 +2748,18 @@ cmd_init() {
         esac
     done
 
+    local resolved_python_override=""
+    if [ -n "$python_override" ]; then
+        resolved_python_override="$(resolve_python_minor "$python_override")"
+    fi
+
     ensure_layout
-    ensure_config_file_for_init "$comfyui_dir_override" "$python_override"
+    ensure_config_file_for_init "$comfyui_dir_override" "$resolved_python_override"
     ensure_project_file_for_init
 
     local prod_env py comfyui_dir environment_marker
     comfyui_dir="$(comfyui_dir_path)"
-    py="$(normalize_python_minor "$(configured_python)")"
+    py="$(canonicalize_python_minor "$(configured_python)")"
     ensure_config_file_for_init "$comfyui_dir" "$py"
     environment_marker="$(current_uv_environment_marker)"
     sync_project_runtime_constraints "$PROJECT_FILE" "$py" "$environment_marker"
@@ -4166,7 +4188,7 @@ cmd_env_import() {
     fi
 
     local normalized_python
-    normalized_python="$(normalize_python_minor "$python_spec")"
+    normalized_python="$(resolve_python_minor "$python_spec")"
 
     bundle_manifest_verify "$bundle_dir"
     bundle_check_runtime_compatibility "$bundle_dir" "$normalized_python"

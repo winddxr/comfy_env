@@ -146,7 +146,7 @@ TopDir/
 
 说明：
 
-1. `env export` 导出目录型 bundle，包含 `pyproject.toml`、`uv.lock`、`pylock.toml`、`state/plugins.json`、`custom_nodes` 源码快照和审计文件。
+1. `env export` 导出目录型 bundle，包含 `pyproject.toml`、`uv.lock`、`pylock.toml`、`state/plugins.json`、过滤 Git 元数据后的 `custom_nodes` 运行时源码快照和审计文件。
 2. `env import` 只接受目录 bundle，不支持 tarball。
 3. `comfyui_dir` 是目标机本地配置，不属于 bundle 真相；导入时必须显式传入。
 4. 导入后的本地依赖真相仍然是 `pyproject.toml + uv.lock`；`pylock.toml` 是标准化交付物，不替代本地真相。
