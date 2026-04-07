@@ -13,7 +13,7 @@
 1. 首次初始化时，两个参数都必填。
 2. 已有 `config.toml` 时，未传参数沿用现值，传入参数覆盖现值。
 3. 若 `pyproject.toml` 缺失，则从 `pyproject.toml.template` 生成。
-4. `--python` 会先解析到可用解释器，再规范化为 minor 线写入 `runtime.python`；例如 `3.13.12` 最终会写成 `3.13`。
+4. `--python` 若传入纯 `<major>.<minor>`，会直接按该 minor 线写入；若传入 patch 版本或解释器选择器，则会调用 `uv python find --no-python-downloads` 解析到本机可执行解释器，再规范化为 minor 线写入 `runtime.python`。例如 `3.13.12` 最终会写成 `3.13`。
 5. `init` 会把 `pyproject.toml` 中的 `project.requires-python` 收紧为 `==<major>.<minor>.*`。
 6. `init` 会按当前主机自动写入 `[tool.uv].environments`，把 lock 收敛到单一目标平台。
 
@@ -114,7 +114,7 @@
 1. 只支持目录 bundle，不支持 tarball。
 2. 先校验 `manifest.json` 与关键文件 SHA256，再校验 bundle 的 Python / 平台约束是否与目标机兼容，然后才进入 staging 恢复。
 3. 导入后的本地依赖真相仍然是 `pyproject.toml + uv.lock`；`pylock.toml` 仅作为交付物与审计文件保留。
-4. `--comfyui-dir` 和 `--python` 始终来自目标机 CLI 参数，不从 bundle 恢复；其中 `--python` 会先规范化为 minor 线再参与 lock/sync。
+4. `--comfyui-dir` 和 `--python` 始终来自目标机 CLI 参数，不从 bundle 恢复；其中 `--python` 若是纯 minor 线则直接使用，否则会先通过 `uv python find --no-python-downloads` 解析目标机解释器，再规范化为 minor 线参与 lock/sync 并写回配置。
 5. 导入默认执行 exact restore：覆盖目标 root truth、prod env、插件注册，并清理 bundle 外的 `custom_nodes/*` 目录，使目标机与 bundle 一致。
 6. 失败会恢复 root truth，并恢复本次导入覆盖或清理过的节点目录。
 

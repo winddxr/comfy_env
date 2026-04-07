@@ -84,7 +84,7 @@ TopDir/
 
 说明：
 
-1. `init` 负责写入 `config.toml` 的 `paths.comfyui_dir` 与 `runtime.python`，并初始化最小 prod 环境。
+1. `init` 负责写入 `config.toml` 的 `paths.comfyui_dir` 与 `runtime.python`，并初始化最小 prod 环境；若 `--python` 传入纯 `major.minor`（如 `3.12`）则直接采用该 minor 线，若传入 patch 版本或解释器选择器（如 `3.12.8`、`python3.12`）则先用 `uv python find --no-python-downloads` 解析到本机可执行解释器，再回写成 minor 线。
 2. `install torch` 把 `torch/torchvision/torchaudio` 收敛到 `dependency-groups.torch`，并记录可撤销的 operation。
 3. `install` 从 `${comfyui_dir}/requirements.txt` 导入基础依赖到 `dependency-groups.core`。
 4. `install` 在 torch 未先安装时会阻断。
@@ -146,12 +146,13 @@ TopDir/
 
 说明：
 
-1. `env export` 导出目录型 bundle，包含 `pyproject.toml`、`uv.lock`、`pylock.toml`、`state/plugins.json`、过滤 Git 元数据后的 `custom_nodes` 运行时源码快照和审计文件。
+1. `env export` 导出目录型 bundle，包含 `pyproject.toml`、`uv.lock`、`pylock.toml`、`state/plugins.json`、过滤 Git 元数据后的 `custom_nodes` 运行时源码快照和审计文件；快照保留工作树中的已修改文件和未跟踪文件。
 2. `env import` 只接受目录 bundle，不支持 tarball。
-3. `comfyui_dir` 是目标机本地配置，不属于 bundle 真相；导入时必须显式传入。
-4. 导入后的本地依赖真相仍然是 `pyproject.toml + uv.lock`；`pylock.toml` 是标准化交付物，不替代本地真相。
-5. `env import` 默认执行精确恢复：覆盖目标 root truth、prod env、插件注册，并清理 bundle 外的 `custom_nodes/*` 目录，使结果与 bundle 一致。
-6. v1 不支持 partial import、nodes-only import 或按节点依赖增量导入。
+3. `env import --python` 和 `init --python` 采用同一套规则：纯 `major.minor` 直接使用，其他 selector 先解析到目标机已安装解释器，再规范化为 minor 线。
+4. `comfyui_dir` 是目标机本地配置，不属于 bundle 真相；导入时必须显式传入。
+5. 导入后的本地依赖真相仍然是 `pyproject.toml + uv.lock`；`pylock.toml` 是标准化交付物，不替代本地真相。
+6. `env import` 默认执行精确恢复：覆盖目标 root truth、prod env、插件注册，并清理 bundle 外的 `custom_nodes/*` 目录，使结果与 bundle 一致。
+7. v1 不支持 partial import、nodes-only import 或按节点依赖增量导入。
 
 ## 9. 文档导航
 

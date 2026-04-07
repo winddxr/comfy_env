@@ -63,9 +63,9 @@ The external systems are:
 
 | Doc ID | path | symbol | line |
 |---|---|---|---|
-| SI-001 | `bin/gov` | `comfyui_dir_path` | 496 |
-| SI-002 | `bin/gov` | `plugin_install_abs_path` | 932 |
-| SI-003 | `bin/gov` | `plugin_get_meta` | 1854 |
-| SI-004 | `bin/gov` | `cmd_node_add` | 2779 |
-| SI-005 | `bin/gov` | `cmd_node_remove` | 2872 |
-| SI-006 | `bin/gov` | `bundle_copy_custom_nodes` | 948 |
+| SI-001 | `bin/gov` | `comfyui_dir_path` | 493 |
+| SI-002 | `bin/gov` | `plugin_install_abs_path` | 922 |
+| SI-003 | `bin/gov` | `plugin_get_meta` | 1892 |
+| SI-004 | `bin/gov` | `cmd_node_add` | 2813 |
+| SI-005 | `bin/gov` | `cmd_node_remove` | 2906 |
+| SI-006 | `bin/gov` | `bundle_copy_custom_nodes` | 938 |

@@ -46,9 +46,9 @@
 3. 不支持“把 bundle 合并进一个未知状态的既有环境”。
 4. 不在 v1 自动处理跨 OS / 跨架构 / 跨 Python ABI 的兼容修复。
 
-## 4. 推荐交付物结构
+## 4. 当前 bundle 结构
 
-建议使用 tarball 或目录 bundle，包含：
+当前实现只支持目录 bundle，不支持 tarball，结构如下：
 
 ```text
 bundle/
@@ -56,7 +56,6 @@ bundle/
 ├── pylock.toml
 ├── uv.lock
 ├── pyproject.toml
-├── config.snapshot.toml
 ├── state/
 │   └── plugins.json
 ├── custom_nodes/
@@ -69,17 +68,17 @@ bundle/
 
 说明：
 
-1. `pylock.toml`：
+1. `manifest.json`：
+   - 记录 bundle 完整性与兼容性元数据。
+   - 当前至少包含：`created_at`、`created_by`、`python_spec`、`python_version`、`platform_system`、`platform_machine`、`bundle_format_version`、`node_ids`、`files.sha256`。
+2. `pylock.toml`：
    - 用于标准化迁移与目标端安装。
    - 生成命令草案：`uv export --format pylock.toml --locked --all-groups --output-file pylock.toml`
-2. `uv.lock`：
+3. `uv.lock`：
    - 保留 uv 原生锁文件，作为本地真相和额外保真信息。
    - 不用它替代 `pylock.toml`，而是和 `pylock.toml` 一起导出。
-3. `pyproject.toml`：
+4. `pyproject.toml`：
    - 保留 dependency groups 真相。
-4. `config.snapshot.toml`：
-   - 只保留与导入判定相关的稳定信息，不直接照搬目标端路径。
-   - 例如：`runtime.python`、导出时使用的 `prod_env` 相对名、`comfyui_dir` 布局假设。
 5. `state/plugins.json`：
    - 用于恢复节点注册元数据。
    - 明确它不是依赖真相，只是导入后辅助恢复节点记录。
@@ -90,10 +89,12 @@ bundle/
    - 不依赖远端 `git_url/ref` 在云端重新获取。
 7. `audit/prod-freeze.txt`：
    - 用 `uv pip freeze` 导出，只用于审计和导入后比对，不作为导入真相。
+8. `audit/export-summary.json`：
+   - 记录导出摘要，如 `python_spec`、`node_ids`、`node_count` 及关键交付物是否存在。
 
-## 5. 命令草案
+## 5. 当前命令
 
-### 5.1 新命令
+### 5.1 已实现命令
 
 1. `./bin/gov env export <output_path>`
 2. `./bin/gov env import <bundle_path> --comfyui-dir <abs-path> --python <python-spec>`
@@ -114,10 +115,12 @@ v1 先不做 `nodes-only import` 或 `partial import`。
    - `pyproject.toml` 与 `uv.lock` 存在
    - `state/plugins.json` 存在
    - `config.toml` 存在且 `paths.comfyui_dir` 可解析
-3. 用 `--locked` 导出 `pylock.toml`；若 lock 已过期则直接失败，不自动刷新。
-4. 从 `state/plugins.json` 枚举已注册节点，并把每个 `install_relpath` 对应目录导出为运行时快照；保留未提交修改与未跟踪文件，但排除 `.git` 元数据。
-5. 导出 `prod-freeze.txt` 作为审计文件。
-6. 生成 `manifest.json`，至少包含：
+3. 仅接受不存在路径或空目录作为输出目录；已有非空目录会直接失败。
+4. 用 `--locked` 导出 `pylock.toml`；若 lock 已过期则直接失败，不自动刷新。
+5. 从 `state/plugins.json` 枚举已注册节点，并把每个 `install_relpath` 对应目录导出为运行时快照；保留未提交修改与未跟踪文件，但排除 `.git` 元数据。
+6. 若 registry 中任一节点的 `install_relpath` 缺失、越界或目标目录不存在，则 export 直接失败。
+7. 导出 `prod-freeze.txt`，并写出 `audit/export-summary.json`。
+8. 生成 `manifest.json`，至少包含：
    - `created_at`
    - `created_by`
    - `python_spec`
@@ -127,64 +130,66 @@ v1 先不做 `nodes-only import` 或 `partial import`。
    - `bundle_format_version`
    - `node_ids`
    - `files.sha256`
-7. 输出 bundle 路径和摘要信息。
-8. bundle 中导出的 `pyproject.toml` 应已收紧到单一 Python minor 与单一平台；导入侧以它作为兼容性判定依据。
+9. 输出 bundle 路径和摘要信息。
+10. bundle 中导出的 `pyproject.toml` 应已收紧到单一 Python minor 与单一平台；导入侧以它作为兼容性判定依据。
 
 ### 6.2 Import
 
 1. 导入默认按 bundle 对目标机做精确恢复，不区分“空白目标”和“允许覆盖”两种模式。
-2. 先解包并校验 `manifest.json` 与关键文件完整性。
-3. 失败即退出，不提前改写 root truth。
-4. 先校验目标机 `--python` 归一化后的 minor 线是否与 bundle `requires-python` 兼容，并校验当前主机是否落在 bundle `[tool.uv].environments` 内。
-5. 将 `pyproject.toml`、`uv.lock`、`state/plugins.json` 复制到 staging workdir。
-6. 先清理目标 `ComfyUI/custom_nodes/` 下 bundle 未声明的节点目录，再将 bundle 中的节点源码恢复到目标路径。
-7. 用 staging truth 执行依赖重建，优先验证：
-   - `uv lock --check` 或等效“锁文件不漂移”校验
-   - `uv pip sync pylock.toml` 或继续复用现有 `sync_project_env_exact` 路径
-8. 只有 staging 成功后才切换到 root truth 并完成 `.venv-prod` 重建。
-9. 导入后做 smoke test，并输出导入摘要。
+2. 只支持目录 bundle，不支持 tarball。
+3. 先校验 `manifest.json` 与关键文件完整性；校验失败即退出，不提前改写 root truth。
+4. `--python` 若传入纯 `major.minor` 则直接使用；若传入 patch 版本或解释器选择器，则先通过 `uv python find --no-python-downloads` 解析目标机解释器，再规范化为 minor 线。
+5. 先校验目标机 Python minor 线是否与 bundle `requires-python` 兼容，并校验当前主机是否落在 bundle `[tool.uv].environments` 内。
+6. 导入前创建 `env_import` operation，备份 `config.toml` 与受影响的 `custom_nodes` 目录。
+7. 将 `pyproject.toml`、`uv.lock`、`state/plugins.json` 复制到 staging workdir，并执行 `uv lock --check` 等效校验。
+8. staging 通过后，先用 bundle truth 重建 `.venv-prod`，再按 bundle 恢复 `custom_nodes` 运行态快照。
+9. 只有 staging 与 prod sync 成功后，才把 `pyproject.toml`、`uv.lock`、`state/plugins.json` 切回 root，并用目标机 CLI 参数更新 `config.toml`。
+10. 导入后做 smoke test，并输出导入摘要。
+11. 任一步失败都会恢复 root truth，并恢复本次导入覆盖或清理过的 `custom_nodes` 目录。
 
-## 7. 实现建议
+## 7. 实现锚点
 
-### 7.1 复用现有能力
+### 7.1 关键入口
 
-优先复用以下现有逻辑：
-
-1. [bin/gov](/home/windy/comfy-hub/comfy_env/bin/gov#L272) `lock_project_exact`
-2. [bin/gov](/home/windy/comfy-hub/comfy_env/bin/gov#L284) `sync_project_env_exact`
-3. [bin/gov](/home/windy/comfy-hub/comfy_env/bin/gov#L890) `plugin_get_meta`
-4. [bin/gov](/home/windy/comfy-hub/comfy_env/bin/gov#L946) `plugin_update_after_promote`
-5. [bin/gov](/home/windy/comfy-hub/comfy_env/bin/gov#L1015) `build_workdir_for_tx`
-6. [bin/gov](/home/windy/comfy-hub/comfy_env/bin/gov#L1086) `op_begin`
-7. [bin/gov](/home/windy/comfy-hub/comfy_env/bin/gov#L1149) `op_finalize`
-
-### 7.2 新增 helper 建议
-
-建议新增以下 helper：
+当前实现主要入口：
 
 1. `cmd_env_export`
 2. `cmd_env_import`
-3. `bundle_manifest_write`
-4. `bundle_manifest_verify`
-5. `bundle_copy_custom_nodes`
-6. `bundle_stage_truth`
-7. `bundle_restore_plugins_registry`
-8. `bundle_export_pylock`
+3. `resolve_python_minor`
+4. `bundle_check_runtime_compatibility`
+5. `bundle_lock_check`
+6. `sync_project_env_exact`
+7. `run_smoke_test_in_env`
 
-### 7.3 导入路径建议
+### 7.2 关键 helper
 
-1. 不要直接复用 `node add`，因为导入不是重新从 Git 安装节点。
-2. 不要通过事务流恢复每个节点，因为目标是快速恢复已验证环境，不是重新观察每个节点影响。
-3. 应单独实现一个“受保护的整体恢复路径”，语义更接近：
-   - staging
+当前与 handoff 直接相关的 helper：
+
+1. `bundle_manifest_write`
+2. `bundle_manifest_verify`
+3. `bundle_copy_custom_nodes`
+4. `bundle_stage_truth`
+5. `bundle_restore_plugins_registry`
+6. `bundle_export_pylock`
+7. `bundle_backup_custom_nodes`
+8. `bundle_apply_custom_nodes`
+9. `env_import_restore_after_failure`
+
+### 7.3 导入路径现状
+
+1. 没有复用 `node add`，因为导入不是重新从 Git 安装节点。
+2. 没有复用插件事务流，因为导入目标是快速恢复已验证环境，而不是重新观察每个节点影响。
+3. 当前实现采用单独的“受保护整体恢复路径”，语义是：
    - verify
+   - staging
    - exact sync
+   - custom_nodes restore
    - smoke test
    - commit / rollback
 
-## 8. 文档与契约更新清单
+## 8. 后续维护时需要同步的文档
 
-实现后需要同步更新：
+后续若继续调整 handoff 行为，至少同步更新：
 
 1. `docs/04_cli_reference.md`
 2. `docs/05_data_contracts.md`
@@ -234,7 +239,7 @@ v1 先不做 `nodes-only import` 或 `partial import`。
 2. v1 导出节点源码快照，不依赖导入端联网拉取 Git。
 3. v1 导出 `pylock.toml` 时使用 `--locked`，不允许导出时 re-lock。
 4. v1 保留 `uv.lock` 和 `pylock.toml` 两份锁定表示。
-5. v1 导入仅支持空白或显式覆盖目标环境。
+5. v1 导入默认就是 exact restore，可视为显式覆盖目标环境。
 
 ## 11. 建议新会话的起手顺序
 
@@ -245,5 +250,5 @@ v1 先不做 `nodes-only import` 或 `partial import`。
    - [dev-docs/data/spec.md](/home/windy/comfy-hub/comfy_env/dev-docs/data/spec.md)
    - [dev-docs/subsystems/dependency-sync/spec.md](/home/windy/comfy-hub/comfy_env/dev-docs/subsystems/dependency-sync/spec.md)
    - [dev-docs/subsystems/source-integration/spec.md](/home/windy/comfy-hub/comfy_env/dev-docs/subsystems/source-integration/spec.md)
-4. 先实现 `env export`，再实现 `env import`。
-5. 最后补 CLI 文档、契约文档和测试。
+4. 优先核对 `tests/test_gov_cli.sh` 中关于 runtime snapshot、`.git` 过滤和 exact restore 的覆盖场景。
+5. 修改实现后，再同步 CLI 文档、契约文档和测试。

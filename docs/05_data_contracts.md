@@ -129,8 +129,10 @@
 
 语义约束：
 
-1. `pyproject.toml + uv.lock` 仍是导入后的本地依赖真相。
-2. `pylock.toml` 是标准化导出物与审计辅助，不替代导入后的本地真相。
-3. `paths.comfyui_dir` 不属于 bundle 真相；目标机路径必须由 `env import --comfyui-dir` 指定。
-4. `env import` 默认执行 exact restore；导入后目标机的 `custom_nodes/*` 目录集合应与 bundle registry 一致。
-5. v1 不支持 partial import、nodes-only import 或按节点依赖增量导入。
+1. `manifest.json` 记录 bundle 兼容性与完整性元数据，包括 Python / 平台摘要、节点列表和关键文件 SHA256。
+2. `pyproject.toml + uv.lock` 仍是导入后的本地依赖真相。
+3. `pylock.toml` 是标准化导出物与审计辅助，不替代导入后的本地真相。
+4. `custom_nodes/<node_id>/` 保存运行态源码快照：保留工作树中的已修改文件和未跟踪文件，但过滤 `.git/` 目录与 `.git` 指针文件。
+5. `paths.comfyui_dir` 不属于 bundle 真相；目标机路径必须由 `env import --comfyui-dir` 指定。
+6. `env import` 默认执行 exact restore；导入后目标机的 `custom_nodes/*` 目录集合应与 bundle registry 一致。
+7. v1 不支持 partial import、nodes-only import 或按节点依赖增量导入。

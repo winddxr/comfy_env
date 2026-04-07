@@ -3,7 +3,7 @@
 ## Metadata
 
 - Status: Active
-- Last Reviewed: 2026-03-01
+- Last Reviewed: 2026-04-07
 
 ## 1. System Identity / Goals / Non-Goals / Assumptions
 
@@ -13,12 +13,14 @@
   - Make runtime prerequisites explicit through `gov init --comfyui-dir --python`.
   - Force plugin dependency changes through an observable candidate transaction before production promotion.
   - Handle ComfyUI core requirements through `install` and `update` flows without bypassing local truth.
+  - Hand off a verified environment through `env export` and `env import` without re-cloning plugins or redefining local truth ownership.
   - Preserve auditable state for transactions, operations, conflicts, and plugin registration.
   - Prefer automatic recovery before leaving local truth in a partially changed state.
 - Non-Goals:
   - It does not manage ComfyUI application logic or node business behavior.
   - It does not provide concurrent multi-user coordination or remote orchestration.
   - It does not restore purged plugin source code during `undo`.
+  - It does not preserve source-machine `comfyui_dir` as bundle truth or ship VCS admin metadata as part of source handoff.
 - Assumptions:
   - `uv`, `git`, and Python are available on the host.
   - `comfy_env` and `ComfyUI` run in sidecar layout, with `paths.comfyui_dir` pointing at the managed ComfyUI root.
@@ -52,6 +54,8 @@
 4. Lock conflicts must surface as explicit conflict artifacts and a resolvable transaction state, not silent partial success.
 5. Core package drift is policy-gated and cannot promote without explicit approval.
 6. `state/plugins.json` is registry metadata; dependency-group content in `pyproject.toml` remains authoritative for actual dependency removal.
+7. `env export` / `env import` bundles are transport artifacts; after import, local truth remains root `pyproject.toml + uv.lock`, while `paths.comfyui_dir` stays target-local configuration.
+8. Bundle source snapshots represent runtime working trees and must exclude VCS admin metadata such as `.git/`.
 
 ## 4. Top-Level Decomposition
 
@@ -61,8 +65,8 @@
   - [State Ledger](./subsystems/state-ledger/spec.md): durable local records for transactions, operations, plugin registry, and conflict artifacts (I1).
   - [Safety Guards](./subsystems/safety-guards/spec.md): core-impact gate, backup discipline, rollback posture, undo hash guard (I5).
 - Infrastructure Adapters:
-  - [Dependency Sync](./subsystems/dependency-sync/spec.md): `uv` lock/sync/add/remove/freeze and environment materialization (I2).
-  - [Source Integration](./subsystems/source-integration/spec.md): plugin clone/checkout and install-path mapping into `custom_nodes` (I3).
+  - [Dependency Sync](./subsystems/dependency-sync/spec.md): `uv` lock/sync/add/remove/freeze, `pylock.toml` export, bundle compatibility checks, and environment materialization (I2).
+  - [Source Integration](./subsystems/source-integration/spec.md): plugin clone/checkout, install-path mapping, and runtime snapshot export/import for `custom_nodes` (I3).
   - [Runtime Executor](./subsystems/runtime-executor/spec.md): candidate/prod Python execution, ComfyUI launch, timeout, PID, logs (I4).
 
 ## 5. Contracts & Interfaces Index
@@ -83,8 +87,9 @@
   - [SKF-002](./key-flows/system.md#skf-002) `promote lock conflict -> resolve -> re-promote`
   - [SKF-003](./key-flows/system.md#skf-003) `node remove/undo with backup restore`
   - [SKF-004](./key-flows/system.md#skf-004) `init -> install torch -> install -> update run -> update promote`
+  - [SKF-005](./key-flows/system.md#skf-005) `env export -> env import`
 - Module KF Index:
-  - Application Core: `core#KF-001..009` in [application-core/spec.md](./application-core/spec.md#key-flows--failure-recovery)
+  - Application Core: `core#KF-001..010` in [application-core/spec.md](./application-core/spec.md#key-flows--failure-recovery)
   - State Ledger: `state-ledger#KF-001..003` in [state-ledger/spec.md](./subsystems/state-ledger/spec.md#key-flows--failure-recovery)
   - Safety Guards: `safety-guards#KF-001..003` in [safety-guards/spec.md](./subsystems/safety-guards/spec.md#key-flows--failure-recovery)
 - UC Index:
@@ -102,6 +107,7 @@
   - Transaction truth: [`state/transactions/*.json`](./subsystems/state-ledger/contracts.md)
   - Operation backup truth: [`state/ops/<op_id>/`](./subsystems/state-ledger/contracts.md)
   - Runtime liveness hint: `state/comfyui.pid` in [operations/spec.md](./operations/spec.md)
+  - Transfer artifact: `env export` bundle (`manifest.json`, `pylock.toml`, `state/plugins.json`, `custom_nodes/*`, audit files)
 - Integration Boundaries:
   - `git` only touches plugin source directories.
   - `uv` owns lock calculation and virtualenv synchronization.
@@ -134,6 +140,7 @@
 - Risk Register:
   - No explicit file locking, so overlapping local invocations can race on the same state files.
   - `undo` protects local truth files but intentionally excludes purged source trees.
+  - `env import` is an exact-restore flow and will remove bundle-external `custom_nodes/*` directories unless they are restored during rollback.
 
 ## Module Cards
 
@@ -142,7 +149,7 @@
 **Type**: Application Core
 
 **Role / Responsibility**
-- Owns command routing and the six user-visible surfaces S1-S6.
+- Owns command routing and the eight user-visible surfaces S1-S8.
 - Does NOT own tool-specific semantics or record schema internals.
 
 **Owned Data / Source of Truth**
@@ -160,7 +167,7 @@
 - Single-command imperative flows with explicit failure branches.
 
 **Key Behaviors (Index)**
-- `core#KF-001..006`
+- `core#KF-001..010`
 
 **Drill-down**
 - [Spec](./application-core/spec.md)
@@ -243,7 +250,7 @@
 - Batch-transform a workdir, then materialize env state.
 
 **Key Behaviors (Index)**
-- `dependency-sync#KF-001..003`
+- `dependency-sync#KF-001..009`
 
 **Drill-down**
 - [Spec](./subsystems/dependency-sync/spec.md)
@@ -270,7 +277,7 @@
 - Materialize source tree, then hand off to ledger-backed flows.
 
 **Key Behaviors (Index)**
-- `source-integration#KF-001..002`
+- `source-integration#KF-001..005`
 
 **Drill-down**
 - [Spec](./subsystems/source-integration/spec.md)

@@ -3,7 +3,7 @@
 ## Metadata
 
 - Status: Active
-- Last Reviewed: 2026-03-01
+- Last Reviewed: 2026-04-07
 
 ## Contract List
 
@@ -30,8 +30,8 @@
   - Input: optional `--sync`, passthrough ComfyUI args, PID file presence.
   - Output: foreground exec into ComfyUI or explicit stop result.
 - Environment Handoff Contract
-  - Input: `env export <output_dir>` or `env import <bundle_dir> --comfyui-dir --python`.
-  - Output: a verified directory bundle for export, or a staged-and-committed environment restore for import.
+  - Input: `env export <output_dir>` or `env import <bundle_dir> --comfyui-dir --python`, where `--python` can be a canonical minor line or a selector resolvable on the target machine.
+  - Output: a verified directory bundle for export, or a staged-and-committed exact restore for import.
 
 ## Error Taxonomy
 
@@ -39,7 +39,7 @@
   - Missing required identifiers or unknown flags.
 - State precondition errors:
   - Missing transaction, missing operation, invalid transaction status, missing plugin metadata, missing PID file.
-  - Missing bundle manifest, bundle checksum mismatch, invalid bundle registry, invalid absolute target path.
+  - Missing bundle manifest, bundle checksum mismatch, invalid bundle registry, invalid absolute target path, unresolvable Python selector.
 - Policy errors:
   - Core package impact without explicit approval.
   - Undo target is not `success && undoable`.

@@ -3,11 +3,11 @@
 ## Metadata
 
 - Status: Active
-- Last Reviewed: 2026-03-01
+- Last Reviewed: 2026-04-07
 
 ## Scope & Boundary
 
-The application core is the single CLI entrypoint in `bin/gov`. It parses commands, validates user input, sequences subsystems, and decides when to persist state, block unsafe actions, or exit with errors. It now owns seven user-visible surfaces:
+The application core is the single CLI entrypoint in `bin/gov`. It parses commands, validates user input, sequences subsystems, and decides when to persist state, block unsafe actions, or exit with errors. It now owns eight user-visible surfaces:
 
 - S1 Environment bootstrap: `init`
 - S2 Managed dependency install: `install`, `install torch`, `status`
@@ -15,7 +15,8 @@ The application core is the single CLI entrypoint in `bin/gov`. It parses comman
 - S4 Plugin transaction execution: `tx run`, `tx inspect`, `tx abort`
 - S5 Promotion and conflict handling: `tx promote`, `resolve`, `update promote`, `update resolve`
 - S6 Core dependency update transactions: `update run`, `update inspect`, `update abort`
-- S7 Audit, reversal, and runtime control: `op list`, `op inspect`, `undo`, `run`, `stop`
+- S7 Environment handoff: `env export`, `env import`
+- S8 Audit, reversal, and runtime control: `op list`, `op inspect`, `undo`, `run`, `stop`
 
 It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns.
 
@@ -24,6 +25,7 @@ It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns
 - Command Session: one CLI invocation routed by `main()`.
 - Plugin Transaction Intent: a plugin-specific candidate observation and later promotion candidate.
 - Core Update Transaction Intent: a staged `requirements.txt`-driven candidate snapshot for ComfyUI base dependencies.
+- Environment Handoff Intent: export verified locked truth plus runtime source snapshots, or exact-restore them on another machine.
 - Operation Intent: a backup-protected destructive mutation.
 - Runtime Session: a foreground ComfyUI process launched from `.venv-prod`.
 
@@ -38,12 +40,13 @@ It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns
 - `UC-007` Bootstrap local runtime prerequisites: persist `paths.comfyui_dir` and `runtime.python`.
 - `UC-008` Install managed runtime dependencies: install torch first, then import ComfyUI `requirements.txt` into dependency truth.
 - `UC-009` Transactional update of ComfyUI core requirements: stage new `requirements.txt`, observe candidate, resolve conflicts, promote, and allow undo.
+- `UC-010` Export and import environment bundle: hand off locked truth, plugin registry, and runtime source snapshots through a directory bundle.
 
 ## Key Flows & Failure Recovery
 
 - `core#KF-001` Bootstrap local state
   - Trigger: `cmd_init`.
-  - Success: ensure layout, normalize `runtime.python` to a canonical minor line, seed `pyproject.toml` if needed, sync `project.requires-python` plus `[tool.uv].environments`, `uv lock`, exact sync into prod env.
+  - Success: ensure layout, resolve `--python` selectors to a local interpreter when needed, normalize `runtime.python` to a canonical minor line, seed `pyproject.toml` if needed, sync `project.requires-python` plus `[tool.uv].environments`, `uv lock`, exact sync into prod env.
   - Failure: missing required init flags or missing tools exits before partial runtime state is considered valid.
 - `core#KF-002` Install managed torch runtime
   - Trigger: `cmd_install_torch`.
@@ -77,6 +80,10 @@ It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns
   - Trigger: `cmd_run`, `cmd_stop`.
   - Success: optionally sync prod, write PID, `exec` ComfyUI, later stop via TERM then KILL fallback.
   - Failure: missing env, lock, entrypoint, or PID are explicit command errors.
+- `core#KF-010` Hand off environment bundle
+  - Trigger: `cmd_env_export`, `cmd_env_import`.
+  - Success: export copies locked truth plus runtime `custom_nodes` snapshots into a verified directory bundle; import validates manifest/runtime compatibility, stages truth, exact-syncs prod, restores `custom_nodes`, updates target-local config, then smoke-tests.
+  - Failure: export blocks on missing bundle inputs or source directories; import restores pre-op truth and affected `custom_nodes` before finalizing failure.
 
 ## Internal Components / Collaboration
 
@@ -105,18 +112,20 @@ It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns
 
 | Doc ID | path | symbol | line |
 |---|---|---|---|
-| UC-004 | `bin/gov` | `cmd_init` | 1765 |
-| UC-008 | `bin/gov` | `cmd_install_torch` | 2484 |
-| UC-008 | `bin/gov` | `cmd_install_core` | 2554 |
-| UC-009 | `bin/gov` | `cmd_update_run` | 2644 |
-| UC-009 | `bin/gov` | `cmd_update_promote` | 2959 |
-| UC-005 | `bin/gov` | `cmd_status` | 3100 |
-| UC-001 | `bin/gov` | `cmd_node_add` | 1807 |
-| UC-002 | `bin/gov` | `cmd_node_remove` | 1900 |
-| UC-001 | `bin/gov` | `cmd_tx_run` | 2017 |
-| UC-001 | `bin/gov` | `cmd_tx_promote` | 2309 |
-| UC-006 | `bin/gov` | `cmd_run` | 3201 |
-| ROUTE-001 | `bin/gov` | `main` | 3350 |
+| UC-004 | `bin/gov` | `cmd_init` | 2763 |
+| UC-008 | `bin/gov` | `cmd_install_torch` | 3444 |
+| UC-008 | `bin/gov` | `cmd_install_core` | 3514 |
+| UC-009 | `bin/gov` | `cmd_update_run` | 3592 |
+| UC-009 | `bin/gov` | `cmd_update_promote` | 3907 |
+| UC-005 | `bin/gov` | `cmd_status` | 4210 |
+| UC-001 | `bin/gov` | `cmd_node_add` | 2813 |
+| UC-002 | `bin/gov` | `cmd_node_remove` | 2906 |
+| UC-001 | `bin/gov` | `cmd_tx_run` | 3008 |
+| UC-001 | `bin/gov` | `cmd_tx_promote` | 3298 |
+| UC-010 | `bin/gov` | `cmd_env_export` | 4037 |
+| UC-010 | `bin/gov` | `cmd_env_import` | 4103 |
+| UC-006 | `bin/gov` | `cmd_run` | 4311 |
+| ROUTE-001 | `bin/gov` | `main` | 4462 |
 
 ## Internal Contracts
 
