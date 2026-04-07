@@ -247,27 +247,46 @@ normalize_python_minor() {
         exit 1
     fi
 
+    request="${request#"${request%%[![:space:]]*}"}"
+    request="${request%"${request##*[![:space:]]}"}"
+    if [ -z "$request" ]; then
+        echo "ERROR: python request is required" >&2
+        exit 1
+    fi
+
+    if [[ "$request" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]]; then
+        echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+        return 0
+    fi
+
     require_cmd uv
-    mkdir -p "$(uv_cache_dir)"
+    local cache_dir
+    cache_dir="$(uv_cache_dir)"
+    mkdir -p "$cache_dir"
 
     local resolved
-    if ! resolved="$(uv --cache-dir "$(uv_cache_dir)" python find --show-version --no-python-downloads "$request")"; then
+    if ! resolved="$(uv --cache-dir "$cache_dir" python find --no-python-downloads "$request")"; then
         echo "ERROR: failed to resolve python request: $request" >&2
         exit 1
     fi
 
-    require_python
-    "${PYTHON_BIN}" - "$resolved" <<'PY'
-import re
-import sys
+    resolved="${resolved#"${resolved%%[![:space:]]*}"}"
+    resolved="${resolved%"${resolved##*[![:space:]]}"}"
+    if [ ! -x "$resolved" ]; then
+        echo "ERROR: resolved python is not executable: $resolved" >&2
+        exit 1
+    fi
 
-value = sys.argv[1].strip()
-match = re.match(r"^(\d+)\.(\d+)", value)
-if not match:
-    raise SystemExit(f"ERROR: unsupported python version resolved from request: {value}")
-
-print(f"{match.group(1)}.{match.group(2)}")
-PY
+    local resolved_minor
+    if ! resolved_minor="$("$resolved" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"; then
+        echo "ERROR: failed to inspect resolved python version: $resolved" >&2
+        exit 1
+    fi
+    if ! [[ "$resolved_minor" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        echo "ERROR: unsupported python version resolved from request: $resolved_minor" >&2
+        exit 1
+    fi
+    echo "$resolved_minor"
 }
 
 current_uv_environment_marker() {
