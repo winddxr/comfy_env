@@ -47,10 +47,10 @@
 关键行为：
 
 1. 只接受 `pkg==version` 格式，不支持范围约束。
-2. 对同名包执行 upsert：已有 override 会被新 spec 替换，不会累积重复 pin。
+2. 对同名包执行 upsert：同一命令内按 last-wins 去重；已有 override 会先按包名移除，再写回新的 exact spec，不会累积重复 pin。
 3. 不接受 `torch`、`torchvision`、`torchaudio`；这三者由 `gov install torch` 单独治理。
 4. 会对非推荐关键包输出警告；推荐包集合当前为 `numpy`、`transformers`。
-5. 在 staged workdir 中委托 `uv add --group overrides --python "$py" --frozen` 修改 `dependency-groups.overrides`，只有显式 lock 成功后才晋升到 root truth。
+5. 在 staged workdir 中先对当前已存在的目标包执行 `uv remove --group overrides --python "$py" --frozen`，再执行 `uv add --group overrides --python "$py" --frozen` 写回目标 exact specs，只有显式 lock 成功后才晋升到 root truth。
 6. sync 或 smoke test 失败会恢复 `pyproject.toml` 和 `uv.lock`，并把 prod 环境重新同步回恢复后的状态。
 7. 会生成可撤销的 operation。
 
@@ -62,6 +62,7 @@
 
 1. 输出的是声明态 source of truth，不是已安装版本探针。
 2. 无 pin 时输出 `No pins in overrides group.`。
+3. 若 `pyproject.toml` 存在但 TOML 非法，会直接返回 parse error。
 
 ### `gov pin remove <pkg>...`
 
@@ -72,7 +73,7 @@
 1. 参数只接受包名，不接受带版本的 spec。
 2. 匹配按规范化包名进行，`-` / `_` / `.` 与大小写差异会被折叠。
 3. 不接受 `torch`、`torchvision`、`torchaudio`；这三者由 `gov install torch` 单独治理。
-4. 会先对当前 root truth 做只读 precheck；若任一包当前未被 pin，会直接失败，不会部分移除。
+4. 删除阶段直接委托 `uv remove --group overrides --python "$py" --frozen`；缺包、解析失败和原子性都由 `uv` 原生判定。
 5. 会生成可撤销的 operation。
 
 ## 2. 核心依赖升级事务

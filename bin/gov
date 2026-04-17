@@ -681,39 +681,95 @@ warn_for_unrecommended_pin_specs() {
     done
 }
 
-require_group_names_present() {
+write_pin_specs_last_wins() {
+    local out_file="$1"
+    shift
+    require_python
+    "${PYTHON_BIN}" - "$out_file" "$@" <<'PY'
+import pathlib
+import re
+import sys
+
+out_file = pathlib.Path(sys.argv[1])
+items = [str(x).strip() for x in sys.argv[2:] if str(x).strip()]
+
+def normalize_name(spec: str) -> str:
+    token = re.split(r"[<>=!~;\[]", spec.strip(), maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower().strip("-")
+
+last_seen: dict[str, tuple[int, str]] = {}
+for idx, item in enumerate(items):
+    norm = normalize_name(item)
+    if not norm:
+        continue
+    last_seen[norm] = (idx, item)
+
+ordered = [item for _, item in sorted(last_seen.values(), key=lambda entry: entry[0])]
+out_file.write_text("\n".join(ordered) + ("\n" if ordered else ""), encoding="utf-8")
+PY
+}
+
+write_group_names_matching_specs() {
     local pyproject_file="$1"
     local group_name="$2"
-    shift 2
+    local out_file="$3"
+    shift 3
+    require_python
+    "${PYTHON_BIN}" - "$pyproject_file" "$group_name" "$out_file" "$@" <<'PY'
+import pathlib
+import re
+import sys
 
-    local current_file dep pkg dep_name found
-    local -a missing=()
-    current_file="$(mktemp)"
-    write_group_deps "$pyproject_file" "$group_name" "$current_file"
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
-    for pkg in "$@"; do
-        found=false
-        while IFS= read -r dep; do
-            [ -z "$dep" ] && continue
-            dep_name="$(normalize_dep_name "$dep")"
-            if [ "$dep_name" = "$pkg" ]; then
-                found=true
-                break
-            fi
-        done < "$current_file"
-        if [ "$found" != true ]; then
-            missing+=("$pkg")
-        fi
-    done
+pyproject = pathlib.Path(sys.argv[1])
+group = sys.argv[2]
+out_file = pathlib.Path(sys.argv[3])
+items = [str(x).strip() for x in sys.argv[4:] if str(x).strip()]
 
-    rm -f "$current_file"
+def normalize_name(spec: str) -> str:
+    token = re.split(r"[<>=!~;\[]", spec.strip(), maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower().strip("-")
 
-    if [ "${#missing[@]}" -ne 0 ]; then
-        echo "ERROR: pin not found for package(s): ${missing[*]}" >&2
-        return 1
-    fi
+existing: set[str] = set()
+if pyproject.exists():
+    text = pyproject.read_text(encoding="utf-8")
+    try:
+        data = tomllib.loads(text)
+    except Exception as exc:
+        raise SystemExit(f"ERROR: failed to parse pyproject.toml: {exc}")
+    groups = data.get("dependency-groups", {})
+    raw = groups.get(group, []) if isinstance(groups, dict) else []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            spec = item.strip()
+            if not spec:
+                continue
+            norm = normalize_name(spec)
+            if norm:
+                existing.add(norm)
 
-    return 0
+matched: list[str] = []
+seen: set[str] = set()
+for item in items:
+    norm = normalize_name(item)
+    if not norm or norm in seen:
+        continue
+    seen.add(norm)
+    if norm in existing:
+        matched.append(norm)
+
+out_file.write_text("\n".join(matched) + ("\n" if matched else ""), encoding="utf-8")
+PY
 }
 
 rewrite_dependency_group() {
@@ -2000,10 +2056,11 @@ out_file = pathlib.Path(sys.argv[3])
 
 deps = []
 if pyproject.exists():
+    text = pyproject.read_text(encoding="utf-8")
     try:
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except Exception:
-        data = {}
+        data = tomllib.loads(text)
+    except Exception as exc:
+        raise SystemExit(f"ERROR: failed to parse pyproject.toml: {exc}")
     groups = data.get("dependency-groups", {})
     raw = groups.get(group, []) if isinstance(groups, dict) else []
     if isinstance(raw, list):
@@ -4753,6 +4810,8 @@ cmd_pin_add() {
     require_python
 
     local -a specs=()
+    local -a deduped_specs=()
+    local -a present_target_names=()
     local spec dep_name
 
     while [ $# -gt 0 ]; do
@@ -4781,15 +4840,29 @@ cmd_pin_add() {
         fi
     done
 
-    warn_for_unrecommended_pin_specs "${specs[@]}"
+    local deduped_specs_file
+    deduped_specs_file="$(mktemp)"
+    write_pin_specs_last_wins "$deduped_specs_file" "${specs[@]}"
+    mapfile -t deduped_specs < "$deduped_specs_file"
+    rm -f "$deduped_specs_file"
 
-    local workdir py op_id
+    warn_for_unrecommended_pin_specs "${deduped_specs[@]}"
+
+    local workdir py op_id present_names_file
     workdir="$(build_workdir_for_tx "pin-add-$(_random_hex8)")"
     py="$(configured_python)"
+    present_names_file="$(mktemp)"
+
+    write_group_names_matching_specs "$workdir/pyproject.toml" "overrides" "$present_names_file" "${deduped_specs[@]}"
+    mapfile -t present_target_names < "$present_names_file"
+    rm -f "$present_names_file"
 
     if ! (
         cd "$workdir"
-        uv add --group overrides --python "$py" --frozen "${specs[@]}"
+        if [ "${#present_target_names[@]}" -ne 0 ]; then
+            uv remove --group overrides --python "$py" --frozen "${present_target_names[@]}"
+        fi
+        uv add --group overrides --python "$py" --frozen "${deduped_specs[@]}"
     ); then
         echo "ERROR: pin add failed while updating overrides" >&2
         exit 1
@@ -4799,12 +4872,12 @@ cmd_pin_add() {
         exit 1
     fi
 
-    op_id="$(apply_staged_pin_change "$workdir" "pin_add" "${specs[*]}" "pin add succeeded: ${specs[*]}" "pin add")" || {
+    op_id="$(apply_staged_pin_change "$workdir" "pin_add" "${deduped_specs[*]}" "pin add succeeded: ${deduped_specs[*]}" "pin add")" || {
         exit 1
     }
 
     echo "Pins added."
-    echo "  specs: ${specs[*]}"
+    echo "  specs: ${deduped_specs[*]}"
     echo "  op_id: $op_id"
 }
 
@@ -4857,10 +4930,6 @@ cmd_pin_remove() {
     local workdir py op_id
     workdir="$(build_workdir_for_tx "pin-remove-$(_random_hex8)")"
     py="$(configured_python)"
-
-    if ! require_group_names_present "$PROJECT_FILE" "overrides" "${normalized_packages[@]}"; then
-        exit 1
-    fi
 
     if ! (
         cd "$workdir"

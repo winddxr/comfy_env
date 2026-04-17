@@ -118,8 +118,9 @@ text = path.read_text(encoding="utf-8")
 
 try:
     data = tomllib.loads(text)
-except Exception:
-    data = {}
+except Exception as exc:
+    print(f"ERROR: failed to parse pyproject.toml: {exc}", file=sys.stderr)
+    raise SystemExit(1)
 
 groups = data.get("dependency-groups", {})
 if not isinstance(groups, dict):
@@ -161,6 +162,14 @@ if action == "add":
             requested_order.append(norm)
         requested_specs[norm] = item
 
+    for norm in requested_order:
+        matches = [entry for entry in entries if entry_name(entry) == norm]
+        if len(matches) > 1:
+            print(f"error: Cannot perform ambiguous update; found multiple entries for `{norm}`:", file=sys.stderr)
+            for entry in matches:
+                print(f"- `{entry}`", file=sys.stderr)
+            raise SystemExit(2)
+
     for entry in entries:
         norm = entry_name(entry)
         if norm in requested_specs:
@@ -177,7 +186,20 @@ if action == "add":
 
     groups[group] = out
 elif action == "remove":
-    wanted = {normalize_name(x) for x in items}
+    wanted_order = []
+    wanted = set()
+    for item in items:
+        norm = normalize_name(item)
+        if not norm or norm in wanted:
+            continue
+        wanted_order.append(norm)
+        wanted.add(norm)
+
+    missing = [norm for norm in wanted_order if not any(entry_name(item) == norm for item in entries)]
+    if missing:
+        print(f"error: The dependency `{missing[0]}` could not be found in `dependency-groups.{group}`", file=sys.stderr)
+        raise SystemExit(2)
+
     groups[group] = [item for item in entries if entry_name(item) not in wanted]
 else:
     raise SystemExit(f"unsupported action: {action}")
@@ -585,6 +607,50 @@ assert_contains "$WORK_DIR/pyproject.toml" "sys_platform == 'linux' and platform
 assert_contains "$WORK_DIR/uv.lock" "requires-python = \"==3.12.*\""
 assert_contains "$WORK_DIR/uv.lock" "sys_platform == 'linux' and platform_machine == 'x86_64'"
 
+BROKEN_LIST_DIR="$TMP_ROOT/broken-list-work"
+cp -a "$WORK_DIR/." "$BROKEN_LIST_DIR/"
+cat >"$BROKEN_LIST_DIR/pyproject.toml" <<'EOF'
+[project]
+name = "demo"
+version = "0.1.0"
+
+[dependency-groups]
+overrides = [
+    "numpy==1.26.4",
+# invalid TOML on purpose
+EOF
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$BROKEN_LIST_DIR/bin/gov" pin list >"$TMP_ROOT/broken-pin-list.out" 2>"$TMP_ROOT/broken-pin-list.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected pin list with invalid pyproject.toml to fail" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/broken-pin-list.err" "failed to parse pyproject.toml"
+
+BROKEN_REMOVE_DIR="$TMP_ROOT/broken-remove-work"
+cp -a "$WORK_DIR/." "$BROKEN_REMOVE_DIR/"
+cat >"$BROKEN_REMOVE_DIR/pyproject.toml" <<'EOF'
+[project]
+name = "demo"
+version = "0.1.0"
+
+[dependency-groups]
+overrides = [
+    "numpy==1.26.4",
+# invalid TOML on purpose
+EOF
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$BROKEN_REMOVE_DIR/bin/gov" pin remove numpy >"$TMP_ROOT/broken-pin-remove.out" 2>"$TMP_ROOT/broken-pin-remove.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected pin remove with invalid pyproject.toml to fail" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/broken-pin-remove.err" "failed to parse pyproject.toml"
+
 PRESERVE_DIR="$TMP_ROOT/preserve-work"
 cp -a "$WORK_DIR/." "$PRESERVE_DIR/"
 python3 - "$PRESERVE_DIR/pyproject.toml" <<'PY'
@@ -685,6 +751,111 @@ assert_occurrences "$SPECIAL_DIR/pyproject.toml" "https://example.com/pkg].whl" 
 assert_dependency_group_assignment_count "$SPECIAL_DIR/pyproject.toml" "overrides" "1"
 assert_toml_parses "$SPECIAL_DIR/pyproject.toml"
 
+DUPLICATE_ADD_DIR="$TMP_ROOT/duplicate-add-work"
+cp -a "$WORK_DIR/." "$DUPLICATE_ADD_DIR/"
+python3 - "$DUPLICATE_ADD_DIR/pyproject.toml" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacement = """[dependency-groups]
+core = []
+torch = []
+overrides = [
+    "numpy==1.26.3",
+    "numpy==1.26.4",
+    "pillow==10.0.0",
+]
+"""
+text, count = re.subn(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)", replacement, text)
+if count != 1:
+    raise SystemExit("failed to replace dependency-groups section in duplicate-add fixture")
+path.write_text(text, encoding="utf-8")
+PY
+PATH="$FAKE_BIN:$PATH" bash "$DUPLICATE_ADD_DIR/bin/gov" pin add numpy==1.26.5 >"$TMP_ROOT/duplicate-pin-add.out" 2>"$TMP_ROOT/duplicate-pin-add.err"
+assert_contains "$TMP_ROOT/duplicate-pin-add.out" "Pins added."
+assert_contains "$DUPLICATE_ADD_DIR/pyproject.toml" "\"numpy==1.26.5\""
+assert_not_contains "$DUPLICATE_ADD_DIR/pyproject.toml" "\"numpy==1.26.3\""
+assert_not_contains "$DUPLICATE_ADD_DIR/pyproject.toml" "\"numpy==1.26.4\""
+assert_occurrences "$DUPLICATE_ADD_DIR/pyproject.toml" "numpy==" "1"
+assert_contains "$DUPLICATE_ADD_DIR/pyproject.toml" "\"pillow==10.0.0\""
+
+LAST_WINS_DIR="$TMP_ROOT/last-wins-work"
+cp -a "$WORK_DIR/." "$LAST_WINS_DIR/"
+PATH="$FAKE_BIN:$PATH" bash "$LAST_WINS_DIR/bin/gov" pin add numpy==1.26.3 numpy==1.26.2 >"$TMP_ROOT/last-wins-pin-add.out" 2>"$TMP_ROOT/last-wins-pin-add.err"
+assert_contains "$TMP_ROOT/last-wins-pin-add.out" "Pins added."
+assert_contains "$LAST_WINS_DIR/pyproject.toml" "\"numpy==1.26.2\""
+assert_not_contains "$LAST_WINS_DIR/pyproject.toml" "\"numpy==1.26.3\""
+assert_occurrences "$LAST_WINS_DIR/pyproject.toml" "numpy==" "1"
+
+REMOVE_ATOMIC_DIR="$TMP_ROOT/remove-atomic-work"
+cp -a "$WORK_DIR/." "$REMOVE_ATOMIC_DIR/"
+python3 - "$REMOVE_ATOMIC_DIR/pyproject.toml" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacement = """[dependency-groups]
+core = []
+torch = []
+overrides = [
+    "numpy==1.26.4",
+    "pillow==10.0.0",
+]
+"""
+text, count = re.subn(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)", replacement, text)
+if count != 1:
+    raise SystemExit("failed to replace dependency-groups section in remove-atomic fixture")
+path.write_text(text, encoding="utf-8")
+PY
+remove_atomic_before="$(cat "$REMOVE_ATOMIC_DIR/pyproject.toml")"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$REMOVE_ATOMIC_DIR/bin/gov" pin remove numpy transformers >"$TMP_ROOT/remove-atomic.out" 2>"$TMP_ROOT/remove-atomic.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected pin remove with one missing package to fail atomically" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/remove-atomic.err" "could not be found"
+if [ "$remove_atomic_before" != "$(cat "$REMOVE_ATOMIC_DIR/pyproject.toml")" ]; then
+    echo "expected pyproject.toml to remain unchanged after atomic pin remove failure" >&2
+    exit 1
+fi
+
+REMOVE_DUPLICATE_DIR="$TMP_ROOT/remove-duplicate-work"
+cp -a "$WORK_DIR/." "$REMOVE_DUPLICATE_DIR/"
+python3 - "$REMOVE_DUPLICATE_DIR/pyproject.toml" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacement = """[dependency-groups]
+core = []
+torch = []
+overrides = [
+    "numpy==1.26.3",
+    "numpy==1.26.4",
+    "pillow==10.0.0",
+]
+"""
+text, count = re.subn(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)", replacement, text)
+if count != 1:
+    raise SystemExit("failed to replace dependency-groups section in remove-duplicate fixture")
+path.write_text(text, encoding="utf-8")
+PY
+PATH="$FAKE_BIN:$PATH" bash "$REMOVE_DUPLICATE_DIR/bin/gov" pin remove numpy >"$TMP_ROOT/remove-duplicate.out" 2>"$TMP_ROOT/remove-duplicate.err"
+assert_contains "$TMP_ROOT/remove-duplicate.out" "Pins removed."
+assert_not_contains "$REMOVE_DUPLICATE_DIR/pyproject.toml" "\"numpy==1.26.3\""
+assert_not_contains "$REMOVE_DUPLICATE_DIR/pyproject.toml" "\"numpy==1.26.4\""
+assert_contains "$REMOVE_DUPLICATE_DIR/pyproject.toml" "\"pillow==10.0.0\""
+
 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin list >"$TMP_ROOT/pin-list-empty.out"
 assert_contains "$TMP_ROOT/pin-list-empty.out" "No pins in overrides group."
 
@@ -730,7 +901,7 @@ if [ "$rc" -eq 0 ]; then
     echo "expected pin remove of missing package to fail" >&2
     exit 1
 fi
-assert_contains "$TMP_ROOT/pin-remove-missing.err" "pin not found"
+assert_contains "$TMP_ROOT/pin-remove-missing.err" "could not be found"
 
 set +e
 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin remove torchaudio >"$TMP_ROOT/pin-remove-torchaudio.out" 2>"$TMP_ROOT/pin-remove-torchaudio.err"

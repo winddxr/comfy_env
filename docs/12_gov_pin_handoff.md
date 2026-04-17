@@ -21,7 +21,7 @@
 当前会写入 `dependency-groups.overrides` 的路径有三类：
 
 1. `gov pin add` / `gov pin remove`
-   - 在 staged workdir 中调用 `uv add/remove --group overrides --python "$py" --frozen` 修改 `pyproject.toml`。
+   - 在 staged workdir 中调用 `uv` 修改 `pyproject.toml`；`pin add` 先 remove 当前目标包名再 add 目标 exact specs，`pin remove` 直接调用 `uv remove`。
    - 修改成功后再显式执行 `lock_project_exact`。
    - lock 成功后才会晋升到 root truth，并继续 prod sync + smoke test。
 2. `gov resolve <txid>`
@@ -35,9 +35,9 @@
 
 - 只接受精确版本 spec，不支持范围约束。
 - 不接受 `torch`、`torchvision`、`torchaudio`；torch-family 由 `gov install torch` 单独治理。
-- 对同名包执行 upsert：重复 pin 同一包时，最新 spec 覆盖旧 spec，不会累积重复条目。
+- 对同名包执行 upsert：同一命令内按规范化包名 last-wins 去重；已有 override 会先按包名移除，再写回目标 exact spec。
 - 对非推荐关键包输出 warning；当前推荐集合为 `numpy`、`transformers`。
-- group 变更阶段由 `uv add --group overrides --python "$py" --frozen` 完成。
+- group 变更阶段先对当前已存在的目标包执行 `uv remove --group overrides --python "$py" --frozen`，再执行 `uv add --group overrides --python "$py" --frozen`。
 - 后续仍保留 `gov` 自己的显式 `lock -> copy truth -> prod sync -> smoke test -> op record` 流程。
 
 ### 3.2 `gov pin list`
@@ -45,14 +45,14 @@
 - 逐行读取当前 root `pyproject.toml` 中的 `dependency-groups.overrides`。
 - 输出的是声明态 pin，不是环境实际安装版本。
 - 若 `pyproject.toml` 尚未初始化或该组为空，输出 `No pins in overrides group.`。
+- 若 `pyproject.toml` 存在但 TOML 非法，会直接返回 parse error。
 
 ### 3.3 `gov pin remove <pkg>...`
 
 - 只接受包名，不接受带版本的 spec。
 - 匹配按规范化包名进行，大小写以及 `-` / `_` / `.` 差异会被折叠。
-- 在进入 staged mutation 前，会先对当前 root truth 做只读 precheck。
-- 若任一目标包当前未被 pin，则直接失败，并保持现有报错语义：`ERROR: pin not found for package(s): ...`。
-- precheck 通过后，再在 staged workdir 中调用 `uv remove --group overrides --python "$py" --frozen`。
+- 在 staged workdir 中直接调用 `uv remove --group overrides --python "$py" --frozen`。
+- 缺包报错、解析失败和原子失败语义都由 `uv` 原生负责。
 
 ## 4. 事务与回滚语义
 
@@ -81,7 +81,9 @@
 - `cmd_pin_add`
 - `cmd_pin_list`
 - `cmd_pin_remove`
-- `require_group_names_present`
+- `write_group_deps`
+- `write_pin_specs_last_wins`
+- `write_group_names_matching_specs`
 - staged apply 与回滚：`apply_staged_pin_change`
 - 事务 resolution 仍使用的共享 pin helper：`append_pins_to_overrides_group`
 

@@ -61,7 +61,7 @@ It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns
   - Failure: sync or smoke failure restores pre-op truth.
 - `core#KF-004` Manage global override pins
   - Trigger: `cmd_pin_add`, `cmd_pin_list`, `cmd_pin_remove`.
-  - Success: `pin list` reads `dependency-groups.overrides`; `pin add/remove` stage `uv add/remove --group overrides --frozen` in a workdir, then lock, copy truth to root, sync prod, smoke test, and record an undoable op.
+  - Success: `pin list` strictly reads `dependency-groups.overrides`; `pin add` stages `uv remove` for matching current package names followed by `uv add --group overrides --frozen`, while `pin remove` stages `uv remove --group overrides --frozen`; both then lock, copy truth to root, sync prod, smoke test, and record an undoable op.
   - Failure: invalid pin grammar, torch-family package rejection, removing a non-pinned package, lock failure, sync failure, or smoke failure exits explicitly; sync and smoke failures restore pre-op truth and resync prod back to that restored state.
 - `core#KF-005` Register or remove plugin node
   - Trigger: `cmd_node_add`, `cmd_node_remove`.
