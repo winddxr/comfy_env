@@ -59,7 +59,8 @@
 1. `pin add` 只接受精确版本，不支持范围约束。
 2. `pin` 不接受 `torch`、`torchvision`、`torchaudio`；torch-family 的版本与 source/index 由 `install torch` 单独治理。
 3. `pin` 写入的是共享的 `dependency-groups.overrides`，会影响后续 lock、prod sync，以及事务 resolve 的共同求解结果。
-4. 成功标准是 `lock + prod sync + smoke test`；失败会回滚 root truth，并把 prod 环境同步回恢复后的状态。
+4. `pin add/remove` 的 group 变更委托给 `uv add/remove --group overrides --frozen` 在 staged workdir 中完成；CLI 自己保留显式 lock、prod sync、smoke test 与回滚。
+5. 成功标准是 `lock + prod sync + smoke test`；失败会回滚 root truth，并把 prod 环境同步回恢复后的状态。
 
 ### 4.4 插件治理（保持原有路径）
 

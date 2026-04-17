@@ -681,6 +681,41 @@ warn_for_unrecommended_pin_specs() {
     done
 }
 
+require_group_names_present() {
+    local pyproject_file="$1"
+    local group_name="$2"
+    shift 2
+
+    local current_file dep pkg dep_name found
+    local -a missing=()
+    current_file="$(mktemp)"
+    write_group_deps "$pyproject_file" "$group_name" "$current_file"
+
+    for pkg in "$@"; do
+        found=false
+        while IFS= read -r dep; do
+            [ -z "$dep" ] && continue
+            dep_name="$(normalize_dep_name "$dep")"
+            if [ "$dep_name" = "$pkg" ]; then
+                found=true
+                break
+            fi
+        done < "$current_file"
+        if [ "$found" != true ]; then
+            missing+=("$pkg")
+        fi
+    done
+
+    rm -f "$current_file"
+
+    if [ "${#missing[@]}" -ne 0 ]; then
+        echo "ERROR: pin not found for package(s): ${missing[*]}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
 rewrite_dependency_group() {
     local pyproject_file="$1"
     local group="$2"
@@ -720,13 +755,20 @@ if not isinstance(groups, dict):
 entries = groups.get(group, [])
 if not isinstance(entries, list):
     entries = []
-entries = [str(x).strip() for x in entries if str(x).strip()]
 
 def normalize_name(spec: str) -> str:
     token = re.split(r"[<>=!~;\[]", spec.strip(), maxsplit=1)[0].strip()
     if "@" in token:
         token = token.split("@", 1)[0].strip()
     return re.sub(r"[-_.]+", "-", token).lower().strip("-")
+
+def entry_name(entry) -> str:
+    if not isinstance(entry, str):
+        return ""
+    spec = entry.strip()
+    if not spec:
+        return ""
+    return normalize_name(spec)
 
 def dedupe_exact_specs(values: list[str]) -> list[str]:
     ordered: list[str] = []
@@ -754,7 +796,7 @@ if mode == "upsert_exact":
         requested_specs[norm] = item
 
     for entry in entries:
-        norm = normalize_name(entry)
+        norm = entry_name(entry)
         if norm in requested_specs:
             if norm not in emitted:
                 out.append(requested_specs[norm])
@@ -783,7 +825,7 @@ elif mode == "remove_names":
         remove_set.add(norm)
 
     for entry in entries:
-        norm = normalize_name(entry)
+        norm = entry_name(entry)
         if norm in remove_set:
             found.add(norm)
             continue
@@ -800,38 +842,112 @@ elif mode == "replace_exact":
 else:
     raise SystemExit(f"ERROR: unsupported dependency-group rewrite mode: {mode}")
 
-section_re = re.compile(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)")
-match = section_re.search(text)
-ordered_keys = []
-if match:
-    for raw_line in match.group(0).splitlines()[1:]:
-        key_match = re.match(r"^([A-Za-z0-9_.-]+)\s*=", raw_line.strip())
-        if key_match and key_match.group(1) not in ordered_keys:
-            ordered_keys.append(key_match.group(1))
-for key in groups.keys():
-    if key not in ordered_keys:
-        ordered_keys.append(key)
+def render_toml_key(value: str) -> str:
+    if re.match(r"^[A-Za-z0-9_-]+$", value):
+        return value
+    return json.dumps(value)
 
-def render_list(values):
-    if not values:
-        return "[]"
-    rendered = ",\n".join(f"    {json.dumps(str(value))}" for value in values)
-    return "[\n" + rendered + ",\n]"
+def render_toml_literal_key(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
-section_lines = ["[dependency-groups]"]
-for key in ordered_keys:
-    values = groups.get(key, [])
+def serialized_toml_keys(value: str) -> list[str]:
+    candidates = []
+    if re.match(r"^[A-Za-z0-9_-]+$", value):
+        candidates.append(value)
+    candidates.append(json.dumps(value))
+    candidates.append(render_toml_literal_key(value))
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+def render_toml_value(value):
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(render_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        parts = [f"{render_toml_key(str(key))} = {render_toml_value(item)}" for key, item in value.items()]
+        return "{ " + ", ".join(parts) + " }"
+    raise SystemExit(f"ERROR: unsupported dependency-group item type: {type(value).__name__}")
+
+def render_group_assignment(rendered_key: str, values) -> str:
     if not isinstance(values, list):
         values = []
-    section_lines.append(f"{key} = {render_list(values)}")
-new_section = "\n".join(section_lines) + "\n"
+    if not values:
+        return f"{rendered_key} = []\n"
+    rendered = ",\n".join(f"    {render_toml_value(value)}" for value in values)
+    return f"{rendered_key} = [\n{rendered},\n]\n"
 
+def bracket_balance(text: str) -> int:
+    balance = 0
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "[":
+            balance += 1
+        elif ch == "]":
+            balance -= 1
+    return balance
+
+def replace_group_assignment(section_text: str, group_name: str, values) -> str:
+    lines = section_text.splitlines(keepends=True)
+    key_choices = serialized_toml_keys(group_name)
+    key_re = re.compile(rf"^({'|'.join(re.escape(key) for key in key_choices)})\s*=")
+
+    for idx in range(1, len(lines)):
+        match = key_re.match(lines[idx].strip())
+        if not match:
+            continue
+        assignment = render_group_assignment(match.group(1), values)
+        balance = 0
+        found_array = False
+        end = idx
+        while end < len(lines):
+            chunk = lines[end]
+            if "=" in chunk or found_array:
+                rhs = chunk.split("=", 1)[1] if not found_array and "=" in chunk else chunk
+                if "[" in rhs or found_array:
+                    found_array = True
+                    balance += bracket_balance(rhs)
+                    if balance <= 0:
+                        break
+            end += 1
+        return "".join(lines[:idx]) + assignment + "".join(lines[end + 1:])
+
+    if not section_text.endswith("\n"):
+        section_text += "\n"
+    return section_text + render_group_assignment(render_toml_key(group_name), values)
+
+section_re = re.compile(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)")
+match = section_re.search(text)
 if match:
+    new_section = replace_group_assignment(match.group(0), group, groups.get(group, []))
     text = text[:match.start()] + new_section + text[match.end():]
 else:
     if text and not text.endswith("\n"):
         text += "\n"
-    text += "\n" + new_section
+    text += "\n[dependency-groups]\n" + render_group_assignment(render_toml_key(group), groups.get(group, []))
 
 path.write_text(text, encoding="utf-8")
 PY
@@ -4609,7 +4725,6 @@ apply_staged_pin_change() {
 
 cmd_pin_list() {
     ensure_layout
-    ensure_project_file_for_init
     require_python
 
     if [ $# -ne 0 ]; then
@@ -4672,7 +4787,10 @@ cmd_pin_add() {
     workdir="$(build_workdir_for_tx "pin-add-$(_random_hex8)")"
     py="$(configured_python)"
 
-    if ! rewrite_dependency_group "$workdir/pyproject.toml" "overrides" "upsert_exact" "${specs[@]}"; then
+    if ! (
+        cd "$workdir"
+        uv add --group overrides --python "$py" --frozen "${specs[@]}"
+    ); then
         echo "ERROR: pin add failed while updating overrides" >&2
         exit 1
     fi
@@ -4697,7 +4815,8 @@ cmd_pin_remove() {
     require_python
 
     local -a packages=()
-    local pkg dep_name
+    local -a normalized_packages=()
+    local pkg dep_name existing seen
 
     while [ $# -gt 0 ]; do
         packages+=("$1")
@@ -4723,13 +4842,30 @@ cmd_pin_remove() {
             echo "ERROR: torch-family packages are managed by 'gov install torch'. Use 'gov install torch --index-url <url> [--torch <torch==version>] [--torchvision <torchvision==version>] [--torchaudio <torchaudio==version>]' instead." >&2
             exit 1
         fi
+        seen=false
+        for existing in "${normalized_packages[@]}"; do
+            if [ "$existing" = "$dep_name" ]; then
+                seen=true
+                break
+            fi
+        done
+        if [ "$seen" != true ]; then
+            normalized_packages+=("$dep_name")
+        fi
     done
 
     local workdir py op_id
     workdir="$(build_workdir_for_tx "pin-remove-$(_random_hex8)")"
     py="$(configured_python)"
 
-    if ! rewrite_dependency_group "$workdir/pyproject.toml" "overrides" "remove_names" "${packages[@]}"; then
+    if ! require_group_names_present "$PROJECT_FILE" "overrides" "${normalized_packages[@]}"; then
+        exit 1
+    fi
+
+    if ! (
+        cd "$workdir"
+        uv remove --group overrides --python "$py" --frozen "${normalized_packages[@]}"
+    ); then
         exit 1
     fi
 

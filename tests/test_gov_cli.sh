@@ -127,7 +127,7 @@ if not isinstance(groups, dict):
 
 action = sys.argv[1]
 group = sys.argv[2]
-items = [x for x in sys.argv[3:] if str(x).strip()]
+items = [str(x).strip() for x in sys.argv[3:] if str(x).strip()]
 
 def normalize_name(spec: str) -> str:
     token = re.split(r"[<>=!~;\[]", str(spec).strip(), maxsplit=1)[0].strip()
@@ -135,45 +135,112 @@ def normalize_name(spec: str) -> str:
         token = token.split("@", 1)[0].strip()
     return re.sub(r"[-_.]+", "-", token).lower().strip("-")
 
+def entry_name(entry) -> str:
+    if not isinstance(entry, str):
+        return ""
+    spec = entry.strip()
+    if not spec:
+        return ""
+    return normalize_name(spec)
+
 entries = groups.get(group, [])
 if not isinstance(entries, list):
     entries = []
-entries = [str(x) for x in entries]
 
 if action == "add":
-    entries.extend(items)
+    requested_order = []
+    requested_specs = {}
+    emitted = set()
+    out = []
+
+    for item in items:
+        norm = normalize_name(item)
+        if not norm:
+            continue
+        if norm not in requested_specs:
+            requested_order.append(norm)
+        requested_specs[norm] = item
+
+    for entry in entries:
+        norm = entry_name(entry)
+        if norm in requested_specs:
+            if norm not in emitted:
+                out.append(requested_specs[norm])
+                emitted.add(norm)
+            continue
+        out.append(entry)
+
+    for norm in requested_order:
+        if norm not in emitted:
+            out.append(requested_specs[norm])
+            emitted.add(norm)
+
+    groups[group] = out
 elif action == "remove":
     wanted = {normalize_name(x) for x in items}
-    entries = [item for item in entries if normalize_name(item) not in wanted]
+    groups[group] = [item for item in entries if entry_name(item) not in wanted]
 else:
     raise SystemExit(f"unsupported action: {action}")
 
-groups[group] = entries
+def render_toml_key(value: str) -> str:
+    if re.match(r"^[A-Za-z0-9_-]+$", value):
+        return value
+    return json.dumps(value)
+
+def render_toml_value(value):
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(render_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        parts = [f"{render_toml_key(str(key))} = {render_toml_value(item)}" for key, item in value.items()]
+        return "{ " + ", ".join(parts) + " }"
+    raise SystemExit(f"unsupported dependency-group item type: {type(value).__name__}")
+
+def render_group_assignment(rendered_key: str, values) -> str:
+    if not isinstance(values, list):
+        values = []
+    if not values:
+        return f"{rendered_key} = []"
+    rendered = ",\n".join(f"    {render_toml_value(value)}" for value in values)
+    return f"{rendered_key} = [\n{rendered},\n]"
+
+def parse_key_token(token: str) -> str:
+    if token.startswith('"'):
+        return json.loads(token)
+    if token.startswith("'"):
+        return token[1:-1].replace("''", "'")
+    return token
 
 section_re = re.compile(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)")
 match = section_re.search(text)
 ordered_keys = []
+rendered_keys = {}
 if match:
     for raw_line in match.group(0).splitlines()[1:]:
-        m = re.match(r"^([A-Za-z0-9_.-]+)\s*=", raw_line.strip())
-        if m and m.group(1) not in ordered_keys:
-            ordered_keys.append(m.group(1))
+        m = re.match(r"^\s*([A-Za-z0-9_.-]+|\"(?:[^\"\\]|\\.)*\"|'(?:[^']|'')*')\s*=", raw_line)
+        if not m:
+            continue
+        key = parse_key_token(m.group(1))
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+            rendered_keys[key] = m.group(1)
 for key in groups.keys():
     if key not in ordered_keys:
         ordered_keys.append(key)
-
-def render_list(values):
-    if not values:
-        return "[]"
-    rendered = ",\n".join(f"    {json.dumps(str(value))}" for value in values)
-    return "[\n" + rendered + ",\n]"
 
 section_lines = ["[dependency-groups]"]
 for key in ordered_keys:
     values = groups.get(key, [])
     if not isinstance(values, list):
         values = []
-    section_lines.append(f"{key} = {render_list(values)}")
+    section_lines.append(render_group_assignment(rendered_keys.get(key, render_toml_key(str(key))), values))
 new_section = "\n".join(section_lines) + "\n"
 
 if match:
@@ -282,7 +349,7 @@ PYEOF
                 --python|--index)
                     shift 2
                     ;;
-                --no-sync)
+                --frozen|--no-sync)
                     shift
                     ;;
                 *)
@@ -424,6 +491,47 @@ assert_occurrences() {
     fi
 }
 
+assert_dependency_group_assignment_count() {
+    local file="$1"
+    local group="$2"
+    local expected="$3"
+    python3 - "$file" "$group" "$expected" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+group = sys.argv[2]
+expected = int(sys.argv[3])
+text = path.read_text(encoding="utf-8")
+match = re.search(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)", text)
+if not match:
+    actual = 0
+else:
+    quoted = re.escape(group)
+    pattern = rf"(?m)^\s*(?:{quoted}|\"{quoted}\"|'{quoted}')\s*="
+    actual = len(re.findall(pattern, match.group(0)))
+if actual != expected:
+    raise SystemExit(f"assertion failed: expected dependency group '{group}' to appear {expected} time(s) in {path}, got {actual}")
+PY
+}
+
+assert_toml_parses() {
+    local file="$1"
+    python3 - "$file" <<'PY'
+import pathlib
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+path = pathlib.Path(sys.argv[1])
+tomllib.loads(path.read_text(encoding="utf-8"))
+PY
+}
+
 assert_file_exists() {
     local path="$1"
     if [ ! -e "$path" ]; then
@@ -451,6 +559,11 @@ assert_contains "$help_out" "gov env export <output_dir>"
 assert_contains "$help_out" "gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>"
 assert_not_contains "$help_out" "[--force]"
 
+assert_not_exists "$WORK_DIR/pyproject.toml"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin list >"$TMP_ROOT/pin-list-pre-init.out"
+assert_contains "$TMP_ROOT/pin-list-pre-init.out" "No pins in overrides group."
+assert_not_exists "$WORK_DIR/pyproject.toml"
+
 set +e
 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" init >"$TMP_ROOT/init-no-args.out" 2>"$TMP_ROOT/init-no-args.err"
 rc=$?
@@ -471,6 +584,106 @@ assert_contains "$WORK_DIR/pyproject.toml" "[tool.uv]"
 assert_contains "$WORK_DIR/pyproject.toml" "sys_platform == 'linux' and platform_machine == 'x86_64'"
 assert_contains "$WORK_DIR/uv.lock" "requires-python = \"==3.12.*\""
 assert_contains "$WORK_DIR/uv.lock" "sys_platform == 'linux' and platform_machine == 'x86_64'"
+
+PRESERVE_DIR="$TMP_ROOT/preserve-work"
+cp -a "$WORK_DIR/." "$PRESERVE_DIR/"
+python3 - "$PRESERVE_DIR/pyproject.toml" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacement = """[dependency-groups]
+core = [
+    "numpy>=1.25.0",
+]
+dev = [
+    { include-group = "core" },
+    "pytest>=8",
+]
+torch = []
+overrides = []
+"""
+text, count = re.subn(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)", replacement, text)
+if count != 1:
+    raise SystemExit("failed to replace dependency-groups section in preserve fixture")
+path.write_text(text, encoding="utf-8")
+PY
+PATH="$FAKE_BIN:$PATH" bash "$PRESERVE_DIR/bin/gov" pin add transformers==4.44.0 >"$TMP_ROOT/preserve-pin-add.out" 2>"$TMP_ROOT/preserve-pin-add.err"
+assert_contains "$TMP_ROOT/preserve-pin-add.out" "Pins added."
+assert_contains "$PRESERVE_DIR/pyproject.toml" "{ include-group = \"core\" }"
+assert_contains "$PRESERVE_DIR/pyproject.toml" "\"pytest>=8\""
+assert_contains "$PRESERVE_DIR/pyproject.toml" "\"transformers==4.44.0\""
+assert_not_contains "$PRESERVE_DIR/pyproject.toml" "\"{'include-group': 'core'}\""
+
+QUOTED_DIR="$TMP_ROOT/quoted-work"
+cp -a "$WORK_DIR/." "$QUOTED_DIR/"
+python3 - "$QUOTED_DIR/pyproject.toml" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacement = """[dependency-groups]
+core = []
+torch = []
+"overrides" = []
+"""
+text, count = re.subn(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)", replacement, text)
+if count != 1:
+    raise SystemExit("failed to replace dependency-groups section in quoted fixture")
+path.write_text(text, encoding="utf-8")
+PY
+PATH="$FAKE_BIN:$PATH" bash "$QUOTED_DIR/bin/gov" pin add transformers==4.44.0 >"$TMP_ROOT/quoted-pin-add.out" 2>"$TMP_ROOT/quoted-pin-add.err"
+assert_contains "$TMP_ROOT/quoted-pin-add.out" "Pins added."
+assert_contains "$QUOTED_DIR/pyproject.toml" "\"overrides\" = ["
+assert_contains "$QUOTED_DIR/pyproject.toml" "\"transformers==4.44.0\""
+assert_dependency_group_assignment_count "$QUOTED_DIR/pyproject.toml" "overrides" "1"
+
+PATH="$FAKE_BIN:$PATH" bash "$QUOTED_DIR/bin/gov" pin remove transformers >"$TMP_ROOT/quoted-pin-remove.out" 2>"$TMP_ROOT/quoted-pin-remove.err"
+assert_contains "$TMP_ROOT/quoted-pin-remove.out" "Pins removed."
+assert_contains "$QUOTED_DIR/pyproject.toml" "\"overrides\" = []"
+assert_not_contains "$QUOTED_DIR/pyproject.toml" "\"transformers==4.44.0\""
+assert_dependency_group_assignment_count "$QUOTED_DIR/pyproject.toml" "overrides" "1"
+
+SPECIAL_DIR="$TMP_ROOT/special-work"
+cp -a "$WORK_DIR/." "$SPECIAL_DIR/"
+python3 - "$SPECIAL_DIR/pyproject.toml" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+replacement = """[dependency-groups]
+core = []
+torch = []
+"overrides" = [
+    'demo @ https://example.com/pkg].whl',
+]
+"""
+text, count = re.subn(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)", replacement, text)
+if count != 1:
+    raise SystemExit("failed to replace dependency-groups section in special fixture")
+path.write_text(text, encoding="utf-8")
+PY
+PATH="$FAKE_BIN:$PATH" bash "$SPECIAL_DIR/bin/gov" pin add transformers==4.44.0 >"$TMP_ROOT/special-pin-add.out" 2>"$TMP_ROOT/special-pin-add.err"
+assert_contains "$TMP_ROOT/special-pin-add.out" "Pins added."
+assert_contains "$SPECIAL_DIR/pyproject.toml" "\"overrides\" = ["
+assert_contains "$SPECIAL_DIR/pyproject.toml" "\"transformers==4.44.0\""
+assert_occurrences "$SPECIAL_DIR/pyproject.toml" "https://example.com/pkg].whl" "1"
+assert_dependency_group_assignment_count "$SPECIAL_DIR/pyproject.toml" "overrides" "1"
+assert_toml_parses "$SPECIAL_DIR/pyproject.toml"
+
+PATH="$FAKE_BIN:$PATH" bash "$SPECIAL_DIR/bin/gov" pin remove transformers >"$TMP_ROOT/special-pin-remove.out" 2>"$TMP_ROOT/special-pin-remove.err"
+assert_contains "$TMP_ROOT/special-pin-remove.out" "Pins removed."
+assert_contains "$SPECIAL_DIR/pyproject.toml" "\"overrides\" = ["
+assert_not_contains "$SPECIAL_DIR/pyproject.toml" "\"transformers==4.44.0\""
+assert_occurrences "$SPECIAL_DIR/pyproject.toml" "https://example.com/pkg].whl" "1"
+assert_dependency_group_assignment_count "$SPECIAL_DIR/pyproject.toml" "overrides" "1"
+assert_toml_parses "$SPECIAL_DIR/pyproject.toml"
 
 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin list >"$TMP_ROOT/pin-list-empty.out"
 assert_contains "$TMP_ROOT/pin-list-empty.out" "No pins in overrides group."

@@ -1,216 +1,103 @@
-# 12 Gov Pin Handoff
+# 12 Gov Pin Notes
 
 ## 1. 目标
 
-为 `comfy_env` 增加独立的版本锁定管理能力，允许用户主动声明关键包的版本约束，而不必等到冲突解决流程才能写入 pin。
+`gov pin` 提供独立于事务冲突解决流程的全局精确版本 pin 管理能力。它允许用户直接维护共享的 `dependency-groups.overrides`，从而影响：
 
-面向以下场景：
+1. 后续 `uv lock` 的求解结果。
+2. prod 环境的 exact sync 结果。
+3. `gov resolve` / `gov update resolve` 与手动 pin 的共同求解面。
 
-1. 锁定基础设施包版本（torch、numpy、transformers 等），防止后续插件安装或 `uv lock` 重新求解时意外升降级。
-2. 在 `gov init` 降级 Python 后，主动 pin 住已知兼容的关键包版本。
-3. 审查当前哪些 pin 生效，以及按需移除不再需要的 pin。
+## 2. 当前实现概览
 
-## 2. 现状分析
+### 2.1 底层权威
 
-### 2.1 已有的 overrides 机制
+- `pyproject.toml` 中的 `dependency-groups.overrides` 是 pin 的声明态 source of truth。
+- `uv.lock` 和 `.venv-prod` 都由该真相经过显式 lock + sync 推导而来。
+- `pin` 不引入来源归属模型；手动 pin 与事务 resolution pin 共享同一个 `overrides` group。
 
-当前 `overrides` dependency group 已经是 pin 的底层载体：
+### 2.2 三条写入路径
 
-- `pyproject.toml` 模板预定义了 `[dependency-groups] overrides = []`。
-- `append_pins_to_overrides_group`（[bin/gov:782](../bin/gov#L782)）通过 `uv add --group overrides --python "$py" --no-sync` 逐条写入 pin。
-- `uv lock` 会尊重 `overrides` group 中的版本约束。
+当前会写入 `dependency-groups.overrides` 的路径有三类：
 
-### 2.2 当前 pin 只在冲突解决流程中使用
+1. `gov pin add` / `gov pin remove`
+   - 在 staged workdir 中调用 `uv add/remove --group overrides --python "$py" --frozen` 修改 `pyproject.toml`。
+   - 修改成功后再显式执行 `lock_project_exact`。
+   - lock 成功后才会晋升到 root truth，并继续 prod sync + smoke test。
+2. `gov resolve <txid>`
+   - 把 `resolution_pins` 合并进事务 staging truth，再 lock。
+3. `gov update resolve <txid>`
+   - 把参数化 pin 合并进核心升级事务的 staged workdir，再 lock。
 
-pin 的写入路径目前仅有两条：
+## 3. 命令行为
 
-1. **插件事务冲突解决**：`gov resolve <txid>`（[bin/gov:3174](../bin/gov#L3174)）— 交互式输入 `pkg==version`。
-2. **核心更新冲突解决**：`gov update resolve <txid>`（[bin/gov:3771](../bin/gov#L3771)）— 参数化 `--pin` / `--pins-file`。
+### 3.1 `gov pin add <pkg==version>...`
 
-两者都将 pin 写入事务记录的 `resolution_pins` 字段，并通过 `append_pins_to_overrides_group` 落盘到 `pyproject.toml`。
+- 只接受精确版本 spec，不支持范围约束。
+- 不接受 `torch`、`torchvision`、`torchaudio`；torch-family 由 `gov install torch` 单独治理。
+- 对同名包执行 upsert：重复 pin 同一包时，最新 spec 覆盖旧 spec，不会累积重复条目。
+- 对非推荐关键包输出 warning；当前推荐集合为 `numpy`、`transformers`。
+- group 变更阶段由 `uv add --group overrides --python "$py" --frozen` 完成。
+- 后续仍保留 `gov` 自己的显式 `lock -> copy truth -> prod sync -> smoke test -> op record` 流程。
 
-### 2.3 缺口
+### 3.2 `gov pin list`
 
-- 没有独立于事务的 pin 管理命令。
-- 没有列出当前生效 pin 的方式。
-- 没有移除单条 pin 的方式（只能手动编辑 `pyproject.toml`）。
-- `overrides` group 中的条目没有来源标注（事务 resolve pin 与手动 pin 混在一起）。
+- 逐行读取当前 root `pyproject.toml` 中的 `dependency-groups.overrides`。
+- 输出的是声明态 pin，不是环境实际安装版本。
+- 若 `pyproject.toml` 尚未初始化或该组为空，输出 `No pins in overrides group.`。
 
-## 3. 设计边界
+### 3.3 `gov pin remove <pkg>...`
 
-### 3.1 In Scope
+- 只接受包名，不接受带版本的 spec。
+- 匹配按规范化包名进行，大小写以及 `-` / `_` / `.` 差异会被折叠。
+- 在进入 staged mutation 前，会先对当前 root truth 做只读 precheck。
+- 若任一目标包当前未被 pin，则直接失败，并保持现有报错语义：`ERROR: pin not found for package(s): ...`。
+- precheck 通过后，再在 staged workdir 中调用 `uv remove --group overrides --python "$py" --frozen`。
 
-1. `gov pin add <pkg==version> [<pkg==version> ...]` — 添加 pin 到 `overrides` group 并重新 lock + sync。
-2. `gov pin list` — 列出当前 `overrides` group 中的所有 pin。
-3. `gov pin remove <pkg> [<pkg> ...]` — 从 `overrides` group 中移除指定包的 pin 并重新 lock + sync。
+## 4. 事务与回滚语义
 
-### 3.2 Out Of Scope
+- `gov pin add/remove` 都走 staged workdir，不直接改 root truth。
+- 只有 staged `pyproject.toml` 和 `uv.lock` 都准备好后，才会通过 `apply_staged_pin_change` 晋升到 root truth。
+- 若 prod sync 失败：
+  - 恢复备份的 `pyproject.toml` 和 `uv.lock`。
+  - 再次把 prod 环境同步回恢复后的 root truth。
+- 若 smoke test 失败：
+  - 同样恢复 root truth，并把 prod 环境回滚到恢复后的状态。
+- 成功路径会生成可撤销的 operation，保持与其他破坏性依赖变更一致。
 
-1. 不引入 pin 来源归属模型（不区分"手动 pin"与"resolve pin"）。
-2. 不引入 pin 锁定强度分级（如 soft pin / hard pin）。
-3. 不自动推荐 pin 版本（用户必须显式指定 `==version`）。
-4. 不在 `gov pin add` 中运行候选测试（pin 只影响 lock + sync，不走事务流）。
+## 5. 为什么委托给 uv
 
-## 4. 命令定义
+`dependency-groups` 是 TOML 结构，不适合继续通过“解析 TOML 语义后再手写文本替换”的方式局部修改。`gov pin` 当前把这部分委托给 `uv`，主要是为了获得：
 
-### 4.1 `gov pin add`
+1. 对 quoted key 的稳定处理，例如 `"overrides" = []`。
+2. 对 inline table / 其他 group 内容的保真，避免不相关条目被字符串化。
+3. 对合法字符串内容中 `]` 等字符的稳健处理，避免数组边界误判。
 
-```
-gov pin add <spec>... [--no-sync]
-```
+这并不意味着所有 `dependency-groups` 写入路径都已经完全去除手写重写逻辑；当前只收敛了 `pin add/remove`。
 
-- `<spec>`：一个或多个 `pkg==version` 格式的版本约束。
-- `--no-sync`：只写入 `pyproject.toml` 和 `uv.lock`，不同步 `.venv-prod`。默认执行 lock + sync。
-- 验证格式：复用现有正则 `^[A-Za-z0-9_.-]+==[^[:space:]]+$`。
-- 操作保护：创建 operation 记录，备份 `pyproject.toml` 和 `uv.lock`，失败时恢复。
-- 实现路径：对每个 spec 调用 `uv add --group overrides --python "$py" --no-sync`，然后 `lock_project_exact` + `sync_project_env_exact`。
+## 6. 关键实现锚点
 
-### 4.2 `gov pin list`
+- CLI 入口：[bin/gov](../bin/gov)
+- `cmd_pin_add`
+- `cmd_pin_list`
+- `cmd_pin_remove`
+- `require_group_names_present`
+- staged apply 与回滚：`apply_staged_pin_change`
+- 事务 resolution 仍使用的共享 pin helper：`append_pins_to_overrides_group`
 
-```
-gov pin list
-```
+## 7. 测试关注点
 
-- 从 `pyproject.toml` 解析 `[dependency-groups] overrides` 的内容并逐行输出。
-- 无 pin 时输出提示信息。
+`tests/test_gov_cli.sh` 当前覆盖了以下 pin 相关场景：
 
-### 4.3 `gov pin remove`
+1. `pin list` 在未 init 和空组时返回 `No pins in overrides group.`。
+2. `pin add` 的新增、替换、非法 spec、torch-family 拒绝、warning、lock/sync/smoke 失败回滚。
+3. `pin remove` 的成功删除、缺失包报错、torch-family 拒绝。
+4. `quoted "overrides"` key 只保留一次，不会重复生成 assignment。
+5. `overrides` 中包含合法字符串依赖且字符串内容带 `]` 时，`pin add/remove` 不会破坏 TOML，且文件仍可被 `tomllib` 解析。
 
-```
-gov pin remove <pkg>... [--no-sync]
-```
+## 8. 当前边界
 
-- `<pkg>`：一个或多个包名（不带版本号）。
-- 从 `overrides` group 中移除匹配的条目。
-- 操作保护：与 `pin add` 一致。
-- 实现路径：对每个 pkg 调用 `uv remove --group overrides --python "$py" --no-sync`，然后 lock + sync。
-
-## 5. 行为定义
-
-### 5.1 `pin add` 流程
-
-1. `ensure_layout` + `require_python`。
-2. 验证所有 spec 格式。
-3. `op_begin "pin_add" "$specs"`。
-4. 备份 `pyproject.toml` 和 `uv.lock`。
-5. 对每个 spec 执行 `uv add --group overrides --python "$py" --no-sync`。
-6. `lock_project_exact`。
-7. 若非 `--no-sync`，则 `sync_project_env_exact`。
-8. `op_finalize` success 或 failure（failure 时恢复备份）。
-
-### 5.2 `pin remove` 流程
-
-1. `ensure_layout` + `require_python`。
-2. 验证包名存在于当前 `overrides` group 中。
-3. `op_begin "pin_remove" "$pkgs"`。
-4. 备份 `pyproject.toml` 和 `uv.lock`。
-5. 对每个 pkg 执行 `uv remove --group overrides --python "$py" --no-sync`。
-6. `lock_project_exact`。
-7. 若非 `--no-sync`，则 `sync_project_env_exact`。
-8. `op_finalize` success 或 failure。
-
-### 5.3 失败处理
-
-- lock 失败（如 pin 与其他约束不兼容）：恢复备份的 `pyproject.toml` 和 `uv.lock`，输出冲突信息，`op_finalize` failed。
-- sync 失败：恢复备份，`op_finalize` failed。
-- 不自动进入 resolve 流程——`gov pin` 是确定性操作，失败意味着用户需要修改 spec。
-
-## 6. 实现锚点
-
-### 6.1 复用的现有 helper
-
-| Helper | 行号 | 用途 |
-|--------|------|------|
-| `append_pins_to_overrides_group` | [bin/gov:782](../bin/gov#L782) | `pin add` 的核心写入逻辑 |
-| `lock_project_exact` | [bin/gov:456](../bin/gov#L456) | lock |
-| `sync_project_env_exact` | [bin/gov:468](../bin/gov#L468) | sync |
-| `configured_python` | bin/gov | 获取当前 Python 版本 |
-| `op_begin` / `op_finalize` | bin/gov | 操作记录与回滚 |
-| pin 格式验证正则 | `^[A-Za-z0-9_.-]+==[^[:space:]]+$` | 格式检查 |
-
-### 6.2 需要新增的代码
-
-1. `cmd_pin_add` — `pin add` 命令处理函数。
-2. `cmd_pin_list` — 从 `pyproject.toml` 解析 `overrides` group。
-3. `cmd_pin_remove` — `pin remove` 命令处理函数。
-4. 命令分发入口（[bin/gov:4464](../bin/gov#L4464) `main` case 块）：
-   ```bash
-   pin) shift; case "${1:-}" in
-       add) shift; cmd_pin_add "$@" ;;
-       list) shift; cmd_pin_list "$@" ;;
-       remove) shift; cmd_pin_remove "$@" ;;
-       *) echo "Usage: gov pin {add|list|remove} ..." >&2; exit 1 ;;
-   esac ;;
-   ```
-5. `cmd_help` 中添加用法行（[bin/gov:4424](../bin/gov#L4424)）。
-
-### 6.3 `pin list` 解析方式
-
-从 `pyproject.toml` 提取 `overrides` group 内容。建议用内联 Python 解析 TOML，与现有代码风格一致（项目中已有多处 `"${PYTHON_BIN}" - <<'PY'` 模式）：
-
-```python
-import tomllib, sys
-with open(sys.argv[1], "rb") as f:
-    data = tomllib.load(f)
-for pin in data.get("dependency-groups", {}).get("overrides", []):
-    print(pin)
-```
-
-## 7. 对现有架构的影响
-
-### 7.1 不变量遵守情况
-
-| 架构不变量 | 影响 |
-|------------|------|
-| I1: 所有生产依赖变更先锚定本地真相 | ✅ `pin add/remove` 先改 `pyproject.toml` 再 lock + sync |
-| I3: 破坏性操作需备份 | ✅ 通过 `op_begin/op_finalize` 保护 |
-| I6: `pyproject.toml` 是依赖权威 | ✅ pin 写入 `overrides` group |
-
-### 7.2 与事务 resolve pin 的关系
-
-- `gov pin add` 与 `gov resolve` / `gov update resolve` 写入同一个 `overrides` group。
-- 两者写入的 pin 不区分来源，这是 v1 的有意简化。
-- `gov pin list` 会列出所有 pin，无论来源。
-
-## 8. 测试计划
-
-### 8.1 成功路径
-
-1. `gov pin add numpy==1.26.4` — pin 出现在 `pyproject.toml overrides`，lock 和 venv 中版本一致。
-2. `gov pin list` — 输出当前 pin。
-3. `gov pin remove numpy` — pin 从 `overrides` 中消失，lock 重新求解。
-4. 多包操作：`gov pin add torch==2.9.0 numpy==1.26.4` 一次添加多个。
-
-### 8.2 失败路径
-
-1. 格式错误的 spec（如 `numpy>=1.26`）应被拒绝。
-2. 与已有约束不兼容的 pin 应 lock 失败并恢复。
-3. remove 不存在的包名应提示。
-
-### 8.3 边界路径
-
-1. 重复 `pin add` 相同包不同版本 — `uv add` 会覆盖旧版本。
-2. `pin add --no-sync` 只改 lock 不改 venv。
-3. 与 `gov resolve` 写入的 pin 共存。
-
-## 9. 后续需同步的文档
-
-1. `docs/04_cli_reference.md`
-2. `docs/10_quick_start_for_llm.md`
-3. `dev-docs/application-core/contracts.md`
-4. `dev-docs/application-core/spec.md`（新增 KF 条目）
-5. `bin/gov` 内 `cmd_help` 帮助文本
-
-## 10. 建议新会话的起手顺序
-
-1. 读 `dev-docs/architecture-haiku.md` 建立全局心智模型。
-2. 读本文件确认设计边界与行为定义。
-3. 读 `bin/gov` 中以下锚点：
-   - `append_pins_to_overrides_group`（行 782）
-   - `lock_project_exact` / `sync_project_env_exact`（行 456 / 468）
-   - `op_begin` / `op_finalize`（搜索定义）
-   - `cmd_update_resolve`（行 3771）作为参数化 pin 写入的参考实现
-   - `main` 分发块（行 4464）
-4. 实现 `cmd_pin_add` → `cmd_pin_list` → `cmd_pin_remove`，按此顺序。
-5. 补充测试到 `tests/test_gov_cli.sh`。
-6. 同步 §9 中列出的文档。
+- 不区分 pin 来源归属。
+- 不支持 `pin --no-sync` 之类的部分提交模式。
+- 不自动推荐具体版本；用户必须显式给出 `pkg==version`。
+- `install torch` 和其他 `dependency-groups` 重写路径仍可能使用独立逻辑，它们不在本文档覆盖的这次 pin 收敛范围内。

@@ -50,7 +50,7 @@
 2. 对同名包执行 upsert：已有 override 会被新 spec 替换，不会累积重复 pin。
 3. 不接受 `torch`、`torchvision`、`torchaudio`；这三者由 `gov install torch` 单独治理。
 4. 会对非推荐关键包输出警告；推荐包集合当前为 `numpy`、`transformers`。
-5. 使用 staged workdir 直接重写 `dependency-groups.overrides`，只有 lock 成功后才晋升到 root truth。
+5. 在 staged workdir 中委托 `uv add --group overrides --python "$py" --frozen` 修改 `dependency-groups.overrides`，只有显式 lock 成功后才晋升到 root truth。
 6. sync 或 smoke test 失败会恢复 `pyproject.toml` 和 `uv.lock`，并把 prod 环境重新同步回恢复后的状态。
 7. 会生成可撤销的 operation。
 
@@ -72,7 +72,7 @@
 1. 参数只接受包名，不接受带版本的 spec。
 2. 匹配按规范化包名进行，`-` / `_` / `.` 与大小写差异会被折叠。
 3. 不接受 `torch`、`torchvision`、`torchaudio`；这三者由 `gov install torch` 单独治理。
-4. 若任一包当前未被 pin，会直接失败，不会部分移除。
+4. 会先对当前 root truth 做只读 precheck；若任一包当前未被 pin，会直接失败，不会部分移除。
 5. 会生成可撤销的 operation。
 
 ## 2. 核心依赖升级事务
