@@ -3,7 +3,7 @@
 ## Metadata
 
 - Status: Active
-- Last Reviewed: 2026-04-07
+- Last Reviewed: 2026-04-17
 
 ## Contract List
 
@@ -18,7 +18,7 @@
 ## Input / Output Semantics
 
 - CLI Command Contract
-  - Input: top-level verbs and subcommands parsed from `argv`.
+  - Input: top-level verbs and subcommands parsed from `argv`, including exact pin specs for `pin add`, package identifiers for `pin remove`, optional exact torch-family specs on `install torch`, and transactional resolution pins for conflict repair flows.
   - Output: stdout summary for success paths, stderr plus non-zero exit on invalid usage or failed operations.
 - Transaction Control Contract
   - Input: `node_id`, optional timeout, `txid`, optional resolution pins, approval flags.
@@ -40,10 +40,16 @@
 - State precondition errors:
   - Missing transaction, missing operation, invalid transaction status, missing plugin metadata, missing PID file.
   - Missing bundle manifest, bundle checksum mismatch, invalid bundle registry, invalid absolute target path, unresolvable Python selector.
+  - Removing a package that is not currently pinned in `dependency-groups.overrides`.
 - Policy errors:
   - Core package impact without explicit approval.
   - Undo target is not `success && undoable`.
   - Undo hash mismatch against current local truth.
+- Validation errors:
+  - Non-exact pin specs for `pin add`.
+  - Invalid package names for `pin remove`.
+  - Torch-family packages rejected from generic `pin add/remove`.
+  - Mismatched or non-exact package specs on `install torch --torch*`.
 - Adapter-propagated errors:
   - `git` failure, lock conflict, prod sync failure, smoke test failure, missing ComfyUI entrypoint.
 

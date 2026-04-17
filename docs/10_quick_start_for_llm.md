@@ -4,7 +4,7 @@
 
 1. 依赖真相是本地文件：`pyproject.toml` 和 `uv.lock`。
 2. `config.toml` 现在还承载运行前置条件：`paths.comfyui_dir` 与 `runtime.python`。
-3. `dependency-groups.torch` 和 `dependency-groups.core` 分别治理 torch 与 ComfyUI 基础依赖。
+3. `dependency-groups.torch`、`dependency-groups.core`、`dependency-groups.overrides` 分别治理 torch、ComfyUI 基础依赖、以及全局精确 pin。
 4. 插件事务和核心依赖升级事务共用 `state/transactions/`，但通过 `kind` 区分。
 5. 破坏性变更仍然依赖 `operation backup + undo`。
 6. 环境交付 bundle 只是运输载体；导入后的本地依赖真相仍然是 `pyproject.toml + uv.lock`。
@@ -37,7 +37,7 @@
 ### 4.1 环境与首装
 
 1. `./bin/gov init --comfyui-dir <abs-path> --python <python-spec>`
-2. `./bin/gov install torch --index-url <url>`
+2. `./bin/gov install torch --index-url <url> [--torch <torch==version>] [--torchvision <torchvision==version>] [--torchaudio <torchaudio==version>]`
 3. `./bin/gov install [--requirements-file <path>]`
 
 ### 4.2 核心依赖升级事务
@@ -48,7 +48,20 @@
 4. `./bin/gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
 5. `./bin/gov update abort <txid>`
 
-### 4.3 插件治理（保持原有路径）
+### 4.3 全局 Pin 管理
+
+1. `./bin/gov pin add <pkg==version>...`
+2. `./bin/gov pin list`
+3. `./bin/gov pin remove <pkg>...`
+
+说明：
+
+1. `pin add` 只接受精确版本，不支持范围约束。
+2. `pin` 不接受 `torch`、`torchvision`、`torchaudio`；torch-family 的版本与 source/index 由 `install torch` 单独治理。
+3. `pin` 写入的是共享的 `dependency-groups.overrides`，会影响后续 lock、prod sync，以及事务 resolve 的共同求解结果。
+4. 成功标准是 `lock + prod sync + smoke test`；失败会回滚 root truth，并把 prod 环境同步回恢复后的状态。
+
+### 4.4 插件治理（保持原有路径）
 
 1. `./bin/gov node add <git_url> [--id <node_id>]`
 2. `./bin/gov tx run <node_id>`
@@ -56,12 +69,12 @@
 4. `./bin/gov tx promote <txid>`
 5. `./bin/gov resolve <txid>`
 
-### 4.4 环境交付
+### 4.5 环境交付
 
 1. `./bin/gov env export <output_dir>`
 2. `./bin/gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>`
 
-### 4.5 审计与运行
+### 4.6 审计与运行
 
 1. `./bin/gov status`
 2. `./bin/gov op list`
@@ -89,7 +102,24 @@
 ./bin/gov update promote <txid>
 ```
 
-### 5.3 插件接入
+### 5.3 全局兼容 Pin
+
+```bash
+./bin/gov pin list
+./bin/gov pin add numpy==1.26.4
+./bin/gov pin add transformers==4.44.0
+./bin/gov pin remove numpy
+```
+
+### 5.4 Torch 版本治理
+
+```bash
+./bin/gov install torch --index-url https://download.pytorch.org/whl/cu130
+./bin/gov install torch --index-url https://download.pytorch.org/whl/cu130 --torch torch==2.11.1
+./bin/gov install torch --index-url https://download.pytorch.org/whl/cu130 --torchvision torchvision==0.26.1
+```
+
+### 5.5 插件接入
 
 ```bash
 ./bin/gov node add <git_url> [--id <node_id>]
@@ -97,7 +127,7 @@
 ./bin/gov tx promote <txid>
 ```
 
-### 5.4 环境交付
+### 5.6 环境交付
 
 ```bash
 ./bin/gov env export /abs/path/to/bundle-dir
@@ -113,6 +143,7 @@
 ## 6. 接手时最小核查清单
 
 1. `./bin/gov help` 包含 `install` 和 `update` 命令族。
-2. `./bin/gov status` 能输出 `config_ready/python/torch_ready/core_ready`。
-3. `pyproject.toml.template` 包含 `core`、`torch`、`overrides` 三个固定组。
-4. 若要做环境迁移，优先核对 `docs/04_cli_reference.md` 与 `docs/11_env_export_import_handoff.md` 中的 bundle/exact restore 语义。
+2. `./bin/gov help` 包含 `pin add/list/remove`。
+3. `./bin/gov status` 能输出 `config_ready/python/torch_ready/core_ready`。
+4. `pyproject.toml.template` 包含 `core`、`torch`、`overrides` 三个固定组。
+5. 若要做环境迁移，优先核对 `docs/04_cli_reference.md` 与 `docs/11_env_export_import_handoff.md` 中的 bundle/exact restore 语义。

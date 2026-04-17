@@ -34,6 +34,50 @@ FAKE_PY_RESOLVERS="$TMP_ROOT/fake-python"
 mkdir -p "$FAKE_PY_RESOLVERS"
 export FAKE_PY_RESOLVERS
 
+find_host_python() {
+    local candidate
+    local -a candidates=()
+
+    if [ -n "${PYTHON_CMD:-}" ]; then
+        candidates+=("${PYTHON_CMD}")
+    fi
+    for candidate in /c/Users/*/AppData/Roaming/uv/python/*/python.exe; do
+        [ -e "$candidate" ] && candidates+=("$candidate")
+    done
+    for candidate in /c/Users/*/AppData/Local/Programs/Python/*/python.exe; do
+        [ -e "$candidate" ] && candidates+=("$candidate")
+    done
+    if command -v python3 >/dev/null 2>&1; then
+        candidates+=("$(command -v python3)")
+    fi
+    if command -v python >/dev/null 2>&1; then
+        candidates+=("$(command -v python)")
+    fi
+
+    for candidate in "${candidates[@]}"; do
+        [ -n "$candidate" ] || continue
+        if "$candidate" -c 'import sys; print(sys.version)' >/dev/null 2>&1; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    echo "no runnable host python found for tests" >&2
+    exit 1
+}
+
+HOST_PYTHON="$(find_host_python)"
+cat >"$FAKE_BIN/python3" <<EOF
+#!/usr/bin/env bash
+exec "$HOST_PYTHON" "\$@"
+EOF
+chmod +x "$FAKE_BIN/python3"
+cat >"$FAKE_BIN/python" <<EOF
+#!/usr/bin/env bash
+exec "$HOST_PYTHON" "\$@"
+EOF
+chmod +x "$FAKE_BIN/python"
+
 reset_local_state() {
     local dir="$1"
     rm -f "$dir/config.toml" "$dir/pyproject.toml" "$dir/uv.lock"
@@ -53,6 +97,95 @@ done
 
 cmd="${1:-}"
 shift || true
+
+update_dependency_group() {
+    local action="$1"
+    local group="$2"
+    shift 2
+    python3 - "$action" "$group" "$@" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+path = pathlib.Path("pyproject.toml")
+text = path.read_text(encoding="utf-8")
+
+try:
+    data = tomllib.loads(text)
+except Exception:
+    data = {}
+
+groups = data.get("dependency-groups", {})
+if not isinstance(groups, dict):
+    groups = {}
+
+action = sys.argv[1]
+group = sys.argv[2]
+items = [x for x in sys.argv[3:] if str(x).strip()]
+
+def normalize_name(spec: str) -> str:
+    token = re.split(r"[<>=!~;\[]", str(spec).strip(), maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower().strip("-")
+
+entries = groups.get(group, [])
+if not isinstance(entries, list):
+    entries = []
+entries = [str(x) for x in entries]
+
+if action == "add":
+    entries.extend(items)
+elif action == "remove":
+    wanted = {normalize_name(x) for x in items}
+    entries = [item for item in entries if normalize_name(item) not in wanted]
+else:
+    raise SystemExit(f"unsupported action: {action}")
+
+groups[group] = entries
+
+section_re = re.compile(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)")
+match = section_re.search(text)
+ordered_keys = []
+if match:
+    for raw_line in match.group(0).splitlines()[1:]:
+        m = re.match(r"^([A-Za-z0-9_.-]+)\s*=", raw_line.strip())
+        if m and m.group(1) not in ordered_keys:
+            ordered_keys.append(m.group(1))
+for key in groups.keys():
+    if key not in ordered_keys:
+        ordered_keys.append(key)
+
+def render_list(values):
+    if not values:
+        return "[]"
+    rendered = ",\n".join(f"    {json.dumps(str(value))}" for value in values)
+    return "[\n" + rendered + ",\n]"
+
+section_lines = ["[dependency-groups]"]
+for key in ordered_keys:
+    values = groups.get(key, [])
+    if not isinstance(values, list):
+        values = []
+    section_lines.append(f"{key} = {render_list(values)}")
+new_section = "\n".join(section_lines) + "\n"
+
+if match:
+    text = text[:match.start()] + new_section + text[match.end():]
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "\n" + new_section
+
+path.write_text(text, encoding="utf-8")
+PY
+}
 
 case "$cmd" in
     lock)
@@ -77,6 +210,10 @@ case "$cmd" in
                 exit 1
             fi
             exit 0
+        fi
+        if [ "${FAKE_UV_LOCK_FAIL:-0}" = "1" ]; then
+            echo "lock failed" >&2
+            exit 1
         fi
         requires_python="$(python3 - <<'PY'
 import pathlib
@@ -132,6 +269,33 @@ PY
 exit "${FAKE_PYTHON_EXIT_CODE:-0}"
 PYEOF
         chmod +x "$env_path/bin/python"
+        ;;
+    add|remove)
+        group=""
+        positional=()
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --group)
+                    group="${2:-}"
+                    shift 2
+                    ;;
+                --python|--index)
+                    shift 2
+                    ;;
+                --no-sync)
+                    shift
+                    ;;
+                *)
+                    positional+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+        if [ -z "$group" ]; then
+            echo "missing group" >&2
+            exit 1
+        fi
+        update_dependency_group "$cmd" "$group" "${positional[@]}"
         ;;
     export)
         if [ "${FAKE_UV_EXPORT_FAIL:-0}" = "1" ]; then
@@ -248,6 +412,18 @@ assert_not_contains() {
     fi
 }
 
+assert_occurrences() {
+    local file="$1"
+    local pattern="$2"
+    local expected="$3"
+    local actual
+    actual="$(grep -F -c "$pattern" "$file" || true)"
+    if [ "$actual" != "$expected" ]; then
+        echo "assertion failed: expected '$pattern' to appear $expected time(s) in $file, got $actual" >&2
+        exit 1
+    fi
+}
+
 assert_file_exists() {
     local path="$1"
     if [ ! -e "$path" ]; then
@@ -266,7 +442,10 @@ assert_not_exists() {
 
 help_out="$TMP_ROOT/help.txt"
 bash "$WORK_DIR/bin/gov" help >"$help_out"
-assert_contains "$help_out" "gov install torch --index-url <url>"
+assert_contains "$help_out" "gov install torch --index-url <url> [--torch <torch==version>] [--torchvision <torchvision==version>] [--torchaudio <torchaudio==version>]"
+assert_contains "$help_out" "gov pin add <pkg==version>..."
+assert_contains "$help_out" "gov pin list"
+assert_contains "$help_out" "gov pin remove <pkg>..."
 assert_contains "$help_out" "gov update run"
 assert_contains "$help_out" "gov env export <output_dir>"
 assert_contains "$help_out" "gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>"
@@ -292,6 +471,134 @@ assert_contains "$WORK_DIR/pyproject.toml" "[tool.uv]"
 assert_contains "$WORK_DIR/pyproject.toml" "sys_platform == 'linux' and platform_machine == 'x86_64'"
 assert_contains "$WORK_DIR/uv.lock" "requires-python = \"==3.12.*\""
 assert_contains "$WORK_DIR/uv.lock" "sys_platform == 'linux' and platform_machine == 'x86_64'"
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin list >"$TMP_ROOT/pin-list-empty.out"
+assert_contains "$TMP_ROOT/pin-list-empty.out" "No pins in overrides group."
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin add numpy==1.26.4 >"$TMP_ROOT/pin-add-numpy.out" 2>"$TMP_ROOT/pin-add-numpy.err"
+assert_contains "$TMP_ROOT/pin-add-numpy.out" "Pins added."
+assert_contains "$WORK_DIR/pyproject.toml" "numpy==1.26.4"
+assert_occurrences "$WORK_DIR/pyproject.toml" "numpy==1.26.4" "1"
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin list >"$TMP_ROOT/pin-list-numpy.out"
+assert_contains "$TMP_ROOT/pin-list-numpy.out" "numpy==1.26.4"
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin add numpy==1.26.3 >"$TMP_ROOT/pin-add-numpy-replace.out" 2>"$TMP_ROOT/pin-add-numpy-replace.err"
+assert_contains "$WORK_DIR/pyproject.toml" "numpy==1.26.3"
+assert_not_contains "$WORK_DIR/pyproject.toml" "numpy==1.26.4"
+assert_occurrences "$WORK_DIR/pyproject.toml" "numpy==1.26.3" "1"
+
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin add 'numpy>=1.26' >"$TMP_ROOT/pin-add-invalid.out" 2>"$TMP_ROOT/pin-add-invalid.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected pin add with invalid format to fail" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/pin-add-invalid.err" "invalid pin format"
+assert_contains "$WORK_DIR/pyproject.toml" "numpy==1.26.3"
+
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin add torch==2.11.0 >"$TMP_ROOT/pin-add-torch.out" 2>"$TMP_ROOT/pin-add-torch.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected pin add of torch-family package to fail" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/pin-add-torch.err" "torch-family packages are managed by 'gov install torch'"
+
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin remove transformers >"$TMP_ROOT/pin-remove-missing.out" 2>"$TMP_ROOT/pin-remove-missing.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected pin remove of missing package to fail" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/pin-remove-missing.err" "pin not found"
+
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin remove torchaudio >"$TMP_ROOT/pin-remove-torchaudio.out" 2>"$TMP_ROOT/pin-remove-torchaudio.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected pin remove of torch-family package to fail" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/pin-remove-torchaudio.err" "torch-family packages are managed by 'gov install torch'"
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin add pillow==10.0.0 >"$TMP_ROOT/pin-add-pillow.out" 2>"$TMP_ROOT/pin-add-pillow.err"
+assert_contains "$TMP_ROOT/pin-add-pillow.err" "WARNING: pinning non-recommended package: pillow==10.0.0"
+assert_contains "$WORK_DIR/pyproject.toml" "pillow==10.0.0"
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin remove numpy >"$TMP_ROOT/pin-remove-numpy.out" 2>"$TMP_ROOT/pin-remove-numpy.err"
+assert_contains "$TMP_ROOT/pin-remove-numpy.out" "Pins removed."
+assert_not_contains "$WORK_DIR/pyproject.toml" "numpy==1.26.3"
+assert_contains "$WORK_DIR/pyproject.toml" "pillow==10.0.0"
+
+pin_lock_before="$(cat "$WORK_DIR/uv.lock")"
+pin_project_before="$(cat "$WORK_DIR/pyproject.toml")"
+set +e
+FAKE_UV_LOCK_FAIL=1 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin add transformers==4.44.0 >"$TMP_ROOT/pin-lockfail.out" 2>"$TMP_ROOT/pin-lockfail.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected pin add to fail when lock fails" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/pin-lockfail.err" "pin add failed during lock"
+assert_contains "$WORK_DIR/pyproject.toml" "pillow==10.0.0"
+assert_not_contains "$WORK_DIR/pyproject.toml" "transformers==4.44.0"
+if [ "$pin_project_before" != "$(cat "$WORK_DIR/pyproject.toml")" ]; then
+    echo "expected pyproject.toml to be restored after pin lock failure" >&2
+    exit 1
+fi
+if [ "$pin_lock_before" != "$(cat "$WORK_DIR/uv.lock")" ]; then
+    echo "expected uv.lock to be restored after pin lock failure" >&2
+    exit 1
+fi
+
+pin_project_before="$(cat "$WORK_DIR/pyproject.toml")"
+pin_lock_before="$(cat "$WORK_DIR/uv.lock")"
+set +e
+FAKE_UV_SYNC_FAIL=1 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin add transformers==4.44.0 >"$TMP_ROOT/pin-syncfail.out" 2>"$TMP_ROOT/pin-syncfail.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected pin add to fail when sync fails" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/pin-syncfail.err" "prod sync failed during pin add"
+if [ "$pin_project_before" != "$(cat "$WORK_DIR/pyproject.toml")" ]; then
+    echo "expected pyproject.toml to be restored after pin sync failure" >&2
+    exit 1
+fi
+if [ "$pin_lock_before" != "$(cat "$WORK_DIR/uv.lock")" ]; then
+    echo "expected uv.lock to be restored after pin sync failure" >&2
+    exit 1
+fi
+
+pin_project_before="$(cat "$WORK_DIR/pyproject.toml")"
+pin_lock_before="$(cat "$WORK_DIR/uv.lock")"
+set +e
+FAKE_PYTHON_EXIT_CODE=1 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" pin add transformers==4.44.0 >"$TMP_ROOT/pin-smokefail.out" 2>"$TMP_ROOT/pin-smokefail.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected pin add to fail when smoke test fails" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/pin-smokefail.err" "smoke test failed during pin add"
+if [ "$pin_project_before" != "$(cat "$WORK_DIR/pyproject.toml")" ]; then
+    echo "expected pyproject.toml to be restored after pin smoke-test failure" >&2
+    exit 1
+fi
+if [ "$pin_lock_before" != "$(cat "$WORK_DIR/uv.lock")" ]; then
+    echo "expected uv.lock to be restored after pin smoke-test failure" >&2
+    exit 1
+fi
 
 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" init --comfyui-dir "$TMP_ROOT/ComfyUI" --python 3.12.9 >"$TMP_ROOT/init-patch.out"
 assert_contains "$WORK_DIR/config.toml" "python = \"3.12\""
@@ -322,6 +629,21 @@ if [ "$rc" -eq 0 ]; then
     exit 1
 fi
 assert_contains "$TMP_ROOT/install.err" "managed torch dependencies are not installed"
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" install torch --index-url https://download.pytorch.org/whl/cu130 --torch torch==2.11.1 --torchvision torchvision==0.26.1 >"$TMP_ROOT/install-torch-custom.out"
+assert_contains "$WORK_DIR/pyproject.toml" "torch==2.11.1"
+assert_contains "$WORK_DIR/pyproject.toml" "torchvision==0.26.1"
+assert_contains "$WORK_DIR/pyproject.toml" "\"torchaudio\""
+
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" install torch --index-url https://download.pytorch.org/whl/cu130 --torch torchvision==0.26.1 >"$TMP_ROOT/install-torch-bad-flag.out" 2>"$TMP_ROOT/install-torch-bad-flag.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected install torch with mismatched package flag to fail" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/install-torch-bad-flag.err" "torch flag must target package 'torch'"
 
 mkdir -p "$TMP_ROOT/ComfyUI/custom_nodes/demo-node"
 cat >"$TMP_ROOT/ComfyUI/custom_nodes/demo-node/__init__.py" <<'EOF'

@@ -3,7 +3,7 @@
 ## Metadata
 
 - Status: Active
-- Last Reviewed: 2026-04-07
+- Last Reviewed: 2026-04-17
 
 ## 1. System Identity / Goals / Non-Goals / Assumptions
 
@@ -13,6 +13,7 @@
   - Make runtime prerequisites explicit through `gov init --comfyui-dir --python`.
   - Force plugin dependency changes through an observable candidate transaction before production promotion.
   - Handle ComfyUI core requirements through `install` and `update` flows without bypassing local truth.
+  - Allow direct exact-version compatibility pins through shared `dependency-groups.overrides` without waiting for a conflict-resolution flow.
   - Hand off a verified environment through `env export` and `env import` without re-cloning plugins or redefining local truth ownership.
   - Preserve auditable state for transactions, operations, conflicts, and plugin registration.
   - Prefer automatic recovery before leaving local truth in a partially changed state.
@@ -60,7 +61,7 @@
 ## 4. Top-Level Decomposition
 
 - Application Core:
-  - [Governance CLI Orchestrator](./application-core/spec.md): command dispatch plus surface use cases for bootstrap/install, plugin lifecycle, plugin tx, core update tx, audit/undo, and runtime control.
+  - [Governance CLI Orchestrator](./application-core/spec.md): command dispatch plus surface use cases for bootstrap/install, global override pin management, plugin lifecycle, plugin tx, core update tx, audit/undo, and runtime control.
 - Peer Subsystems:
   - [State Ledger](./subsystems/state-ledger/spec.md): durable local records for transactions, operations, plugin registry, and conflict artifacts (I1).
   - [Safety Guards](./subsystems/safety-guards/spec.md): core-impact gate, backup discipline, rollback posture, undo hash guard (I5).
@@ -89,7 +90,7 @@
   - [SKF-004](./key-flows/system.md#skf-004) `init -> install torch -> install -> update run -> update promote`
   - [SKF-005](./key-flows/system.md#skf-005) `env export -> env import`
 - Module KF Index:
-  - Application Core: `core#KF-001..010` in [application-core/spec.md](./application-core/spec.md#key-flows--failure-recovery)
+  - Application Core: `core#KF-001..011` in [application-core/spec.md](./application-core/spec.md#key-flows--failure-recovery)
   - State Ledger: `state-ledger#KF-001..003` in [state-ledger/spec.md](./subsystems/state-ledger/spec.md#key-flows--failure-recovery)
   - Safety Guards: `safety-guards#KF-001..003` in [safety-guards/spec.md](./subsystems/safety-guards/spec.md#key-flows--failure-recovery)
 - UC Index:
@@ -149,7 +150,7 @@
 **Type**: Application Core
 
 **Role / Responsibility**
-- Owns command routing and the eight user-visible surfaces S1-S8.
+- Owns command routing and the nine user-visible surfaces S1-S9.
 - Does NOT own tool-specific semantics or record schema internals.
 
 **Owned Data / Source of Truth**
@@ -167,7 +168,7 @@
 - Single-command imperative flows with explicit failure branches.
 
 **Key Behaviors (Index)**
-- `core#KF-001..010`
+- `core#KF-001..011`
 
 **Drill-down**
 - [Spec](./application-core/spec.md)
