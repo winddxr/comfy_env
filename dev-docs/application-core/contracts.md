@@ -3,7 +3,7 @@
 ## Metadata
 
 - Status: Active
-- Last Reviewed: 2026-03-01
+- Last Reviewed: 2026-04-17
 
 ## Contract List
 
@@ -13,11 +13,12 @@
 | Transaction Control Contract | Application Core | State Ledger + Adapters | Stable, additive fields only |
 | Promotion Approval Contract | Local operator + Application Core | Safety Guards | Stable policy surface |
 | Runtime Control Contract | Local operator | Application Core + Runtime Executor | Stable |
+| Environment Handoff Contract | Local operator | Application Core + Dependency Sync + Source Integration | Stable for v1 bundle shape |
 
 ## Input / Output Semantics
 
 - CLI Command Contract
-  - Input: top-level verbs and subcommands parsed from `argv`.
+  - Input: top-level verbs and subcommands parsed from `argv`, including exact pin specs for `pin add`, package identifiers for `pin remove`, optional exact torch-family specs on `install torch`, and transactional resolution pins for conflict repair flows.
   - Output: stdout summary for success paths, stderr plus non-zero exit on invalid usage or failed operations.
 - Transaction Control Contract
   - Input: `node_id`, optional timeout, `txid`, optional resolution pins, approval flags.
@@ -28,6 +29,9 @@
 - Runtime Control Contract
   - Input: optional `--sync`, passthrough ComfyUI args, PID file presence.
   - Output: foreground exec into ComfyUI or explicit stop result.
+- Environment Handoff Contract
+  - Input: `env export <output_dir>` or `env import <bundle_dir> --comfyui-dir --python`, where `--python` can be a canonical minor line or a selector resolvable on the target machine.
+  - Output: a verified directory bundle for export, or a staged-and-committed exact restore for import.
 
 ## Error Taxonomy
 
@@ -35,10 +39,17 @@
   - Missing required identifiers or unknown flags.
 - State precondition errors:
   - Missing transaction, missing operation, invalid transaction status, missing plugin metadata, missing PID file.
+  - Missing bundle manifest, bundle checksum mismatch, invalid bundle registry, invalid absolute target path, unresolvable Python selector.
+  - Removing a package that is not currently pinned in `dependency-groups.overrides`.
 - Policy errors:
   - Core package impact without explicit approval.
   - Undo target is not `success && undoable`.
   - Undo hash mismatch against current local truth.
+- Validation errors:
+  - Non-exact pin specs for `pin add`.
+  - Invalid package names for `pin remove`.
+  - Torch-family packages rejected from generic `pin add/remove`.
+  - Mismatched or non-exact package specs on `install torch --torch*`.
 - Adapter-propagated errors:
   - `git` failure, lock conflict, prod sync failure, smoke test failure, missing ComfyUI entrypoint.
 

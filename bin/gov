@@ -58,6 +58,10 @@ require_cmd() {
     fi
 }
 
+uv_cache_dir() {
+    echo "${ROOT_DIR}/cache/uv"
+}
+
 config_get() {
     local key="$1"
     local default_value="$2"
@@ -226,22 +230,202 @@ for name, payload in sections:
     lines.append(f"[{name}]")
     for key, value in payload.items():
         rendered = fmt_value(value)
-        if "\n" in rendered:
-            lines.append(f"{key} = {rendered}")
-        else:
-            lines.append(f"{key} = {rendered}")
+        lines.append(f"{key} = {rendered}")
     lines.append("")
 
 config_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 PY
 }
 
-ensure_layout() {
+canonicalize_python_minor() {
+    local request="${1:-}"
+    if [ -z "$request" ]; then
+        echo "ERROR: python request is required" >&2
+        exit 1
+    fi
+
+    request="${request#"${request%%[![:space:]]*}"}"
+    request="${request%"${request##*[![:space:]]}"}"
+    if [ -z "$request" ]; then
+        echo "ERROR: python request is required" >&2
+        exit 1
+    fi
+
+    if [[ "$request" =~ ^([0-9]+)\.([0-9]+)(\.[0-9]+)?$ ]]; then
+        echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    echo "$request"
+}
+
+resolve_python_minor() {
+    local request canonical_request
+    request="${1:-}"
+    canonical_request="$(canonicalize_python_minor "$request")"
+
+    if [[ "$request" =~ ^[[:space:]]*[0-9]+\.[0-9]+[[:space:]]*$ ]]; then
+        echo "$canonical_request"
+        return 0
+    fi
+
+    require_cmd uv
+    local cache_dir
+    cache_dir="$(uv_cache_dir)"
+    mkdir -p "$cache_dir"
+
+    local resolved
+    if ! resolved="$(uv --cache-dir "$cache_dir" python find --no-python-downloads "$request")"; then
+        echo "ERROR: failed to resolve python request: $request" >&2
+        exit 1
+    fi
+
+    resolved="${resolved#"${resolved%%[![:space:]]*}"}"
+    resolved="${resolved%"${resolved##*[![:space:]]}"}"
+    if [ ! -x "$resolved" ]; then
+        echo "ERROR: resolved python is not executable: $resolved" >&2
+        exit 1
+    fi
+
+    local resolved_minor
+    if ! resolved_minor="$("$resolved" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"; then
+        echo "ERROR: failed to inspect resolved python version: $resolved" >&2
+        exit 1
+    fi
+    if ! [[ "$resolved_minor" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        echo "ERROR: unsupported python version resolved from request: $resolved_minor" >&2
+        exit 1
+    fi
+    echo "$resolved_minor"
+}
+
+current_uv_environment_marker() {
+    require_python
+    "${PYTHON_BIN}" - <<'PY'
+import platform
+import sys
+
+print(f"sys_platform == '{sys.platform}' and platform_machine == '{platform.machine()}'")
+PY
+}
+
+sync_project_runtime_constraints() {
+    local project_file="$1"
+    local python_minor="$2"
+    local environment_marker="$3"
+
+    require_python
+    "${PYTHON_BIN}" - "$project_file" "$python_minor" "$environment_marker" <<'PY'
+import pathlib
+import re
+import sys
+
+project_path = pathlib.Path(sys.argv[1])
+python_minor = sys.argv[2].strip()
+environment_marker = sys.argv[3].strip()
+requires_python = f"=={python_minor}.*"
+
+if not project_path.exists():
+    raise SystemExit(f"ERROR: project file not found: {project_path}")
+
+lines = project_path.read_text(encoding="utf-8").splitlines()
+
+def find_section(header: str):
+    start = None
+    for idx, line in enumerate(lines):
+        if line.strip() == header:
+            start = idx
+            break
+    if start is None:
+        return None, None
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        if re.match(r"^\[", lines[idx]):
+            end = idx
+            break
+    return start, end
+
+def value_block_end(start_idx: int) -> int:
+    line = lines[start_idx]
+    bracket_balance = line.count("[") - line.count("]")
+    idx = start_idx + 1
+    while bracket_balance > 0 and idx < len(lines):
+        bracket_balance += lines[idx].count("[") - lines[idx].count("]")
+        idx += 1
+    return idx
+
+def set_key(section_header: str, key: str, new_block_lines: list[str]):
+    start, end = find_section(section_header)
+    if start is None:
+        raise SystemExit(f"ERROR: required TOML section missing: {section_header}")
+
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    for idx in range(start + 1, end):
+        if key_re.match(lines[idx]):
+            block_end = value_block_end(idx)
+            lines[idx:block_end] = new_block_lines
+            return
+
+    insert_at = end
+    while insert_at > start + 1 and lines[insert_at - 1].strip() == "":
+        insert_at -= 1
+    lines[insert_at:insert_at] = new_block_lines
+
+project_start, _ = find_section("[project]")
+if project_start is None:
+    raise SystemExit("ERROR: pyproject.toml is missing [project]")
+
+tool_uv_start, tool_uv_end = find_section("[tool.uv]")
+if tool_uv_start is None:
+    insert_at = len(lines)
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[tool.uv.") or stripped.startswith("[[tool.uv."):
+            insert_at = idx
+            break
+    block = []
+    if insert_at > 0 and lines[insert_at - 1].strip() != "":
+        block.append("")
+    block.extend([
+        "[tool.uv]",
+        "environments = [",
+        f"    \"{environment_marker}\",",
+        "]",
+    ])
+    if insert_at < len(lines) and lines[insert_at].strip() != "":
+        block.append("")
+    lines[insert_at:insert_at] = block
+else:
+    set_key(
+        "[tool.uv]",
+        "environments",
+        [
+            "environments = [",
+            f"    \"{environment_marker}\",",
+            "]",
+        ],
+    )
+
+set_key("[project]", "requires-python", [f'requires-python = "{requires_python}"'])
+
+project_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+PY
+}
+
+ensure_state_dirs() {
     mkdir -p "${STATE_DIR}" "${TX_DIR}" "${LOG_DIR}" "${CONFLICT_DIR}" "${WORK_DIR}" "${CACHE_WHEELS_DIR}" "${OPS_DIR}" "${ROOT_DIR}/.venv-candidate"
+}
+
+ensure_plugins_registry() {
     if [ ! -f "${PLUGINS_FILE}" ]; then
         printf '[]\n' > "${PLUGINS_FILE}"
     fi
     migrate_plugins_registry
+}
+
+ensure_layout() {
+    ensure_state_dirs
+    ensure_plugins_registry
 }
 
 ensure_project_file_for_init() {
@@ -369,38 +553,71 @@ group_name_for_node() {
     echo "node-${norm}"
 }
 
+_random_hex8() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen | tr -d '-' | head -c 8 | tr '[:upper:]' '[:lower:]'
+    elif [ -r /proc/sys/kernel/random/uuid ]; then
+        tr -d '-' < /proc/sys/kernel/random/uuid | head -c 8
+    else
+        od -An -tx1 -N4 /dev/urandom | tr -d ' \n' | head -c 8
+    fi
+}
+
 new_txid() {
-    require_python
-    "${PYTHON_BIN}" - <<'PY'
-import datetime
-import uuid
-print(datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8])
-PY
+    echo "$(date -u +"%Y%m%dT%H%M%SZ")-$(_random_hex8)"
 }
 
 new_op_id() {
-    require_python
-    "${PYTHON_BIN}" - <<'PY'
-import datetime
-import uuid
-print(datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ") + "-op-" + uuid.uuid4().hex[:8])
-PY
+    echo "$(date -u +"%Y%m%dT%H%M%SZ")-op-$(_random_hex8)"
 }
 
 file_sha256() {
     local file_path="$1"
-    require_python
-    "${PYTHON_BIN}" - "$file_path" <<'PY'
-import hashlib
-import pathlib
-import sys
+    if [ ! -f "$file_path" ]; then
+        echo ""
+        return 0
+    fi
+    sha256sum "$file_path" | cut -d' ' -f1
+}
 
-p = pathlib.Path(sys.argv[1])
-if not p.exists():
-    print("")
-    raise SystemExit(0)
-print(hashlib.sha256(p.read_bytes()).hexdigest())
-PY
+backup_file_with_marker() {
+    local src="$1"
+    local backup="$2"
+    local marker="$3"
+    if [ -e "$src" ]; then
+        cp -a "$src" "$backup"
+        printf '1\n' > "$marker"
+    else
+        : > "$backup"
+        printf '0\n' > "$marker"
+    fi
+}
+
+restore_file_with_marker() {
+    local backup="$1"
+    local dst="$2"
+    local marker="$3"
+    local existed="0"
+    if [ -f "$marker" ]; then
+        existed="$(tr -d '\n' < "$marker")"
+    fi
+    if [ "$existed" = "1" ]; then
+        cp -a "$backup" "$dst"
+    else
+        rm -f "$dst"
+    fi
+}
+
+run_smoke_test_in_env() {
+    local env_path="$1"
+    local comfyui_dir="$2"
+    local smoke_cmd
+    smoke_cmd="$(smoke_test_cmd)"
+    if [ -n "$smoke_cmd" ]; then
+        (cd "$comfyui_dir" && PATH="$env_path/bin:$PATH" bash -lc "$smoke_cmd")
+    else
+        "$env_path/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1
+    fi
 }
 
 dep_name_from_spec() {
@@ -420,6 +637,375 @@ if "@" in token:
     token = token.split("@", 1)[0].strip()
 
 print(token)
+PY
+}
+
+normalize_dep_name() {
+    local raw="${1:-}"
+    local name
+    name="$(dep_name_from_spec "$raw")"
+    normalize_group_name "$name"
+}
+
+pin_name_is_recommended() {
+    local dep_name="$1"
+    case "$dep_name" in
+        numpy|transformers)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+torch_family_dep_name_is_managed() {
+    local dep_name="$1"
+    case "$dep_name" in
+        torch|torchvision|torchaudio)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+warn_for_unrecommended_pin_specs() {
+    local spec dep_name
+    for spec in "$@"; do
+        dep_name="$(normalize_dep_name "$spec")"
+        if [ -n "$dep_name" ] && ! pin_name_is_recommended "$dep_name"; then
+            echo "WARNING: pinning non-recommended package: $spec" >&2
+        fi
+    done
+}
+
+write_pin_specs_last_wins() {
+    local out_file="$1"
+    shift
+    require_python
+    "${PYTHON_BIN}" - "$out_file" "$@" <<'PY'
+import pathlib
+import re
+import sys
+
+out_file = pathlib.Path(sys.argv[1])
+items = [str(x).strip() for x in sys.argv[2:] if str(x).strip()]
+
+def normalize_name(spec: str) -> str:
+    token = re.split(r"[<>=!~;\[]", spec.strip(), maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower().strip("-")
+
+last_seen: dict[str, tuple[int, str]] = {}
+for idx, item in enumerate(items):
+    norm = normalize_name(item)
+    if not norm:
+        continue
+    last_seen[norm] = (idx, item)
+
+ordered = [item for _, item in sorted(last_seen.values(), key=lambda entry: entry[0])]
+out_file.write_text("\n".join(ordered) + ("\n" if ordered else ""), encoding="utf-8")
+PY
+}
+
+write_group_names_matching_specs() {
+    local pyproject_file="$1"
+    local group_name="$2"
+    local out_file="$3"
+    shift 3
+    require_python
+    "${PYTHON_BIN}" - "$pyproject_file" "$group_name" "$out_file" "$@" <<'PY'
+import pathlib
+import re
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+pyproject = pathlib.Path(sys.argv[1])
+group = sys.argv[2]
+out_file = pathlib.Path(sys.argv[3])
+items = [str(x).strip() for x in sys.argv[4:] if str(x).strip()]
+
+def normalize_name(spec: str) -> str:
+    token = re.split(r"[<>=!~;\[]", spec.strip(), maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower().strip("-")
+
+existing: set[str] = set()
+if pyproject.exists():
+    text = pyproject.read_text(encoding="utf-8")
+    try:
+        data = tomllib.loads(text)
+    except Exception as exc:
+        raise SystemExit(f"ERROR: failed to parse pyproject.toml: {exc}")
+    groups = data.get("dependency-groups", {})
+    raw = groups.get(group, []) if isinstance(groups, dict) else []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            spec = item.strip()
+            if not spec:
+                continue
+            norm = normalize_name(spec)
+            if norm:
+                existing.add(norm)
+
+matched: list[str] = []
+seen: set[str] = set()
+for item in items:
+    norm = normalize_name(item)
+    if not norm or norm in seen:
+        continue
+    seen.add(norm)
+    if norm in existing:
+        matched.append(norm)
+
+out_file.write_text("\n".join(matched) + ("\n" if matched else ""), encoding="utf-8")
+PY
+}
+
+rewrite_dependency_group() {
+    local pyproject_file="$1"
+    local group="$2"
+    local mode="$3"
+    shift 3
+
+    require_python
+    "${PYTHON_BIN}" - "$pyproject_file" "$group" "$mode" "$@" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+path = pathlib.Path(sys.argv[1])
+group = sys.argv[2]
+mode = sys.argv[3]
+items = [str(x).strip() for x in sys.argv[4:] if str(x).strip()]
+
+if not path.exists():
+    raise SystemExit(f"ERROR: project file not found: {path}")
+
+text = path.read_text(encoding="utf-8")
+try:
+    data = tomllib.loads(text)
+except Exception as exc:
+    raise SystemExit(f"ERROR: failed to parse pyproject.toml: {exc}")
+
+groups = data.get("dependency-groups", {})
+if not isinstance(groups, dict):
+    groups = {}
+
+entries = groups.get(group, [])
+if not isinstance(entries, list):
+    entries = []
+
+def normalize_name(spec: str) -> str:
+    token = re.split(r"[<>=!~;\[]", spec.strip(), maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
+    return re.sub(r"[-_.]+", "-", token).lower().strip("-")
+
+def entry_name(entry) -> str:
+    if not isinstance(entry, str):
+        return ""
+    spec = entry.strip()
+    if not spec:
+        return ""
+    return normalize_name(spec)
+
+def dedupe_exact_specs(values: list[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        norm = normalize_name(value)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        ordered.append(value)
+    return ordered
+
+if mode == "upsert_exact":
+    requested_order: list[str] = []
+    requested_specs: dict[str, str] = {}
+    emitted: set[str] = set()
+    out: list[str] = []
+
+    for item in items:
+        norm = normalize_name(item)
+        if not norm:
+            continue
+        if norm not in requested_specs:
+            requested_order.append(norm)
+        requested_specs[norm] = item
+
+    for entry in entries:
+        norm = entry_name(entry)
+        if norm in requested_specs:
+            if norm not in emitted:
+                out.append(requested_specs[norm])
+                emitted.add(norm)
+            continue
+        out.append(entry)
+
+    for norm in requested_order:
+        if norm not in emitted:
+            out.append(requested_specs[norm])
+            emitted.add(norm)
+
+    groups[group] = out
+elif mode == "remove_names":
+    requested_order: list[str] = []
+    remove_set: set[str] = set()
+    found: set[str] = set()
+    out: list[str] = []
+
+    for item in items:
+        norm = normalize_name(item)
+        if not norm:
+            continue
+        if norm not in remove_set:
+            requested_order.append(norm)
+        remove_set.add(norm)
+
+    for entry in entries:
+        norm = entry_name(entry)
+        if norm in remove_set:
+            found.add(norm)
+            continue
+        out.append(entry)
+
+    missing = [norm for norm in requested_order if norm not in found]
+    if missing:
+        print(f"ERROR: pin not found for package(s): {' '.join(missing)}", file=sys.stderr)
+        raise SystemExit(1)
+
+    groups[group] = out
+elif mode == "replace_exact":
+    groups[group] = dedupe_exact_specs(items)
+else:
+    raise SystemExit(f"ERROR: unsupported dependency-group rewrite mode: {mode}")
+
+def render_toml_key(value: str) -> str:
+    if re.match(r"^[A-Za-z0-9_-]+$", value):
+        return value
+    return json.dumps(value)
+
+def render_toml_literal_key(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+def serialized_toml_keys(value: str) -> list[str]:
+    candidates = []
+    if re.match(r"^[A-Za-z0-9_-]+$", value):
+        candidates.append(value)
+    candidates.append(json.dumps(value))
+    candidates.append(render_toml_literal_key(value))
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+def render_toml_value(value):
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(render_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        parts = [f"{render_toml_key(str(key))} = {render_toml_value(item)}" for key, item in value.items()]
+        return "{ " + ", ".join(parts) + " }"
+    raise SystemExit(f"ERROR: unsupported dependency-group item type: {type(value).__name__}")
+
+def render_group_assignment(rendered_key: str, values) -> str:
+    if not isinstance(values, list):
+        values = []
+    if not values:
+        return f"{rendered_key} = []\n"
+    rendered = ",\n".join(f"    {render_toml_value(value)}" for value in values)
+    return f"{rendered_key} = [\n{rendered},\n]\n"
+
+def bracket_balance(text: str) -> int:
+    balance = 0
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "[":
+            balance += 1
+        elif ch == "]":
+            balance -= 1
+    return balance
+
+def replace_group_assignment(section_text: str, group_name: str, values) -> str:
+    lines = section_text.splitlines(keepends=True)
+    key_choices = serialized_toml_keys(group_name)
+    key_re = re.compile(rf"^({'|'.join(re.escape(key) for key in key_choices)})\s*=")
+
+    for idx in range(1, len(lines)):
+        match = key_re.match(lines[idx].strip())
+        if not match:
+            continue
+        assignment = render_group_assignment(match.group(1), values)
+        balance = 0
+        found_array = False
+        end = idx
+        while end < len(lines):
+            chunk = lines[end]
+            if "=" in chunk or found_array:
+                rhs = chunk.split("=", 1)[1] if not found_array and "=" in chunk else chunk
+                if "[" in rhs or found_array:
+                    found_array = True
+                    balance += bracket_balance(rhs)
+                    if balance <= 0:
+                        break
+            end += 1
+        return "".join(lines[:idx]) + assignment + "".join(lines[end + 1:])
+
+    if not section_text.endswith("\n"):
+        section_text += "\n"
+    return section_text + render_group_assignment(render_toml_key(group_name), values)
+
+section_re = re.compile(r"(?ms)^\[dependency-groups\]\n.*?(?=^\[|\Z)")
+match = section_re.search(text)
+if match:
+    new_section = replace_group_assignment(match.group(0), group, groups.get(group, []))
+    text = text[:match.start()] + new_section + text[match.end():]
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "\n[dependency-groups]\n" + render_group_assignment(render_toml_key(group), groups.get(group, []))
+
+path.write_text(text, encoding="utf-8")
 PY
 }
 
@@ -611,7 +1197,7 @@ PY
 op_begin() {
     local kind="$1"
     local ref="$2"
-    ensure_layout
+    ensure_state_dirs
     require_python
 
     local op_id op_dir backup_dir
@@ -620,13 +1206,9 @@ op_begin() {
     backup_dir="${op_dir}/backup"
     mkdir -p "$backup_dir"
 
-    cp "$PROJECT_FILE" "${backup_dir}/pyproject.toml"
-    if [ -f "$LOCK_FILE" ]; then
-        cp "$LOCK_FILE" "${backup_dir}/uv.lock"
-    else
-        : > "${backup_dir}/uv.lock"
-    fi
-    cp "$PLUGINS_FILE" "${backup_dir}/plugins.json"
+    backup_file_with_marker "$PROJECT_FILE" "${backup_dir}/pyproject.toml" "${backup_dir}/pyproject.toml.present"
+    backup_file_with_marker "$LOCK_FILE" "${backup_dir}/uv.lock" "${backup_dir}/uv.lock.present"
+    backup_file_with_marker "$PLUGINS_FILE" "${backup_dir}/plugins.json" "${backup_dir}/plugins.json.present"
 
     "${PYTHON_BIN}" - "$op_dir/meta.json" "$op_id" "$kind" "$ref" "$(timestamp_utc)" "$backup_dir" \
         "$(file_sha256 "$PROJECT_FILE")" "$(file_sha256 "$LOCK_FILE")" "$(file_sha256 "$PLUGINS_FILE")" <<'PY'
@@ -665,9 +1247,9 @@ op_restore_backup() {
         echo "ERROR: op backup missing: $op_id" >&2
         return 1
     fi
-    cp "${backup_dir}/pyproject.toml" "$PROJECT_FILE"
-    cp "${backup_dir}/uv.lock" "$LOCK_FILE"
-    cp "${backup_dir}/plugins.json" "$PLUGINS_FILE"
+    restore_file_with_marker "${backup_dir}/pyproject.toml" "$PROJECT_FILE" "${backup_dir}/pyproject.toml.present"
+    restore_file_with_marker "${backup_dir}/uv.lock" "$LOCK_FILE" "${backup_dir}/uv.lock.present"
+    restore_file_with_marker "${backup_dir}/plugins.json" "$PLUGINS_FILE" "${backup_dir}/plugins.json.present"
 }
 
 op_finalize() {
@@ -713,6 +1295,747 @@ plugin_install_abs_path() {
     echo "${comfyui_dir}/${rel_path}"
 }
 
+bundle_export_pylock() {
+    local bundle_dir="$1"
+    local pylock_file="${bundle_dir}/pylock.toml"
+    (
+        cd "$ROOT_DIR"
+        uv export --format pylock.toml --locked --all-groups --output-file "$pylock_file"
+    )
+}
+
+bundle_copy_custom_nodes() {
+    local bundle_dir="$1"
+    local comfyui_dir="$2"
+    local plugins_file="${3:-$PLUGINS_FILE}"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$comfyui_dir" "$plugins_file" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1])
+comfyui_dir = pathlib.Path(sys.argv[2]).resolve()
+plugins_path = pathlib.Path(sys.argv[3])
+custom_nodes_root = bundle_dir / "custom_nodes"
+custom_nodes_root.mkdir(parents=True, exist_ok=True)
+
+try:
+    data = json.loads(plugins_path.read_text(encoding="utf-8")) if plugins_path.exists() else []
+except Exception as exc:
+    raise SystemExit(f"ERROR: failed to read plugins registry: {exc}")
+
+if not isinstance(data, list):
+    raise SystemExit("ERROR: plugins registry must be a JSON array")
+
+def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
+    rel_path = pathlib.Path(rel)
+    if rel_path.is_absolute():
+        raise SystemExit(f"ERROR: {label} must be relative: {rel}")
+    target = (base / rel_path).resolve()
+    try:
+        target.relative_to(base)
+    except Exception:
+        raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
+    return target
+
+def ignore_vcs_admin(_dir: str, names):
+    # Export the runtime snapshot, not repository admin state.
+    return {name for name in names if name == ".git"}
+
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    node_id = str(item.get("id") or "").strip()
+    if not node_id:
+        raise SystemExit("ERROR: plugins registry contains item without id")
+    rel = str(item.get("install_relpath") or f"custom_nodes/{node_id}").strip()
+    source_dir = resolve_under(comfyui_dir, rel, f"install_relpath for node '{node_id}'")
+    if not source_dir.exists() or not source_dir.is_dir():
+        raise SystemExit(f"ERROR: plugin source directory missing for node '{node_id}': {source_dir}")
+    dest_dir = custom_nodes_root / node_id
+    if dest_dir.exists():
+        shutil.rmtree(dest_dir)
+    shutil.copytree(source_dir, dest_dir, ignore=ignore_vcs_admin)
+PY
+}
+
+bundle_write_export_summary() {
+    local bundle_dir="$1"
+    local created_at="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$created_at" "$(configured_python)" <<'PY'
+import json
+import pathlib
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1])
+created_at = sys.argv[2]
+python_spec = sys.argv[3]
+plugins_path = bundle_dir / "state" / "plugins.json"
+project_path = bundle_dir / "pyproject.toml"
+
+try:
+    plugins = json.loads(plugins_path.read_text(encoding="utf-8")) if plugins_path.exists() else []
+except Exception:
+    plugins = []
+
+node_ids = []
+for item in plugins:
+    if isinstance(item, dict) and str(item.get("id") or "").strip():
+        node_ids.append(str(item["id"]).strip())
+
+summary = {
+    "created_at": created_at,
+    "python_spec": python_spec,
+    "node_ids": sorted(node_ids),
+    "node_count": len(node_ids),
+    "has_pyproject": project_path.exists(),
+    "has_uv_lock": (bundle_dir / "uv.lock").exists(),
+    "has_pylock": (bundle_dir / "pylock.toml").exists(),
+}
+
+out_path = bundle_dir / "audit" / "export-summary.json"
+out_path.parent.mkdir(parents=True, exist_ok=True)
+out_path.write_text(json.dumps(summary, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+bundle_manifest_write() {
+    local bundle_dir="$1"
+    local created_at="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$created_at" "$(configured_python)" <<'PY'
+import getpass
+import hashlib
+import json
+import pathlib
+import platform
+import socket
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+created_at = sys.argv[2]
+python_spec = sys.argv[3]
+manifest_path = bundle_dir / "manifest.json"
+plugins_path = bundle_dir / "state" / "plugins.json"
+
+try:
+    plugins = json.loads(plugins_path.read_text(encoding="utf-8")) if plugins_path.exists() else []
+except Exception:
+    plugins = []
+
+node_ids = []
+for item in plugins:
+    if isinstance(item, dict) and str(item.get("id") or "").strip():
+        node_ids.append(str(item["id"]).strip())
+
+files = {}
+for path in sorted(p for p in bundle_dir.rglob("*") if p.is_file() and p != manifest_path):
+    rel = str(path.relative_to(bundle_dir)).replace("\\", "/")
+    files[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+payload = {
+    "bundle_format_version": "1",
+    "created_at": created_at,
+    "created_by": f"{getpass.getuser()}@{socket.gethostname()}",
+    "python_spec": python_spec,
+    "python_version": platform.python_version(),
+    "platform_system": platform.system(),
+    "platform_machine": platform.machine(),
+    "node_ids": sorted(node_ids),
+    "files": {
+        "sha256": files,
+    },
+}
+
+manifest_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+bundle_manifest_verify() {
+    local bundle_dir="$1"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+manifest_path = bundle_dir / "manifest.json"
+if not bundle_dir.exists() or not bundle_dir.is_dir():
+    raise SystemExit(f"ERROR: bundle directory not found: {bundle_dir}")
+if not manifest_path.exists():
+    raise SystemExit(f"ERROR: bundle manifest missing: {manifest_path}")
+
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+required_top = [
+    "bundle_format_version",
+    "created_at",
+    "created_by",
+    "python_spec",
+    "python_version",
+    "platform_system",
+    "platform_machine",
+    "node_ids",
+    "files",
+]
+for key in required_top:
+    if key not in manifest:
+        raise SystemExit(f"ERROR: manifest missing field: {key}")
+
+sha_map = (manifest.get("files") or {}).get("sha256")
+if not isinstance(sha_map, dict):
+    raise SystemExit("ERROR: manifest files.sha256 must be a mapping")
+
+required_files = [
+    "pyproject.toml",
+    "uv.lock",
+    "pylock.toml",
+    "state/plugins.json",
+    "audit/prod-freeze.txt",
+    "audit/export-summary.json",
+]
+for rel in required_files:
+    if rel not in sha_map:
+        raise SystemExit(f"ERROR: manifest missing checksum entry for {rel}")
+
+for rel, expected in sha_map.items():
+    path = bundle_dir / rel
+    if not path.exists() or not path.is_file():
+        raise SystemExit(f"ERROR: bundle file missing: {rel}")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != expected:
+        raise SystemExit(f"ERROR: bundle checksum mismatch: {rel}")
+PY
+}
+
+bundle_check_import_conflicts() {
+    local bundle_dir="$1"
+    local comfyui_dir="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$comfyui_dir" <<'PY'
+import json
+import pathlib
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+raw_comfyui_dir = pathlib.Path(sys.argv[2])
+if not raw_comfyui_dir.is_absolute():
+    raise SystemExit(f"ERROR: ComfyUI path must be absolute: {raw_comfyui_dir}")
+comfyui_dir = raw_comfyui_dir.resolve()
+bundle_plugins = bundle_dir / "state" / "plugins.json"
+
+if not comfyui_dir.exists() or not comfyui_dir.is_dir():
+    raise SystemExit(f"ERROR: ComfyUI directory not found: {comfyui_dir}")
+
+try:
+    data = json.loads(bundle_plugins.read_text(encoding="utf-8"))
+except Exception as exc:
+    raise SystemExit(f"ERROR: failed to read bundle plugins registry: {exc}")
+
+if not isinstance(data, list):
+    raise SystemExit("ERROR: bundle plugins registry must be a JSON array")
+
+def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
+    rel_path = pathlib.Path(rel)
+    if rel_path.is_absolute():
+        raise SystemExit(f"ERROR: {label} must be relative: {rel}")
+    target = (base / rel_path).resolve()
+    try:
+        target.relative_to(base)
+    except Exception:
+        raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
+    return target
+
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    node_id = str(item.get("id") or "").strip()
+    if not node_id:
+        raise SystemExit("ERROR: bundle plugins registry contains item without id")
+    rel = str(item.get("install_relpath") or f"custom_nodes/{node_id}").strip()
+    resolve_under(comfyui_dir, rel, f"install_relpath for node '{node_id}'")
+PY
+}
+
+bundle_stage_truth() {
+    local bundle_dir="$1"
+    local workdir="$2"
+    mkdir -p "$workdir/state"
+    cp "${bundle_dir}/pyproject.toml" "${workdir}/pyproject.toml"
+    cp "${bundle_dir}/uv.lock" "${workdir}/uv.lock"
+    cp "${bundle_dir}/state/plugins.json" "${workdir}/state/plugins.json"
+}
+
+bundle_lock_check() {
+    local workdir="$1"
+    local py="$2"
+    (
+        cd "$workdir"
+        uv lock --check --python "$py"
+    )
+}
+
+bundle_check_runtime_compatibility() {
+    local bundle_dir="$1"
+    local target_python="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$target_python" <<'PY'
+import ast
+import json
+import os
+import pathlib
+import platform
+import re
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+target_python = sys.argv[2].strip()
+bundle_project = bundle_dir / "pyproject.toml"
+manifest_path = bundle_dir / "manifest.json"
+
+match = re.fullmatch(r"(\d+)\.(\d+)", target_python)
+if not match:
+    raise SystemExit(f"ERROR: target python must be a canonical minor version, got: {target_python}")
+
+target_minor = (match.group(1), match.group(2))
+target_requires = f"=={target_minor[0]}.{target_minor[1]}.*"
+
+def implementation_version() -> str:
+    version = sys.implementation.version
+    value = f"{version.major}.{version.minor}.{version.micro}"
+    if version.releaselevel != "final":
+        suffix = {
+            "alpha": "a",
+            "beta": "b",
+            "candidate": "rc",
+        }.get(version.releaselevel, version.releaselevel)
+        value += f"{suffix}{version.serial}"
+    return value
+
+def current_marker_environment() -> dict[str, str]:
+    python_full_version = platform.python_version()
+    return {
+        "extra": "",
+        "implementation_name": sys.implementation.name,
+        "implementation_version": implementation_version(),
+        "os_name": os.name,
+        "platform_machine": platform.machine(),
+        "platform_python_implementation": platform.python_implementation(),
+        "platform_release": platform.release(),
+        "platform_system": platform.system(),
+        "platform_version": platform.version(),
+        "python_full_version": python_full_version,
+        "python_version": ".".join(python_full_version.split(".")[:2]),
+        "sys_platform": sys.platform,
+    }
+
+MARKER_ENV = current_marker_environment()
+VERSION_FIELDS = {"implementation_version", "python_full_version", "python_version"}
+
+def exact_minor_tuple(value: str):
+    exact_minor = re.fullmatch(r"==\s*(\d+)\.(\d+)\.\*", value)
+    if not exact_minor:
+        return None
+    return exact_minor.group(1), exact_minor.group(2)
+
+def normalized_version_parts(value: str):
+    parts = []
+    for token in re.split(r"[._-]", str(value).strip()):
+        if not token:
+            continue
+        parts.append(int(token) if token.isdigit() else token.lower())
+    return tuple(parts)
+
+def compare_marker_values(left, right, op, left_name: str | None, right_name: str | None) -> bool:
+    if isinstance(op, ast.In):
+        return str(left) in str(right)
+    if isinstance(op, ast.NotIn):
+        return str(left) not in str(right)
+
+    if left_name in VERSION_FIELDS or right_name in VERSION_FIELDS:
+        left_value = normalized_version_parts(left)
+        right_value = normalized_version_parts(right)
+    else:
+        left_value = str(left)
+        right_value = str(right)
+
+    if isinstance(op, ast.Eq):
+        return left_value == right_value
+    if isinstance(op, ast.NotEq):
+        return left_value != right_value
+    if isinstance(op, ast.Lt):
+        return left_value < right_value
+    if isinstance(op, ast.LtE):
+        return left_value <= right_value
+    if isinstance(op, ast.Gt):
+        return left_value > right_value
+    if isinstance(op, ast.GtE):
+        return left_value >= right_value
+    raise ValueError(f"unsupported marker operator: {ast.dump(op)}")
+
+def marker_name(node) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+def marker_value(node):
+    if isinstance(node, ast.Name):
+        if node.id not in MARKER_ENV:
+            raise ValueError(f"unsupported marker variable: {node.id}")
+        return MARKER_ENV[node.id]
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    raise ValueError(f"unsupported marker expression: {ast.dump(node)}")
+
+def eval_marker_ast(node) -> bool:
+    if isinstance(node, ast.Expression):
+        return eval_marker_ast(node.body)
+    if isinstance(node, ast.BoolOp):
+        values = [eval_marker_ast(value) for value in node.values]
+        if isinstance(node.op, ast.And):
+            return all(values)
+        if isinstance(node.op, ast.Or):
+            return any(values)
+        raise ValueError(f"unsupported boolean operator: {ast.dump(node.op)}")
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not eval_marker_ast(node.operand)
+    if isinstance(node, ast.Compare):
+        left_node = node.left
+        left_value = marker_value(left_node)
+        left_name = marker_name(left_node)
+        for op, comparator in zip(node.ops, node.comparators):
+            right_value = marker_value(comparator)
+            right_name = marker_name(comparator)
+            if not compare_marker_values(left_value, right_value, op, left_name, right_name):
+                return False
+            left_value = right_value
+            left_name = right_name
+        return True
+    raise ValueError(f"unsupported marker syntax: {ast.dump(node)}")
+
+def marker_matches_environment(marker: str) -> bool:
+    marker = marker.strip()
+    if not marker:
+        return False
+
+    try:
+        from packaging.markers import Marker
+    except ModuleNotFoundError:
+        Marker = None
+
+    if Marker is not None:
+        try:
+            return bool(Marker(marker).evaluate(environment=MARKER_ENV))
+        except Exception:
+            pass
+
+    parsed = ast.parse(marker, mode="eval")
+    return eval_marker_ast(parsed)
+
+project = {}
+if bundle_project.exists():
+    project = tomllib.loads(bundle_project.read_text(encoding="utf-8"))
+
+requires_python = str((project.get("project") or {}).get("requires-python") or "").strip()
+bundle_minor = exact_minor_tuple(requires_python)
+if bundle_minor and bundle_minor != target_minor:
+    raise SystemExit(
+        f"ERROR: bundle requires-python is {requires_python}, but target python resolves to {target_requires}"
+    )
+
+tool_uv = (project.get("tool") or {}).get("uv") or {}
+environments = tool_uv.get("environments") or []
+if isinstance(environments, str):
+    environments = [environments]
+normalized_envs = [str(item).strip() for item in environments if str(item).strip()]
+if normalized_envs:
+    if not any(marker_matches_environment(marker) for marker in normalized_envs):
+        raise SystemExit(
+            "ERROR: bundle environments do not support this host: "
+            f"markers={normalized_envs}, host={MARKER_ENV['sys_platform']}/{MARKER_ENV['platform_machine']}"
+        )
+elif manifest_path.exists():
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_system = str(manifest.get("platform_system") or "").strip()
+    manifest_machine = str(manifest.get("platform_machine") or "").strip()
+    current_system = platform.system()
+    current_machine = platform.machine()
+    if manifest_system and manifest_machine and (
+        manifest_system != current_system or manifest_machine != current_machine
+    ):
+        raise SystemExit(
+            "ERROR: bundle platform does not match this host: "
+            f"bundle={manifest_system}/{manifest_machine}, host={current_system}/{current_machine}"
+        )
+PY
+}
+
+bundle_restore_plugins_registry() {
+    local bundle_dir="$1"
+    cp "${bundle_dir}/state/plugins.json" "$PLUGINS_FILE"
+}
+
+bundle_backup_custom_nodes() {
+    local bundle_dir="$1"
+    local op_id="$2"
+    local comfyui_dir="$3"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "${OPS_DIR}/${op_id}/backup" "$comfyui_dir" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+backup_dir = pathlib.Path(sys.argv[2]).resolve()
+comfyui_dir = pathlib.Path(sys.argv[3]).resolve()
+plugins_path = bundle_dir / "state" / "plugins.json"
+backup_root = backup_dir / "custom_nodes"
+manifest_path = backup_dir / "custom_nodes_manifest.json"
+custom_nodes_root = comfyui_dir / "custom_nodes"
+backup_root.mkdir(parents=True, exist_ok=True)
+
+try:
+    data = json.loads(plugins_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    raise SystemExit(f"ERROR: failed to read bundle plugins registry: {exc}")
+
+if not isinstance(data, list):
+    raise SystemExit("ERROR: bundle plugins registry must be a JSON array")
+
+def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
+    rel_path = pathlib.Path(rel)
+    if rel_path.is_absolute():
+        raise SystemExit(f"ERROR: {label} must be relative: {rel}")
+    target = (base / rel_path).resolve()
+    try:
+        target.relative_to(base)
+    except Exception:
+        raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
+    return target
+
+if custom_nodes_root.exists() and not custom_nodes_root.is_dir():
+    raise SystemExit(f"ERROR: target custom_nodes root is not a directory: {custom_nodes_root}")
+
+records = []
+expected_custom_node_dirs = set()
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    node_id = str(item.get("id") or "").strip()
+    if not node_id:
+        raise SystemExit("ERROR: bundle plugins registry contains item without id")
+    rel = str(item.get("install_relpath") or f"custom_nodes/{node_id}").strip()
+    rel_path = pathlib.Path(rel)
+    if len(rel_path.parts) >= 2 and rel_path.parts[0] == "custom_nodes":
+        expected_custom_node_dirs.add(rel_path.parts[1])
+    target = resolve_under(comfyui_dir, rel, f"install_relpath for node '{node_id}'")
+    existed = target.exists()
+    if existed and not target.is_dir():
+        raise SystemExit(f"ERROR: target path is not a directory for node '{node_id}': {target}")
+    backup_name = ""
+    if existed:
+        backup_name = f"entry-{len(records):04d}"
+        dest = backup_root / backup_name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(target, dest)
+    records.append({
+        "node_id": node_id,
+        "install_relpath": rel,
+        "existed": existed,
+        "backup_name": backup_name,
+    })
+
+if custom_nodes_root.exists():
+    for child in sorted(custom_nodes_root.iterdir(), key=lambda p: p.name):
+        if not child.is_dir():
+            continue
+        if child.name in expected_custom_node_dirs:
+            continue
+        rel = str(child.relative_to(comfyui_dir)).replace("\\", "/")
+        backup_name = f"entry-{len(records):04d}"
+        dest = backup_root / backup_name
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(child, dest)
+        records.append({
+            "node_id": child.name,
+            "install_relpath": rel,
+            "existed": True,
+            "backup_name": backup_name,
+        })
+
+manifest_path.write_text(json.dumps({"records": records}, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
+bundle_apply_custom_nodes() {
+    local bundle_dir="$1"
+    local comfyui_dir="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$comfyui_dir" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+comfyui_dir = pathlib.Path(sys.argv[2]).resolve()
+plugins_path = bundle_dir / "state" / "plugins.json"
+custom_nodes_root = comfyui_dir / "custom_nodes"
+
+try:
+    data = json.loads(plugins_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    raise SystemExit(f"ERROR: failed to read bundle plugins registry: {exc}")
+
+if not isinstance(data, list):
+    raise SystemExit("ERROR: bundle plugins registry must be a JSON array")
+
+def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
+    rel_path = pathlib.Path(rel)
+    if rel_path.is_absolute():
+        raise SystemExit(f"ERROR: {label} must be relative: {rel}")
+    target = (base / rel_path).resolve()
+    try:
+        target.relative_to(base)
+    except Exception:
+        raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
+    return target
+
+if custom_nodes_root.exists() and not custom_nodes_root.is_dir():
+    raise SystemExit(f"ERROR: target custom_nodes root is not a directory: {custom_nodes_root}")
+
+expected_custom_node_dirs = set()
+entries = []
+for item in data:
+    if not isinstance(item, dict):
+        continue
+    node_id = str(item.get("id") or "").strip()
+    if not node_id:
+        raise SystemExit("ERROR: bundle plugins registry contains item without id")
+    rel = str(item.get("install_relpath") or f"custom_nodes/{node_id}").strip()
+    rel_path = pathlib.Path(rel)
+    if len(rel_path.parts) >= 2 and rel_path.parts[0] == "custom_nodes":
+        expected_custom_node_dirs.add(rel_path.parts[1])
+    source = bundle_dir / "custom_nodes" / node_id
+    if not source.exists() or not source.is_dir():
+        raise SystemExit(f"ERROR: bundle custom_nodes payload missing for node '{node_id}': {source}")
+    target = resolve_under(comfyui_dir, rel, f"install_relpath for node '{node_id}'")
+    entries.append((node_id, source, target))
+
+if custom_nodes_root.exists():
+    for child in sorted(custom_nodes_root.iterdir(), key=lambda p: p.name):
+        if child.is_dir() and child.name not in expected_custom_node_dirs:
+            shutil.rmtree(child)
+
+for node_id, source, target in entries:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if not target.is_dir():
+            raise SystemExit(f"ERROR: target path is not a directory for node '{node_id}': {target}")
+        shutil.rmtree(target)
+    shutil.copytree(source, target)
+PY
+}
+
+bundle_restore_custom_nodes() {
+    local op_id="$1"
+    local comfyui_dir="$2"
+    require_python
+    "${PYTHON_BIN}" - "${OPS_DIR}/${op_id}/backup" "$comfyui_dir" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+backup_dir = pathlib.Path(sys.argv[1]).resolve()
+comfyui_dir = pathlib.Path(sys.argv[2]).resolve()
+manifest_path = backup_dir / "custom_nodes_manifest.json"
+backup_root = backup_dir / "custom_nodes"
+if not manifest_path.exists():
+    raise SystemExit(0)
+
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+records = manifest.get("records", [])
+
+def resolve_under(base: pathlib.Path, rel: str, label: str) -> pathlib.Path:
+    rel_path = pathlib.Path(rel)
+    if rel_path.is_absolute():
+        raise SystemExit(f"ERROR: {label} must be relative: {rel}")
+    target = (base / rel_path).resolve()
+    try:
+        target.relative_to(base)
+    except Exception:
+        raise SystemExit(f"ERROR: {label} escapes base directory: {rel}")
+    return target
+
+for record in records:
+    if not isinstance(record, dict):
+        continue
+    node_id = str(record.get("node_id") or "").strip()
+    rel = str(record.get("install_relpath") or f"custom_nodes/{node_id}").strip()
+    backup_name = str(record.get("backup_name") or "").strip()
+    target = resolve_under(comfyui_dir, rel, f"install_relpath for node '{node_id}'")
+    if target.exists():
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    if record.get("existed"):
+        if not backup_name:
+            raise SystemExit(f"ERROR: custom_nodes backup marker missing for node '{node_id}'")
+        source = backup_root / backup_name
+        if not source.exists() or not source.is_dir():
+            raise SystemExit(f"ERROR: custom_nodes backup missing for node '{node_id}': {source}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, target)
+PY
+}
+
+bundle_backup_config() {
+    local op_id="$1"
+    local backup_dir="${OPS_DIR}/${op_id}/backup"
+    backup_file_with_marker "$CONFIG_FILE" "${backup_dir}/config.toml" "${backup_dir}/config.toml.present"
+}
+
+bundle_restore_config() {
+    local op_id="$1"
+    local backup_dir="${OPS_DIR}/${op_id}/backup"
+    restore_file_with_marker "${backup_dir}/config.toml" "$CONFIG_FILE" "${backup_dir}/config.toml.present"
+}
+
+bundle_node_count() {
+    local plugins_file="$1"
+    require_python
+    "${PYTHON_BIN}" - "$plugins_file" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+except Exception:
+    data = []
+count = 0
+for item in data:
+    if isinstance(item, dict) and str(item.get("id") or "").strip():
+        count += 1
+print(count)
+PY
+}
+
 write_group_deps() {
     local pyproject_file="$1"
     local group="$2"
@@ -733,10 +2056,11 @@ out_file = pathlib.Path(sys.argv[3])
 
 deps = []
 if pyproject.exists():
+    text = pyproject.read_text(encoding="utf-8")
     try:
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except Exception:
-        data = {}
+        data = tomllib.loads(text)
+    except Exception as exc:
+        raise SystemExit(f"ERROR: failed to parse pyproject.toml: {exc}")
     groups = data.get("dependency-groups", {})
     raw = groups.get(group, []) if isinstance(groups, dict) else []
     if isinstance(raw, list):
@@ -748,6 +2072,54 @@ PY
 
 migrate_plugins_registry() {
     require_python
+    # Guard: skip migration if all entries already match the target schema.
+    # This check must stay in sync with the migration output shape below.
+    if "${PYTHON_BIN}" - "$PLUGINS_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(0)
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+if not isinstance(data, list):
+    raise SystemExit(1)
+if not data:
+    raise SystemExit(0)
+
+REQUIRED_TYPED = {
+    "id": str, "install_relpath": str, "group": str,
+    "enabled": bool, "created_at": str, "updated_at": str,
+    "git_url": str, "ref": str, "managed_deps": list,
+}
+for item in data:
+    if not isinstance(item, dict):
+        raise SystemExit(1)
+    for key, expected_type in REQUIRED_TYPED.items():
+        if key not in item or not isinstance(item[key], expected_type):
+            raise SystemExit(1)
+    if not item["id"].strip():
+        raise SystemExit(1)
+    if not item["install_relpath"].strip():
+        raise SystemExit(1)
+    if not item["group"].strip():
+        raise SystemExit(1)
+    if not item["created_at"].strip():
+        raise SystemExit(1)
+    if not item["updated_at"].strip():
+        raise SystemExit(1)
+    for dep in item["managed_deps"]:
+        if not isinstance(dep, str) or not dep.strip():
+            raise SystemExit(1)
+raise SystemExit(0)
+PY
+    then
+        return 0
+    fi
     "${PYTHON_BIN}" - "$PLUGINS_FILE" "$PROJECT_FILE" "$(comfyui_dir_path)" "$(timestamp_utc)" <<'PY'
 import json
 import pathlib
@@ -914,6 +2286,20 @@ for item in data:
         raise SystemExit(0)
 
 raise SystemExit(1)
+PY
+}
+
+plugin_meta_fields() {
+    local meta_json="$1"
+    require_python
+    "${PYTHON_BIN}" - "$meta_json" <<'PY'
+import json
+import pathlib
+import sys
+
+m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(m.get("install_relpath") or f"custom_nodes/{m.get('id', '')}")
+print(m.get("group") or f"node-{m.get('id', '')}")
 PY
 }
 
@@ -1167,9 +2553,10 @@ tx_set_conflict() {
     local tx_file="$1"
     local conflict_path="$2"
     local status="$3"
-    local pre_op_id="$4"
+    local update_promotion="${4:-false}"
+    local pre_op_id="${5:-}"
     require_python
-    "${PYTHON_BIN}" - "$tx_file" "$conflict_path" "$status" "$pre_op_id" "$(timestamp_utc)" <<'PY'
+    "${PYTHON_BIN}" - "$tx_file" "$conflict_path" "$status" "$update_promotion" "$pre_op_id" "$(timestamp_utc)" <<'PY'
 import json
 import pathlib
 import sys
@@ -1177,40 +2564,19 @@ import sys
 tx_file = pathlib.Path(sys.argv[1])
 conflict_path = sys.argv[2]
 status = sys.argv[3]
-pre_op_id = sys.argv[4]
-ended_at = sys.argv[5]
+update_promotion = sys.argv[4] == "true"
+pre_op_id = sys.argv[5]
+ended_at = sys.argv[6]
 
 tx = json.loads(tx_file.read_text(encoding="utf-8"))
 tx["status"] = status
 tx["ended_at"] = ended_at
 tx["conflict_report"] = conflict_path
-prom = tx.get("promotion", {})
-prom["status"] = "lock_failed"
-prom["pre_op_id"] = pre_op_id
-tx["promotion"] = prom
-tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
-PY
-}
-
-update_tx_set_conflict() {
-    local tx_file="$1"
-    local conflict_path="$2"
-    local status="$3"
-    require_python
-    "${PYTHON_BIN}" - "$tx_file" "$conflict_path" "$status" "$(timestamp_utc)" <<'PY'
-import json
-import pathlib
-import sys
-
-tx_file = pathlib.Path(sys.argv[1])
-conflict_path = sys.argv[2]
-status = sys.argv[3]
-ended_at = sys.argv[4]
-
-tx = json.loads(tx_file.read_text(encoding="utf-8"))
-tx["status"] = status
-tx["ended_at"] = ended_at
-tx["conflict_report"] = conflict_path
+if update_promotion:
+    prom = tx.get("promotion", {})
+    prom["status"] = "lock_failed"
+    prom["pre_op_id"] = pre_op_id
+    tx["promotion"] = prom
 tx_file.write_text(json.dumps(tx, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 PY
 }
@@ -1590,7 +2956,9 @@ def read_lines(path: str):
     return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 def normalize_name(spec: str):
-    token = re.split(r"[<>=!~\[]", spec, maxsplit=1)[0].strip()
+    token = re.split(r"[<>=!~;\[]", spec, maxsplit=1)[0].strip()
+    if "@" in token:
+        token = token.split("@", 1)[0].strip()
     return re.sub(r"[-_.]+", "-", token).lower()
 
 pre = read_lines(pre_file)
@@ -1695,7 +3063,7 @@ def read_lines(path: str):
     return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 def normalize_name(spec: str):
-    token = re.split(r"[<>=!~\[]", spec, maxsplit=1)[0].strip()
+    token = re.split(r"[<>=!~;\[]", spec, maxsplit=1)[0].strip()
     if "@" in token:
         token = token.split("@", 1)[0].strip()
     return re.sub(r"[-_.]+", "-", token).lower()
@@ -1784,14 +3152,22 @@ cmd_init() {
         esac
     done
 
+    local resolved_python_override=""
+    if [ -n "$python_override" ]; then
+        resolved_python_override="$(resolve_python_minor "$python_override")"
+    fi
+
     ensure_layout
-    ensure_config_file_for_init "$comfyui_dir_override" "$python_override"
+    ensure_config_file_for_init "$comfyui_dir_override" "$resolved_python_override"
     ensure_project_file_for_init
 
-    local prod_env py comfyui_dir
-    prod_env="$(prod_env_path)"
-    py="$(configured_python)"
+    local prod_env py comfyui_dir environment_marker
     comfyui_dir="$(comfyui_dir_path)"
+    py="$(canonicalize_python_minor "$(configured_python)")"
+    ensure_config_file_for_init "$comfyui_dir" "$py"
+    environment_marker="$(current_uv_environment_marker)"
+    sync_project_runtime_constraints "$PROJECT_FILE" "$py" "$environment_marker"
+    prod_env="$(prod_env_path)"
 
     lock_project_exact "$ROOT_DIR" "$py"
     sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py"
@@ -1934,26 +3310,11 @@ cmd_node_remove() {
     fi
 
     local group plugin_relpath plugin_path
-    group="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(meta.get("group") or f"node-{meta.get('id')}")
-PY
-)"
+    { read -r plugin_relpath; read -r group; } < <(plugin_meta_fields "$meta_json")
     group="$(normalize_group_name "$group")"
     if [ -z "$group" ]; then
         group="$(group_name_for_node "$node_id")"
     fi
-    plugin_relpath="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-meta = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(meta.get("install_relpath") or f"custom_nodes/{meta.get('id', '')}")
-PY
-)"
     plugin_path="$(plugin_install_abs_path "$plugin_relpath")"
 
     local op_id
@@ -2148,24 +3509,37 @@ print(f"run_exit_code: {logs.get('run_exit_code', '')}")
 PY
 }
 
+_cmd_abort_impl() {
+    local txid="$1"
+    local expected_kind="$2"
+    local label="$3"
+
+    load_tx "$txid"
+    tx_assert_kind "$expected_kind"
+
+    local candidate_env staged_workdir
+    candidate_env="$(tx_get_field "$TX_FILE" "candidate_env" "")"
+    staged_workdir="$(tx_get_field "$TX_FILE" "staged_workdir" "")"
+
+    if [ -n "$candidate_env" ] && [ -d "$candidate_env" ]; then
+        rm -rf "$candidate_env"
+    fi
+    if [ -n "$staged_workdir" ] && [ -d "$staged_workdir" ]; then
+        rm -rf "$staged_workdir"
+    fi
+
+    tx_update_status "$TX_FILE" "aborted"
+    echo "${label} aborted."
+    echo "  txid: $txid"
+}
+
 cmd_tx_abort() {
     local txid="${1:-}"
     if [ -z "$txid" ]; then
         echo "Usage: gov tx abort <txid>" >&2
         exit 1
     fi
-    load_tx "$txid"
-    tx_assert_kind "plugin"
-
-    local candidate_env
-    candidate_env="$(tx_get_field "$TX_FILE" "candidate_env" "")"
-    if [ -n "$candidate_env" ] && [ -d "$candidate_env" ]; then
-        rm -rf "$candidate_env"
-    fi
-
-    tx_update_status "$TX_FILE" "aborted"
-    echo "Transaction aborted."
-    echo "  txid: $txid"
+    _cmd_abort_impl "$txid" "plugin" "Transaction"
 }
 cmd_resolve() {
     require_cmd uv
@@ -2255,23 +3629,8 @@ PY
         exit 1
     fi
 
-    plugin_relpath="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(m.get("install_relpath") or f"custom_nodes/{m.get('id', '')}")
-PY
-)"
+    { read -r plugin_relpath; read -r group; } < <(plugin_meta_fields "$meta_json")
     plugin_path="$(plugin_install_abs_path "$plugin_relpath")"
-    group="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(m.get("group") or f"node-{m.get('id', '')}")
-PY
-)"
     group="$(normalize_group_name "$group")"
     if [ -z "$group" ]; then
         group="$(group_name_for_node "$node_id")"
@@ -2295,7 +3654,7 @@ PY
     else
         report="$(write_conflict_report "$txid" "$node_id" "$lock_log")"
         tx_set_resolution_pins "$TX_FILE" "$merged_pins" "needs_resolution"
-        tx_set_conflict "$TX_FILE" "$report" "needs_resolution" ""
+        tx_set_conflict "$TX_FILE" "$report" "needs_resolution" "true" ""
         echo "Resolve failed."
         echo "  txid: $txid"
         echo "  conflict_report: $report"
@@ -2380,23 +3739,8 @@ cmd_tx_promote() {
         exit 1
     fi
 
-    plugin_relpath="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(m.get("install_relpath") or f"custom_nodes/{m.get('id', '')}")
-PY
-)"
+    { read -r plugin_relpath; read -r group; } < <(plugin_meta_fields "$meta_json")
     plugin_path="$(plugin_install_abs_path "$plugin_relpath")"
-    group="$("${PYTHON_BIN}" - "$meta_json" <<'PY'
-import json
-import pathlib
-import sys
-m = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(m.get("group") or f"node-{m.get('id', '')}")
-PY
-)"
     group="$(normalize_group_name "$group")"
     if [ -z "$group" ]; then
         group="$(group_name_for_node "$node_id")"
@@ -2419,7 +3763,7 @@ PY
     lock_log="${CONFLICT_DIR}/${txid}.promote.lock.log"
     if ! apply_plan_in_workdir "$workdir" "$group" "$direct_file" "$override_file" "$lock_log"; then
         conflict_report="$(write_conflict_report "$txid" "$node_id" "$lock_log")"
-        tx_set_conflict "$TX_FILE" "$conflict_report" "needs_resolution" "$op_id"
+        tx_set_conflict "$TX_FILE" "$conflict_report" "needs_resolution" "true" "$op_id"
         op_restore_backup "$op_id" || true
         op_finalize "$op_id" "failed" "false" "promote lock conflict"
         echo "Promote blocked by lock conflict."
@@ -2444,30 +3788,16 @@ PY
         exit 1
     fi
 
-    local smoke_cmd
-    smoke_cmd="$(smoke_test_cmd)"
-    if [ -n "$smoke_cmd" ]; then
-        local comfyui_dir
-        comfyui_dir="$(comfyui_dir_path)"
-        if ! (cd "$comfyui_dir" && PATH="$prod_env/bin:$PATH" bash -lc "$smoke_cmd"); then
-            echo "ERROR: smoke test failed, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            tx_set_promote_failed "$TX_FILE" "$op_id" "smoke test failed"
-            op_finalize "$op_id" "failed" "false" "smoke test failed"
-            rm -f "$meta_json" "$plan_json" "$pins_file"
-            exit 1
-        fi
-    else
-        if ! "$prod_env/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1; then
-            echo "ERROR: default smoke test failed, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            tx_set_promote_failed "$TX_FILE" "$op_id" "default smoke test failed"
-            op_finalize "$op_id" "failed" "false" "default smoke test failed"
-            rm -f "$meta_json" "$plan_json" "$pins_file"
-            exit 1
-        fi
+    local comfyui_dir
+    comfyui_dir="$(comfyui_dir_path)"
+    if ! run_smoke_test_in_env "$prod_env" "$comfyui_dir"; then
+        echo "ERROR: smoke test failed, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        tx_set_promote_failed "$TX_FILE" "$op_id" "smoke test failed"
+        op_finalize "$op_id" "failed" "false" "smoke test failed"
+        rm -f "$meta_json" "$plan_json" "$pins_file"
+        exit 1
     fi
 
     tx_set_promoted "$TX_FILE" "$op_id" "$reason"
@@ -2487,23 +3817,66 @@ cmd_install_torch() {
     ensure_project_file_for_init
 
     local index_url=""
+    local torch_spec=""
+    local torchvision_spec=""
+    local torchaudio_spec=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --index-url)
                 index_url="${2:-}"
                 shift 2
                 ;;
+            --torch)
+                torch_spec="${2:-}"
+                shift 2
+                ;;
+            --torchvision)
+                torchvision_spec="${2:-}"
+                shift 2
+                ;;
+            --torchaudio)
+                torchaudio_spec="${2:-}"
+                shift 2
+                ;;
             *)
-                echo "Usage: gov install torch --index-url <url>" >&2
+                echo "Usage: gov install torch --index-url <url> [--torch <torch==version>] [--torchvision <torchvision==version>] [--torchaudio <torchaudio==version>]" >&2
                 exit 1
                 ;;
         esac
     done
 
     if [ -z "$index_url" ]; then
-        echo "Usage: gov install torch --index-url <url>" >&2
+        echo "Usage: gov install torch --index-url <url> [--torch <torch==version>] [--torchvision <torchvision==version>] [--torchaudio <torchaudio==version>]" >&2
         exit 1
     fi
+
+    local custom_torch_specs=false
+    local dep_name
+    for dep_name in torch torchvision torchaudio; do
+        local spec_value=""
+        case "$dep_name" in
+            torch)
+                spec_value="$torch_spec"
+                ;;
+            torchvision)
+                spec_value="$torchvision_spec"
+                ;;
+            torchaudio)
+                spec_value="$torchaudio_spec"
+                ;;
+        esac
+        if [ -n "$spec_value" ]; then
+            custom_torch_specs=true
+            if [[ ! "$spec_value" =~ ^[A-Za-z0-9_.-]+==[^[:space:]]+$ ]]; then
+                echo "ERROR: invalid ${dep_name} spec: $spec_value (expected ${dep_name}==version)" >&2
+                exit 1
+            fi
+            if [ "$(normalize_dep_name "$spec_value")" != "$dep_name" ]; then
+                echo "ERROR: ${dep_name} flag must target package '${dep_name}': $spec_value" >&2
+                exit 1
+            fi
+        fi
+    done
 
     local py prod_env workdir index_name op_id
     py="$(configured_python)"
@@ -2511,11 +3884,29 @@ cmd_install_torch() {
     workdir="$(build_workdir_for_tx "install-torch")"
     index_name="$(torch_index_name_from_url "$index_url")"
 
-    (
+    if ! (
         cd "$workdir"
         uv add --group torch --python "$py" --index "${index_name}=${index_url}" --no-sync torch torchvision torchaudio
-        uv lock --python "$py"
-    )
+    ); then
+        echo "ERROR: install torch failed during staging" >&2
+        exit 1
+    fi
+
+    if [ "$custom_torch_specs" = true ]; then
+        local -a desired_torch_specs=("torch" "torchvision" "torchaudio")
+        [ -n "$torch_spec" ] && desired_torch_specs[0]="$torch_spec"
+        [ -n "$torchvision_spec" ] && desired_torch_specs[1]="$torchvision_spec"
+        [ -n "$torchaudio_spec" ] && desired_torch_specs[2]="$torchaudio_spec"
+        if ! rewrite_dependency_group "$workdir/pyproject.toml" "torch" "replace_exact" "${desired_torch_specs[@]}"; then
+            echo "ERROR: install torch failed while updating managed torch specs" >&2
+            exit 1
+        fi
+    fi
+
+    if ! lock_project_exact "$workdir" "$py"; then
+        echo "ERROR: install torch failed during lock" >&2
+        exit 1
+    fi
 
     if files_are_identical "$PROJECT_FILE" "$workdir/pyproject.toml" && files_are_identical "$LOCK_FILE" "$workdir/uv.lock"; then
         echo "No changes."
@@ -2549,6 +3940,9 @@ cmd_install_torch() {
     echo "Torch dependencies installed."
     echo "  op_id: $op_id"
     echo "  index: ${index_name}=${index_url}"
+    if [ "$custom_torch_specs" = true ]; then
+        echo "  managed specs: torch=${torch_spec:-torch} torchvision=${torchvision_spec:-torchvision} torchaudio=${torchaudio_spec:-torchaudio}"
+    fi
 }
 
 cmd_install_core() {
@@ -2609,27 +4003,15 @@ cmd_install_core() {
         exit 1
     fi
 
-    local smoke_cmd comfyui_dir
-    smoke_cmd="$(smoke_test_cmd)"
+    local comfyui_dir
     comfyui_dir="$(comfyui_dir_path)"
-    if [ -n "$smoke_cmd" ]; then
-        if ! (cd "$comfyui_dir" && PATH="$prod_env/bin:$PATH" bash -lc "$smoke_cmd"); then
-            echo "ERROR: smoke test failed during install, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            op_finalize "$op_id" "failed" "false" "install core failed: smoke test failed"
-            rm -f "$deps_file"
-            exit 1
-        fi
-    else
-        if ! "$prod_env/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1; then
-            echo "ERROR: default smoke test failed during install, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            op_finalize "$op_id" "failed" "false" "install core failed: default smoke test failed"
-            rm -f "$deps_file"
-            exit 1
-        fi
+    if ! run_smoke_test_in_env "$prod_env" "$comfyui_dir"; then
+        echo "ERROR: smoke test failed during install, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        op_finalize "$op_id" "failed" "false" "install core failed: smoke test failed"
+        rm -f "$deps_file"
+        exit 1
     fi
 
     op_finalize "$op_id" "success" "true" "install core succeeded"
@@ -2717,7 +4099,7 @@ cmd_update_run() {
         conflict_report="$(write_conflict_report "$txid" "core" "$lock_log")"
         ended_at="$(timestamp_utc)"
         write_update_tx_file "$TX_FILE" "$txid" "needs_resolution" "$started_at" "$ended_at" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "-1" "$(core_packages_csv)" "$requirements_file" "$req_sha" "$workdir" "$deps_file"
-        update_tx_set_conflict "$TX_FILE" "$conflict_report" "needs_resolution"
+        tx_set_conflict "$TX_FILE" "$conflict_report" "needs_resolution" "false"
         rm -f "$deps_file"
         echo "Core update blocked by lock conflict."
         echo "  txid: $txid"
@@ -2939,7 +4321,7 @@ PY
     ) >"$lock_log" 2>&1; then
         report="$(write_conflict_report "$txid" "core" "$lock_log")"
         tx_set_resolution_pins "$TX_FILE" "$merged_pins" "needs_resolution"
-        update_tx_set_conflict "$TX_FILE" "$report" "needs_resolution"
+        tx_set_conflict "$TX_FILE" "$report" "needs_resolution" "false"
         rm -f "$new_pins" "$merged_pins"
         echo "Resolve failed."
         echo "  txid: $txid"
@@ -2948,7 +4330,7 @@ PY
     fi
 
     tx_set_resolution_pins "$TX_FILE" "$merged_pins" "resolved"
-    update_tx_set_conflict "$TX_FILE" "" "resolved"
+    tx_set_conflict "$TX_FILE" "" "resolved" "false"
 
     rm -f "$new_pins" "$merged_pins"
     echo "Resolve succeeded."
@@ -2995,7 +4377,7 @@ cmd_update_promote() {
     load_tx "$txid"
     tx_assert_kind "core_update"
 
-    local status core_count staged_workdir py op_id prod_env smoke_cmd comfyui_dir
+    local status core_count staged_workdir py op_id prod_env comfyui_dir
     status="$(tx_get_field "$TX_FILE" "status" "")"
     core_count="$(tx_get_field "$TX_FILE" "core_impact" "" | sed '/^$/d' | wc -l | tr -d ' ')"
     staged_workdir="$(tx_get_field "$TX_FILE" "staged_workdir" "")"
@@ -3040,26 +4422,14 @@ cmd_update_promote() {
         exit 1
     fi
 
-    smoke_cmd="$(smoke_test_cmd)"
     comfyui_dir="$(comfyui_dir_path)"
-    if [ -n "$smoke_cmd" ]; then
-        if ! (cd "$comfyui_dir" && PATH="$prod_env/bin:$PATH" bash -lc "$smoke_cmd"); then
-            echo "ERROR: smoke test failed during update promote, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            tx_set_promote_failed "$TX_FILE" "$op_id" "smoke test failed"
-            op_finalize "$op_id" "failed" "false" "update promote failed: smoke test failed"
-            exit 1
-        fi
-    else
-        if ! "$prod_env/bin/python" -c "import sys; print(sys.version)" >/dev/null 2>&1; then
-            echo "ERROR: default smoke test failed during update promote, restoring pre-operation state: $op_id" >&2
-            op_restore_backup "$op_id"
-            sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
-            tx_set_promote_failed "$TX_FILE" "$op_id" "default smoke test failed"
-            op_finalize "$op_id" "failed" "false" "update promote failed: default smoke test failed"
-            exit 1
-        fi
+    if ! run_smoke_test_in_env "$prod_env" "$comfyui_dir"; then
+        echo "ERROR: smoke test failed during update promote, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        tx_set_promote_failed "$TX_FILE" "$op_id" "smoke test failed"
+        op_finalize "$op_id" "failed" "false" "update promote failed: smoke test failed"
+        exit 1
     fi
 
     tx_set_promoted "$TX_FILE" "$op_id" "$reason"
@@ -3077,24 +4447,198 @@ cmd_update_abort() {
         echo "Usage: gov update abort <txid>" >&2
         exit 1
     fi
+    _cmd_abort_impl "$txid" "core_update" "Core update"
+}
 
-    load_tx "$txid"
-    tx_assert_kind "core_update"
+env_import_restore_after_failure() {
+    local op_id="$1"
+    local comfyui_dir="$2"
+    local restore_py="$3"
 
-    local candidate_env staged_workdir
-    candidate_env="$(tx_get_field "$TX_FILE" "candidate_env" "")"
-    staged_workdir="$(tx_get_field "$TX_FILE" "staged_workdir" "")"
+    bundle_restore_config "$op_id" || true
+    bundle_restore_custom_nodes "$op_id" "$comfyui_dir" || true
+    op_restore_backup "$op_id" || true
 
-    if [ -n "$candidate_env" ] && [ -d "$candidate_env" ]; then
-        rm -rf "$candidate_env"
+    local prod_env
+    prod_env="$(prod_env_path)"
+    if [ -f "$PROJECT_FILE" ]; then
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$restore_py" || true
+    else
+        rm -rf "$prod_env"
     fi
-    if [ -n "$staged_workdir" ] && [ -d "$staged_workdir" ]; then
-        rm -rf "$staged_workdir"
+}
+
+cmd_env_export() {
+    require_cmd uv
+    ensure_layout
+
+    local output_dir="${1:-}"
+    if [ -z "$output_dir" ]; then
+        echo "Usage: gov env export <output_dir>" >&2
+        exit 1
     fi
 
-    tx_update_status "$TX_FILE" "aborted"
-    echo "Core update aborted."
-    echo "  txid: $txid"
+    if [ ! -f "$PROJECT_FILE" ]; then
+        echo "ERROR: missing $PROJECT_FILE" >&2
+        exit 1
+    fi
+    if [ ! -f "$LOCK_FILE" ]; then
+        echo "ERROR: missing $LOCK_FILE" >&2
+        exit 1
+    fi
+    if [ ! -f "$PLUGINS_FILE" ]; then
+        echo "ERROR: missing $PLUGINS_FILE" >&2
+        exit 1
+    fi
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "ERROR: missing $CONFIG_FILE" >&2
+        exit 1
+    fi
+
+    local comfyui_dir
+    comfyui_dir="$(comfyui_dir_path)"
+    if [ ! -d "$comfyui_dir" ]; then
+        echo "ERROR: ComfyUI directory not found: $comfyui_dir" >&2
+        exit 1
+    fi
+
+    if [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; then
+        echo "ERROR: export path exists and is not a directory: $output_dir" >&2
+        exit 1
+    fi
+    if [ -d "$output_dir" ] && [ -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+        echo "ERROR: export directory is not empty: $output_dir" >&2
+        exit 1
+    fi
+
+    mkdir -p "$output_dir/state" "$output_dir/audit" "$output_dir/custom_nodes"
+
+    cp "$PROJECT_FILE" "$output_dir/pyproject.toml"
+    cp "$LOCK_FILE" "$output_dir/uv.lock"
+    cp "$PLUGINS_FILE" "$output_dir/state/plugins.json"
+    bundle_export_pylock "$output_dir"
+    bundle_copy_custom_nodes "$output_dir" "$comfyui_dir" "$PLUGINS_FILE"
+
+    local prod_env created_at node_count
+    prod_env="$(prod_env_path)"
+    collect_freeze_file "$prod_env" "$output_dir/audit/prod-freeze.txt"
+    created_at="$(timestamp_utc)"
+    bundle_write_export_summary "$output_dir" "$created_at"
+    bundle_manifest_write "$output_dir" "$created_at"
+    node_count="$(bundle_node_count "$output_dir/state/plugins.json")"
+
+    echo "Environment bundle exported."
+    echo "  output_dir: $output_dir"
+    echo "  python: $(configured_python)"
+    echo "  node_count: $node_count"
+    echo "  manifest: $output_dir/manifest.json"
+}
+
+cmd_env_import() {
+    require_cmd uv
+
+    local bundle_dir="${1:-}"
+    shift || true
+    if [ -z "$bundle_dir" ]; then
+        echo "Usage: gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>" >&2
+        exit 1
+    fi
+
+    local comfyui_dir=""
+    local python_spec=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --comfyui-dir)
+                comfyui_dir="${2:-}"
+                shift 2
+                ;;
+            --python)
+                python_spec="${2:-}"
+                shift 2
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ -z "$comfyui_dir" ] || [ -z "$python_spec" ]; then
+        echo "Usage: gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>" >&2
+        exit 1
+    fi
+
+    local normalized_python
+    normalized_python="$(resolve_python_minor "$python_spec")"
+
+    bundle_manifest_verify "$bundle_dir"
+    bundle_check_runtime_compatibility "$bundle_dir" "$normalized_python"
+
+    local pre_restore_py current_prod_env
+    pre_restore_py="$(config_get "runtime.python" "$normalized_python")"
+    current_prod_env="$(prod_env_path)"
+    bundle_check_import_conflicts "$bundle_dir" "$comfyui_dir"
+
+    local op_id
+    op_id="$(op_begin "env_import" "$bundle_dir")"
+    bundle_backup_config "$op_id"
+    bundle_backup_custom_nodes "$bundle_dir" "$op_id" "$comfyui_dir"
+
+    local workdir
+    workdir="${WORK_DIR}/env-import-${op_id}"
+    rm -rf "$workdir"
+    mkdir -p "$workdir"
+    bundle_stage_truth "$bundle_dir" "$workdir"
+
+    if ! bundle_lock_check "$workdir" "$normalized_python"; then
+        echo "ERROR: bundle lock check failed" >&2
+        env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
+        op_finalize "$op_id" "failed" "false" "env import failed: bundle lock check failed"
+        exit 1
+    fi
+
+    if ! sync_project_env_exact "$workdir" "$current_prod_env" "$normalized_python"; then
+        echo "ERROR: prod sync failed during env import" >&2
+        env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
+        op_finalize "$op_id" "failed" "false" "env import failed: prod sync failed"
+        exit 1
+    fi
+
+    if ! bundle_apply_custom_nodes "$bundle_dir" "$comfyui_dir"; then
+        echo "ERROR: failed to restore custom_nodes payload" >&2
+        env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
+        op_finalize "$op_id" "failed" "false" "env import failed: custom_nodes restore failed"
+        exit 1
+    fi
+
+    cp "${workdir}/pyproject.toml" "$PROJECT_FILE"
+    cp "${workdir}/uv.lock" "$LOCK_FILE"
+    bundle_restore_plugins_registry "$bundle_dir"
+
+    if ! ensure_config_file_for_init "$comfyui_dir" "$normalized_python"; then
+        echo "ERROR: failed to update config.toml during env import" >&2
+        env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
+        op_finalize "$op_id" "failed" "false" "env import failed: config update failed"
+        exit 1
+    fi
+
+    local final_prod_env
+    final_prod_env="$(prod_env_path)"
+    if ! run_smoke_test_in_env "$final_prod_env" "$comfyui_dir"; then
+        echo "ERROR: smoke test failed during env import" >&2
+        env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
+        op_finalize "$op_id" "failed" "false" "env import failed: smoke test failed"
+        exit 1
+    fi
+
+    op_finalize "$op_id" "success" "false" "env import succeeded"
+    ops_prune
+
+    echo "Environment bundle imported."
+    echo "  bundle_dir: $bundle_dir"
+    echo "  comfyui_dir: $comfyui_dir"
+    echo "  python: $normalized_python"
+    echo "  op_id: $op_id"
 }
 
 cmd_status() {
@@ -3196,6 +4740,216 @@ else:
         subject = item.get("subject") or item.get("node_id") or "(unknown)"
         print(f"  - {item.get('txid')} [{item.get('status')}] kind={kind} subject={subject}")
 PY
+}
+
+apply_staged_pin_change() {
+    local workdir="$1"
+    local op_kind="$2"
+    local op_ref="$3"
+    local success_note="$4"
+    local action_label="$5"
+
+    local py prod_env comfyui_dir op_id
+    py="$(configured_python)"
+    prod_env="$(prod_env_path)"
+    comfyui_dir="$(comfyui_dir_path)"
+    op_id="$(op_begin "$op_kind" "$op_ref")"
+
+    cp "$workdir/pyproject.toml" "$PROJECT_FILE"
+    cp "$workdir/uv.lock" "$LOCK_FILE"
+
+    if ! sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py"; then
+        echo "ERROR: prod sync failed during ${action_label}, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        op_finalize "$op_id" "failed" "false" "${action_label} failed: prod sync failed"
+        return 1
+    fi
+
+    if ! run_smoke_test_in_env "$prod_env" "$comfyui_dir"; then
+        echo "ERROR: smoke test failed during ${action_label}, restoring pre-operation state: $op_id" >&2
+        op_restore_backup "$op_id"
+        sync_project_env_exact "$ROOT_DIR" "$prod_env" "$py" || true
+        op_finalize "$op_id" "failed" "false" "${action_label} failed: smoke test failed"
+        return 1
+    fi
+
+    op_finalize "$op_id" "success" "true" "$success_note"
+    ops_prune
+
+    echo "$op_id"
+}
+
+cmd_pin_list() {
+    ensure_layout
+    require_python
+
+    if [ $# -ne 0 ]; then
+        echo "Usage: gov pin list" >&2
+        exit 1
+    fi
+
+    local pins_file
+    pins_file="$(mktemp)"
+    write_group_deps "$PROJECT_FILE" "overrides" "$pins_file"
+
+    if [ ! -s "$pins_file" ]; then
+        rm -f "$pins_file"
+        echo "No pins in overrides group."
+        return 0
+    fi
+
+    cat "$pins_file"
+    rm -f "$pins_file"
+}
+
+cmd_pin_add() {
+    require_cmd uv
+    ensure_layout
+    ensure_project_file_for_init
+    require_python
+
+    local -a specs=()
+    local -a deduped_specs=()
+    local -a present_target_names=()
+    local spec dep_name
+
+    while [ $# -gt 0 ]; do
+        specs+=("$1")
+        shift
+    done
+
+    if [ "${#specs[@]}" -eq 0 ]; then
+        echo "Usage: gov pin add <pkg==version>..." >&2
+        exit 1
+    fi
+
+    for spec in "${specs[@]}"; do
+        if [[ ! "$spec" =~ ^[A-Za-z0-9_.-]+==[^[:space:]]+$ ]]; then
+            echo "ERROR: invalid pin format: $spec (expected pkg==version)" >&2
+            exit 1
+        fi
+        dep_name="$(normalize_dep_name "$spec")"
+        if [ -z "$dep_name" ]; then
+            echo "ERROR: invalid pin format: $spec (expected pkg==version)" >&2
+            exit 1
+        fi
+        if torch_family_dep_name_is_managed "$dep_name"; then
+            echo "ERROR: torch-family packages are managed by 'gov install torch'. Use 'gov install torch --index-url <url> [--torch <torch==version>] [--torchvision <torchvision==version>] [--torchaudio <torchaudio==version>]' instead." >&2
+            exit 1
+        fi
+    done
+
+    local deduped_specs_file
+    deduped_specs_file="$(mktemp)"
+    write_pin_specs_last_wins "$deduped_specs_file" "${specs[@]}"
+    mapfile -t deduped_specs < "$deduped_specs_file"
+    rm -f "$deduped_specs_file"
+
+    warn_for_unrecommended_pin_specs "${deduped_specs[@]}"
+
+    local workdir py op_id present_names_file
+    workdir="$(build_workdir_for_tx "pin-add-$(_random_hex8)")"
+    py="$(configured_python)"
+    present_names_file="$(mktemp)"
+
+    write_group_names_matching_specs "$workdir/pyproject.toml" "overrides" "$present_names_file" "${deduped_specs[@]}"
+    mapfile -t present_target_names < "$present_names_file"
+    rm -f "$present_names_file"
+
+    if ! (
+        cd "$workdir"
+        if [ "${#present_target_names[@]}" -ne 0 ]; then
+            uv remove --group overrides --python "$py" --frozen "${present_target_names[@]}"
+        fi
+        uv add --group overrides --python "$py" --frozen "${deduped_specs[@]}"
+    ); then
+        echo "ERROR: pin add failed while updating overrides" >&2
+        exit 1
+    fi
+    if ! lock_project_exact "$workdir" "$py"; then
+        echo "ERROR: pin add failed during lock" >&2
+        exit 1
+    fi
+
+    op_id="$(apply_staged_pin_change "$workdir" "pin_add" "${deduped_specs[*]}" "pin add succeeded: ${deduped_specs[*]}" "pin add")" || {
+        exit 1
+    }
+
+    echo "Pins added."
+    echo "  specs: ${deduped_specs[*]}"
+    echo "  op_id: $op_id"
+}
+
+cmd_pin_remove() {
+    require_cmd uv
+    ensure_layout
+    ensure_project_file_for_init
+    require_python
+
+    local -a packages=()
+    local -a normalized_packages=()
+    local pkg dep_name existing seen
+
+    while [ $# -gt 0 ]; do
+        packages+=("$1")
+        shift
+    done
+
+    if [ "${#packages[@]}" -eq 0 ]; then
+        echo "Usage: gov pin remove <pkg>..." >&2
+        exit 1
+    fi
+
+    for pkg in "${packages[@]}"; do
+        if [[ ! "$pkg" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "ERROR: invalid package name: $pkg" >&2
+            exit 1
+        fi
+        dep_name="$(normalize_dep_name "$pkg")"
+        if [ -z "$dep_name" ]; then
+            echo "ERROR: invalid package name: $pkg" >&2
+            exit 1
+        fi
+        if torch_family_dep_name_is_managed "$dep_name"; then
+            echo "ERROR: torch-family packages are managed by 'gov install torch'. Use 'gov install torch --index-url <url> [--torch <torch==version>] [--torchvision <torchvision==version>] [--torchaudio <torchaudio==version>]' instead." >&2
+            exit 1
+        fi
+        seen=false
+        for existing in "${normalized_packages[@]}"; do
+            if [ "$existing" = "$dep_name" ]; then
+                seen=true
+                break
+            fi
+        done
+        if [ "$seen" != true ]; then
+            normalized_packages+=("$dep_name")
+        fi
+    done
+
+    local workdir py op_id
+    workdir="$(build_workdir_for_tx "pin-remove-$(_random_hex8)")"
+    py="$(configured_python)"
+
+    if ! (
+        cd "$workdir"
+        uv remove --group overrides --python "$py" --frozen "${normalized_packages[@]}"
+    ); then
+        exit 1
+    fi
+
+    if ! lock_project_exact "$workdir" "$py"; then
+        echo "ERROR: pin remove failed during lock" >&2
+        exit 1
+    fi
+
+    op_id="$(apply_staged_pin_change "$workdir" "pin_remove" "${packages[*]}" "pin remove succeeded: ${packages[*]}" "pin remove")" || {
+        exit 1
+    }
+
+    echo "Pins removed."
+    echo "  packages: ${packages[*]}"
+    echo "  op_id: $op_id"
 }
 
 cmd_run() {
@@ -3318,12 +5072,17 @@ Comfy Env Governance CLI (Batch-4)
 Usage:
   gov init --comfyui-dir <abs-path> --python <python-spec>
   gov install [--requirements-file <path>]
-  gov install torch --index-url <url>
+  gov install torch --index-url <url> [--torch <torch==version>] [--torchvision <torchvision==version>] [--torchaudio <torchaudio==version>]
+  gov pin add <pkg==version>...
+  gov pin list
+  gov pin remove <pkg>...
   gov update run [--requirements-file <path>] [--timeout <seconds>]
   gov update inspect <txid>
   gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]
   gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]
   gov update abort <txid>
+  gov env export <output_dir>
+  gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>
   gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]
   gov node remove <node_id> [--purge-code]
   gov tx run <node_id> [--timeout <seconds>]
@@ -3366,6 +5125,27 @@ main() {
                     ;;
             esac
             ;;
+        pin)
+            shift
+            case "${1:-}" in
+                add)
+                    shift
+                    cmd_pin_add "$@"
+                    ;;
+                list)
+                    shift
+                    cmd_pin_list "$@"
+                    ;;
+                remove)
+                    shift
+                    cmd_pin_remove "$@"
+                    ;;
+                *)
+                    echo "Usage: gov pin {add|list|remove} ..." >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
         update)
             shift
             case "${1:-}" in
@@ -3391,6 +5171,23 @@ main() {
                     ;;
                 *)
                     echo "Usage: gov update {run|inspect|resolve|promote|abort} ..." >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        env)
+            shift
+            case "${1:-}" in
+                export)
+                    shift
+                    cmd_env_export "$@"
+                    ;;
+                import)
+                    shift
+                    cmd_env_import "$@"
+                    ;;
+                *)
+                    echo "Usage: gov env {export|import} ..." >&2
                     exit 1
                     ;;
             esac

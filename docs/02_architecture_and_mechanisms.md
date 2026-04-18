@@ -37,8 +37,16 @@
 2. 先校验当前文件哈希与目标 op 的 `post_sha256` 一致。
 3. 通过校验后恢复目标 op backup 并重建 prod。
 
+### 2.5 Environment Handoff
+
+1. `env export` 复制 root truth、`pylock.toml`、`state/plugins.json`、`audit/*`，以及 `custom_nodes` 的运行态源码快照到目录 bundle。
+2. 节点快照保留工作树中的已修改文件和未跟踪文件，但过滤 `.git/` 目录与 `.git` 指针文件。
+3. `env import` 会先校验 bundle 完整性与运行时兼容性，再用 staging truth 重建 `.venv-prod`，最后执行 exact restore。
+4. `comfyui_dir` 和 `runtime.python` 仍然是目标机本地配置；bundle 不携带源机器路径真相。
+
 ## 3. 安全边界
 
 1. 插件代码目录不是依赖真相的一部分。
 2. `--purge-code` 的代码删除不可逆，undo 不恢复被删目录。
 3. 任何 destructive 操作失败都先恢复 pre-op 文件。
+4. `env import` 默认会清理 bundle 外的 `custom_nodes/*` 目录，因此必须视为显式覆盖型恢复路径。

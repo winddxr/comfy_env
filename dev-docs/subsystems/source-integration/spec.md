@@ -3,7 +3,7 @@
 ## Metadata
 
 - Status: Active
-- Last Reviewed: 2026-03-01
+- Last Reviewed: 2026-04-07
 
 ## Scope & External System Profile
 
@@ -42,11 +42,17 @@ The external systems are:
   - convert `install_relpath` into an absolute path under configured ComfyUI root
 - `source-integration#KF-003` Purge source on explicit request
   - delete the plugin path only when `--purge-code` is passed during remove
+- `source-integration#KF-004` Export source snapshot bundle
+  - snapshot each registered node runtime tree into bundle `custom_nodes/<node_id>/`
+  - exclude VCS admin metadata such as `.git/` directories and `.git` pointer files
+- `source-integration#KF-005` Restore source snapshot from bundle
+  - restore each bundled node snapshot to target `install_relpath`, and purge bundle 外的 `custom_nodes/*` 目录 during exact import
 
 ## Runtime / Connectivity Constraints
 
 - Requires `git` on `PATH` for add flows.
 - Assumes the configured ComfyUI directory is writable by the local operator.
+- `comfyui_dir` is target-machine local configuration and is never restored from bundle payload.
 - The adapter does not validate plugin code safety or contents.
 
 ## Schema / DDL
@@ -57,8 +63,9 @@ The external systems are:
 
 | Doc ID | path | symbol | line |
 |---|---|---|---|
-| SI-001 | `bin/gov` | `comfyui_dir_path` | 147 |
-| SI-002 | `bin/gov` | `plugin_install_abs_path` | 354 |
-| SI-003 | `bin/gov` | `plugin_get_meta` | 535 |
-| SI-004 | `bin/gov` | `cmd_node_add` | 1276 |
-| SI-005 | `bin/gov` | `cmd_node_remove` | 1369 |
+| SI-001 | `bin/gov` | `comfyui_dir_path` | 493 |
+| SI-002 | `bin/gov` | `plugin_install_abs_path` | 922 |
+| SI-003 | `bin/gov` | `plugin_get_meta` | 1892 |
+| SI-004 | `bin/gov` | `cmd_node_add` | 2813 |
+| SI-005 | `bin/gov` | `cmd_node_remove` | 2906 |
+| SI-006 | `bin/gov` | `bundle_copy_custom_nodes` | 938 |

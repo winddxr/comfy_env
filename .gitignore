@@ -1,5 +1,6 @@
 .vscode/
 .agent/
+.codex
 .codex/
 .agents/
 .gemini/

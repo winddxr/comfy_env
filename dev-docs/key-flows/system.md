@@ -3,7 +3,7 @@
 ## Metadata
 
 - Status: Active
-- Last Reviewed: 2026-03-01
+- Last Reviewed: 2026-04-07
 
 ## Hero Flow
 
@@ -19,6 +19,7 @@
 - SKF-002: Conflict-driven re-promotion
 - SKF-003: Reversible removal and undo
 - SKF-004: Runtime bootstrap and core dependency upgrade
+- SKF-005: Exact environment handoff
 
 ## SKF Details
 
@@ -71,6 +72,19 @@
   - `install torch` must happen before `install`.
   - `update run` stages a workdir from `requirements.txt`; `update promote` only promotes that staged snapshot.
   - Failed sync or smoke restores pre-op files before exit.
+
+### SKF-005
+
+- Module Boundaries:
+  - Application Core -> Dependency Sync -> Source Integration -> State Ledger -> Safety Guards -> Runtime Executor
+- Key Contracts:
+  - Environment handoff contract
+  - Bundle manifest and checksum contract
+  - Operation backup contract
+- Failure & Recovery Posture:
+  - `env export` fails closed on missing truth files, missing plugin source directories, or non-empty output directory.
+  - `env import` validates manifest integrity and runtime compatibility before mutating root truth.
+  - Failed import restores pre-op truth and any `custom_nodes` directories that were overwritten or purged.
 
 ## Integration Contracts
 
