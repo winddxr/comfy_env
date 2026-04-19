@@ -1,5 +1,7 @@
 # init
 
+**Implementation target:** [src/application/init.rs](../../src/application/init.rs)
+
 ## Synopsis
 
 ```

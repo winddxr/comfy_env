@@ -5,6 +5,7 @@
 .agents/
 .gemini/
 .cluade/
+target/
 .venv-prod/                
 .venv-candidate/ 
 config.toml

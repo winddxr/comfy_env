@@ -1,5 +1,7 @@
 # toml_support/
 
+**Implementation target:** [src/toml_support/](../../src/toml_support/)
+
 ## Responsibility
 
 Format-preserving reading and editing of `config.toml` and `pyproject.toml`. All TOML mutations go through this module — no other code touches TOML files directly.

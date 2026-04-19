@@ -1,5 +1,7 @@
 # Command Behavioral Contracts
 
+Implementation entry points are linked at the top of each command doc. Start from the one command you are changing, then follow only the module references that command uses.
+
 Language-agnostic behavioral specifications for every `gov` command. These describe *what* each command does, not *how* it's implemented.
 
 **Document hierarchy**: architecture.md (system rules) > commands/*.md (command behavior) > modules/*.md (implementation). Conflicts resolve upward. See [architecture.md §Document Hierarchy](../architecture.md#document-hierarchy).
@@ -12,6 +14,7 @@ Language-agnostic behavioral specifications for every `gov` command. These descr
 - **Implementers**: These specs are the authority for Rust command implementations. If the code disagrees with this doc, fix the code.
 - **Reviewers**: Verify that implementations satisfy every step in the success and failure paths.
 - **AI agents**: Read the relevant command spec before implementing or modifying a command.
+- **AI agents**: Avoid loading unrelated command docs unless the task actually spans multiple command groups.
 
 ## Shared Protocol Reference
 

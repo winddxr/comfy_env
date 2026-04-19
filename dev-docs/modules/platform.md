@@ -1,5 +1,7 @@
 # platform/
 
+**Implementation target:** [src/platform/](../../src/platform/)
+
 ## Responsibility
 
 Cross-platform abstractions that isolate the rest of the codebase from OS-specific differences. Every other module calls into `platform/` rather than using platform-conditional code directly.

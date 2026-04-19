@@ -1,5 +1,7 @@
 # runtime_executor/
 
+**Implementation target:** [src/runtime_executor/](../../src/runtime_executor/)
+
 ## Responsibility
 
 Manages ComfyUI process lifecycle: launching (in candidate or prod environments), capturing output, enforcing timeouts, PID tracking, and process termination.

@@ -1,5 +1,7 @@
 # safety_guards/
 
+**Implementation target:** [src/safety_guards/](../../src/safety_guards/)
+
 ## Responsibility
 
 Enforces all safety rules around destructive mutations. Owns backup creation, restoration, drift detection, policy gating, and smoke testing. Commands call into this module at critical checkpoints — they don't implement safety logic themselves.

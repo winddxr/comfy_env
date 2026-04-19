@@ -1,5 +1,7 @@
 # source_integration/
 
+**Implementation target:** [src/source_integration/](../../src/source_integration/)
+
 ## Responsibility
 
 All interactions with `git` and plugin source directory management. Handles cloning, checkout, path mapping, and source tree operations for custom_nodes.

@@ -1,5 +1,7 @@
 # status / help
 
+**Implementation targets:** [src/application/status.rs](../../src/application/status.rs) for `status`; [src/cli.rs](../../src/cli.rs) and [src/main.rs](../../src/main.rs) for Clap-generated `help`
+
 ## `status`
 
 ### Synopsis

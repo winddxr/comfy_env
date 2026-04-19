@@ -1,5 +1,7 @@
 # pin
 
+**Implementation target:** [src/application/pin.rs](../../src/application/pin.rs)
+
 ## `pin add`
 
 ### Synopsis

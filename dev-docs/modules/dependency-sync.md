@@ -1,5 +1,7 @@
 # dependency_sync/
 
+**Implementation target:** [src/dependency_sync/](../../src/dependency_sync/)
+
 ## Responsibility
 
 All interactions with `uv` and the staged workdir pattern. Translates application-level intent ("add this dependency", "lock this workdir", "sync this env") into `uv` subprocess calls with structured results.

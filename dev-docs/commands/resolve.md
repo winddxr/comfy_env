@@ -1,5 +1,7 @@
 # resolve (Plugin Conflict Resolution)
 
+**Implementation target:** [src/application/resolve.rs](../../src/application/resolve.rs)
+
 ## Synopsis
 
 ```

@@ -1,5 +1,7 @@
 # fs_support/
 
+**Implementation target:** [src/fs_support/](../../src/fs_support/)
+
 ## Responsibility
 
 Filesystem primitives that ensure data integrity across all write operations. No other module performs raw file writes — they go through `fs_support/`.

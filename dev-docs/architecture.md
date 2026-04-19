@@ -18,6 +18,24 @@ When documents conflict, resolve by priority (highest first):
 
 Higher-level documents constrain lower-level ones. If a module spec contradicts an invariant in architecture.md, fix the module spec.
 
+## AI Reading Protocol
+
+This doc set is optimized for AI-assisted implementation and review. It is intentionally split so an agent can load only the minimum relevant context for the task at hand.
+
+Read in this order:
+
+1. `architecture.md` for system invariants, module boundaries, and cross-platform rules
+2. One relevant file from `commands/` for the command-level behavioral contract
+3. Only the module specs referenced by that command contract
+4. The direct implementation target links at the top of those command/module docs
+
+Rules:
+
+- Do not preload unrelated command docs or module specs "for background" unless the current task actually crosses those boundaries.
+- Prefer direct implementation links over repository-wide exploration when a doc already tells you where the code belongs.
+- Treat the docs as the behavioral authority during migration; linked Rust files may still be scaffolded and therefore incomplete.
+- Keep context isolated: command docs define what a command must do, module docs define how a subsystem works, and unrelated slices should stay unread.
+
 ## Invariants
 
 1. All production dependency mutations are anchored in local truth files (`pyproject.toml`, `uv.lock`) first, then applied to `.venv-prod`.

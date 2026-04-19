@@ -1,5 +1,7 @@
 # ops (Operations & Undo)
 
+**Implementation targets:** [src/application/ops.rs](../../src/application/ops.rs) for `op list` and `op inspect`; [src/application/undo.rs](../../src/application/undo.rs) for `undo`
+
 ## `op list`
 
 ### Synopsis

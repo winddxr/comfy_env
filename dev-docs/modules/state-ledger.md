@@ -1,5 +1,7 @@
 # state_ledger/
 
+**Implementation target:** [src/state_ledger/](../../src/state_ledger/)
+
 ## Responsibility
 
 CRUD operations for all durable state files. Owns the JSON schemas and lifecycle rules for transactions, operations, plugins, and conflict artifacts. No other module reads or writes these files directly.

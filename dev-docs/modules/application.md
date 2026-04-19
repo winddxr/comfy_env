@@ -1,5 +1,7 @@
 # application/ (Command Orchestration Layer)
 
+**Implementation targets:** [src/application/](../../src/application/), [src/cli.rs](../../src/cli.rs), [src/main.rs](../../src/main.rs)
+
 ## Responsibility
 
 The `application/` module contains one file per command group (`pin.rs`, `tx.rs`, `node.rs`, etc.). Each file implements command handlers that **orchestrate** calls to infrastructure modules. Application code does not own business rules — it sequences module calls and manages control flow.

@@ -1,5 +1,7 @@
 # install
 
+**Implementation target:** [src/application/install.rs](../../src/application/install.rs)
+
 ## `install torch`
 
 ### Synopsis
