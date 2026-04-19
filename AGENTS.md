@@ -68,8 +68,10 @@ The CLI is implemented in **Rust** as a single binary `gov`. Target platforms: *
 
 ## Sandbox Notes
 
-- In this workspace, Git write operations such as `git add` and `git commit` may fail under sandboxing with index lock or permission errors.
-- If a required Git write fails for sandbox reasons, immediately rerun it with escalation instead of retrying the same non-escalated command.
+Use this section to record commands that should be run with escalation immediately in this workspace, without first attempting a non-escalated run.
+
+- `git add` — direct escalation required; sandboxed execution consistently fails with Git index lock or permission errors.
+- `git commit` — direct escalation required; sandboxed execution consistently fails with Git index lock or permission errors.
 
 ## Migration Status
 
