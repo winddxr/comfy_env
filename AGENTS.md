@@ -31,8 +31,8 @@ The CLI is implemented in **Rust** as a single binary `gov`. Target platforms: *
 - `gov` (Rust binary) is the **sole entry point**. No Bash wrapper, dispatcher, or shim.
 - `pyproject.toml` + `uv.lock` are the dependency source of truth; `state/plugins.json` is registry metadata, not dependency truth.
 - Candidate transactions are the only supported way to observe dependency impact before promotion into `.venv-prod`.
-- Cross-platform abstractions (venv Python locator, process runner, path normalization, atomic writes) live in `src/platform/` and `src/fs_support/`.
-- See `dev-docs/architecture.md` for full system overview, invariants, and module map.
+- Development entry point: start from `dev-docs/architecture.md`, then follow the relevant command and module docs from there.
+- Treat `dev-docs/architecture.md` as the authoritative navigation entry for implementation work; `AGENTS.md` is only the quick project brief and constraint summary.
 
 ## Coding Conventions
 
@@ -66,6 +66,11 @@ The CLI is implemented in **Rust** as a single binary `gov`. Target platforms: *
 - For dependency-mutation changes, verify real `uv lock` and `uv sync` behavior in a project layout.
 - For remove/promote/undo changes, verify backup and restore behavior rather than relying on code inspection alone.
 
+## Sandbox Notes
+
+- In this workspace, Git write operations such as `git add` and `git commit` may fail under sandboxing with index lock or permission errors.
+- If a required Git write fails for sandbox reasons, immediately rerun it with escalation instead of retrying the same non-escalated command.
+
 ## Migration Status
 
 Vertical slice migration — each slice delivers a complete command group:
@@ -81,6 +86,13 @@ Vertical slice migration — each slice delivers a complete command group:
 
 Do not read every document listed below by default. Read only the document(s) that match the current task.
 
+Recommended read order for implementation work:
+
+1. Start with `dev-docs/architecture.md`.
+2. Read the relevant file in `dev-docs/commands/`.
+3. Read only the specific file(s) in `dev-docs/modules/` that the command actually depends on.
+4. Follow the implementation links in those docs into `src/`.
+
 **System-level design:**
 - For system overview, invariants, module map, and cross-platform rules: read `dev-docs/architecture.md`.
 - For the rewrite plan and migration strategy: read `dev-docs/adr/003-rust-rewrite-plan.md`.
@@ -93,5 +105,6 @@ Do not read every document listed below by default. Read only the document(s) th
 - For command orchestration patterns and standard handler skeleton: read `dev-docs/modules/application.md`.
 - For a specific module: read the corresponding file in `dev-docs/modules/` (e.g., `platform.md`, `safety-guards.md`, `dependency-sync.md`).
 
-Background / rationale: **Only READ when** current documentation & Information is unclear
-- Archived Bash-era design docs: `dev-docs-old\architecture-haiku.md`. Retained as reference, not active design authority. Only reference when current documentation is unclear.
+Legacy reference: read only when current docs and current Rust code are still insufficient to answer the question or recover intended behavior.
+- Archived Bash-era design docs: `dev-docs-old\architecture-haiku.md`. This is not active design authority.
+- Use old docs only to understand legacy behavior or old implementation intent, not to override `dev-docs/architecture.md`, `dev-docs/commands/`, or `dev-docs/modules/`.
