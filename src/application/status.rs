@@ -5,11 +5,10 @@ use crate::domain::{AppResult, CmdResult, ProjectRoot, TxStatus};
 use crate::platform;
 use crate::source_integration::GitClient;
 use crate::state_ledger::{self, TransactionRecord};
-use crate::toml_support::{self, ConfigToml, PyProjectToml};
+use crate::toml_support::{self, RuntimeConfig};
 
 pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
-    let config = toml_support::load_config(&root.config_toml())?;
-    let pyproject = toml_support::load_pyproject(&root.pyproject_toml())?;
+    let config = toml_support::read_config(&root.config_toml())?;
     let plugins = state_ledger::load_plugins(root)?;
     let transactions = state_ledger::load_transactions(root)?;
     let runtime_pid = read_runtime_pid(root);
@@ -23,8 +22,8 @@ pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
         "prod_env_exists: {}",
         prod_env_exists(root, config.as_ref())
     );
-    println!("torch_ready: {}", group_ready(pyproject.as_ref(), "torch"));
-    println!("core_ready: {}", group_ready(pyproject.as_ref(), "core"));
+    println!("torch_ready: {}", group_ready(root, "torch"));
+    println!("core_ready: {}", group_ready(root, "core"));
     println!("plugins_registered: {}", plugins.len());
     println!(
         "plugins_enabled: {}",
@@ -45,7 +44,7 @@ pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
     print_notes(
         root,
         config.as_ref(),
-        pyproject.as_ref(),
+        root.pyproject_toml().exists(),
         runtime_pid,
         runtime_running,
     );
@@ -53,37 +52,32 @@ pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
     Ok(())
 }
 
-fn config_comfyui_dir(config: Option<&ConfigToml>) -> String {
+fn config_comfyui_dir(config: Option<&RuntimeConfig>) -> String {
     config
-        .and_then(|value| value.paths.as_ref())
-        .and_then(|paths| paths.comfyui_dir.as_ref())
+        .and_then(|value| value.paths.comfyui_dir.as_ref())
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn config_python(config: Option<&ConfigToml>) -> String {
+fn config_python(config: Option<&RuntimeConfig>) -> String {
     config
-        .and_then(|value| value.runtime.as_ref())
-        .and_then(|runtime| runtime.python.as_ref())
+        .and_then(|value| value.runtime.python.as_ref())
         .cloned()
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn prod_env_exists(root: &ProjectRoot, config: Option<&ConfigToml>) -> bool {
+fn prod_env_exists(root: &ProjectRoot, config: Option<&RuntimeConfig>) -> bool {
     let relative = config
-        .and_then(|value| value.runtime.as_ref())
-        .and_then(|runtime| runtime.prod_env.as_ref())
-        .map(|path| root.as_path().join(path))
+        .map(|value| root.as_path().join(&value.runtime.prod_env))
         .unwrap_or_else(|| root.prod_env_dir());
 
     relative.exists()
 }
 
-fn group_ready(pyproject: Option<&PyProjectToml>, group: &str) -> bool {
-    pyproject
-        .and_then(|value| value.dependency_groups.as_ref())
-        .and_then(|groups| groups.group(group))
-        .is_some_and(|items| !items.is_empty())
+fn group_ready(root: &ProjectRoot, group: &str) -> bool {
+    toml_support::read_dependency_group(&root.pyproject_toml(), group)
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
 }
 
 fn pending_transactions(transactions: &[TransactionRecord]) -> usize {
@@ -110,11 +104,8 @@ fn describe_probe(result: anyhow::Result<CmdResult>) -> String {
     }
 }
 
-fn python_probe(config: Option<&ConfigToml>) -> String {
-    let Some(selector) = config
-        .and_then(|value| value.runtime.as_ref())
-        .and_then(|runtime| runtime.python.as_ref())
-    else {
+fn python_probe(config: Option<&RuntimeConfig>) -> String {
+    let Some(selector) = config.and_then(|value| value.runtime.python.as_ref()) else {
         return "managed by uv during init/run (deferred until config.toml exists)".to_string();
     };
 
@@ -181,8 +172,8 @@ fn print_recent_transactions(transactions: &[TransactionRecord]) {
 
 fn print_notes(
     root: &ProjectRoot,
-    config: Option<&ConfigToml>,
-    pyproject: Option<&PyProjectToml>,
+    config: Option<&RuntimeConfig>,
+    pyproject_exists: bool,
     runtime_pid: Option<u32>,
     runtime_running: bool,
 ) {
@@ -193,7 +184,7 @@ fn print_notes(
             "config.toml is missing; python resolution stays deferred until init".to_string(),
         );
     }
-    if pyproject.is_none() {
+    if !pyproject_exists {
         notes.push("pyproject.toml is missing; dependency truth is not initialized".to_string());
     }
     if !root.plugins_registry().exists() {

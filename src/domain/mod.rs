@@ -81,12 +81,24 @@ impl ProjectRoot {
         self.root.join("state")
     }
 
+    pub fn uv_lock(&self) -> PathBuf {
+        self.root.join("uv.lock")
+    }
+
     pub fn plugins_registry(&self) -> PathBuf {
         self.state_dir().join("plugins.json")
     }
 
     pub fn transactions_dir(&self) -> PathBuf {
         self.state_dir().join("transactions")
+    }
+
+    pub fn ops_dir(&self) -> PathBuf {
+        self.state_dir().join("ops")
+    }
+
+    pub fn work_dir(&self) -> PathBuf {
+        self.state_dir().join("work")
     }
 
     pub fn pid_file(&self) -> PathBuf {
@@ -146,6 +158,18 @@ pub enum OpStatus {
     Success,
     Failed,
     Undone,
+}
+
+impl Display for OpStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Running => "running",
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Undone => "undone",
+        };
+        f.write_str(value)
+    }
 }
 
 #[derive(Debug, Clone)]
