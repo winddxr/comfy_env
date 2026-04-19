@@ -32,7 +32,7 @@ The CLI is implemented in **Rust** as a single binary `gov`. Target platforms: *
 - `pyproject.toml` + `uv.lock` are the dependency source of truth; `state/plugins.json` is registry metadata, not dependency truth.
 - Candidate transactions are the only supported way to observe dependency impact before promotion into `.venv-prod`.
 - Cross-platform abstractions (venv Python locator, process runner, path normalization, atomic writes) live in `src/platform/` and `src/fs_support/`.
-- See `dev-docs/adr/003-rust-rewrite-plan.md` for full architecture and module layout.
+- See `dev-docs/architecture.md` for full system overview, invariants, and module map.
 
 ## Coding Conventions
 
@@ -70,7 +70,6 @@ The CLI is implemented in **Rust** as a single binary `gov`. Target platforms: *
 
 Vertical slice migration — each slice delivers a complete command group:
 
-- [ ] Slice 0: Scaffold + cross-platform infrastructure (`platform/`, `fs_support/`, `toml_support/`, `state_ledger/`, clients, `cli.rs` with stubs)
 - [ ] Slice 1: `pin add` / `pin list` / `pin remove` / `undo` / `op list` / `op inspect`
 - [ ] Slice 2: `install torch` / `install` / `status`
 - [ ] Slice 3: `node add` / `node remove` / `tx run` / `tx inspect` / `tx abort` / `tx promote` / `resolve`
@@ -82,7 +81,17 @@ Vertical slice migration — each slice delivers a complete command group:
 
 Do not read every document listed below by default. Read only the document(s) that match the current task.
 
-- If you are working on the rewrite plan, migration strategy, or cross-platform design, read `dev-docs/adr/003-rust-rewrite-plan.md`.
-- If you need background on language selection rationale, read `dev-docs/adr/002-rewrite-language-selection.md`.
-- If you need background on global pin management design, read `dev-docs/adr/001-global-pin-management.md`.
-- For archived Bash-era design docs (subsystem specs, contracts, policies, key flows), see `dev-docs-old/`. These reflect the Bash implementation and are retained as reference, not as active design authority.
+**System-level design:**
+- For system overview, invariants, module map, and cross-platform rules: read `dev-docs/architecture.md`.
+- For the rewrite plan and migration strategy: read `dev-docs/adr/003-rust-rewrite-plan.md`.
+
+**Command behavioral contracts (what each command does step-by-step):**
+- For the command index and shared protocol reference: read `dev-docs/commands/contracts.md`.
+- For a specific command group: read the corresponding file in `dev-docs/commands/` (e.g., `pin.md`, `tx.md`, `env.md`).
+
+**Module specs (how each building block works internally):**
+- For command orchestration patterns and standard handler skeleton: read `dev-docs/modules/application.md`.
+- For a specific module: read the corresponding file in `dev-docs/modules/` (e.g., `platform.md`, `safety-guards.md`, `dependency-sync.md`).
+
+Background / rationale: **Only READ when** current documentation & Information is unclear
+- Archived Bash-era design docs: `dev-docs-old\architecture-haiku.md`. Retained as reference, not active design authority. Only reference when current documentation is unclear.

@@ -8,6 +8,16 @@
 - **Platforms**: Linux + Windows
 - **External dependencies**: `uv`, `git`, Python (all via subprocess, never embedded)
 
+## Document Hierarchy
+
+When documents conflict, resolve by priority (highest first):
+
+1. **architecture.md** — system-level invariants and rules
+2. **commands/*.md** — command-level behavioral contracts
+3. **modules/*.md** — module-level implementation specs
+
+Higher-level documents constrain lower-level ones. If a module spec contradicts an invariant in architecture.md, fix the module spec.
+
 ## Invariants
 
 1. All production dependency mutations are anchored in local truth files (`pyproject.toml`, `uv.lock`) first, then applied to `.venv-prod`.
@@ -39,6 +49,68 @@ src/
 └── fs_support/             → atomic write, hashing, path normalization, dir operations
 ```
 
+## Domain Model
+
+### State Machines
+
+**Transaction lifecycle:**
+
+```
+                    ┌─────────────┐
+                    │   running   │
+                    └──────┬──────┘
+                           │
+              ┌────────────┴────────────┐
+              ▼                          ▼
+      ┌─────────────┐          ┌─────────────┐
+      │  completed  │          │   failed    │
+      └──────┬──────┘          └─────────────┘
+             │                         │
+    ┌────────┼────────┐                │
+    ▼        ▼        ▼                ▼
+promoted  needs_    aborted         aborted
+          resolution
+             │
+             ▼
+          resolved ──→ promoted | promote_failed
+```
+
+Valid transitions:
+- `running` → `completed` | `failed` | `needs_resolution`
+- `completed` → `promoted` | `needs_resolution` | `aborted`
+- `failed` → `aborted`
+- `needs_resolution` → `resolved` | `aborted`
+- `resolved` → `promoted` | `needs_resolution` | `promote_failed`
+
+Note: `running` → `needs_resolution` occurs when lock fails during `tx run` staging (before ComfyUI executes). `completed` → `needs_resolution` occurs when lock fails during `tx promote`.
+
+**Operation lifecycle:**
+
+```
+running → success | failed
+success → undone (via undo command)
+```
+
+### Type Definitions
+
+| Type | Format | Example |
+|------|--------|---------|
+| TxId | `<UTC_timestamp>-<8_hex_chars>` | `20260419T120000Z-a1b2c3d4` |
+| OpId | `<UTC_timestamp>-op-<8_hex_chars>` | `20260419T120000Z-op-e5f6a7b8` |
+| NodeId | Git repo basename or explicit `--id` | `comfyui-manager` |
+| GroupName | Normalized: lowercase, hyphens only | `node-comfyui-manager` |
+| PythonMinor | `<major>.<minor>` | `3.11` |
+
+### Error Taxonomy
+
+| Category | When | Effect |
+|----------|------|--------|
+| Usage error | Invalid arguments/flags | Exit before any I/O |
+| Precondition error | Missing config, missing files, wrong state | Exit before mutation |
+| Policy error | Core impact gate, undo not undoable | Exit before mutation |
+| Adapter error | uv/git/python subprocess failure | Restore if post-backup, then exit |
+| Restore error | Backup restoration fails | Log prominently, leave state for manual recovery |
+
 ## Data Sovereignty
 
 | Domain | Source of Truth | Location |
@@ -66,13 +138,12 @@ All tool invocations go through client structs that return `CmdResult`. No raw `
 
 ## Cross-Platform Rules
 
-See ADR-003 §Platform Abstraction for full details. Summary:
-
-- Venv Python: `<venv>/bin/python` (Linux) vs `<venv>/Scripts/python.exe` (Windows)
+- Venv Python: `<venv>/bin/python` (Linux) vs `<venv>/Scripts/python.exe` (Windows); centralized in `venv_python()`, never hardcoded
 - Process termination: graceful stop with timeout, then forced termination; Linux uses SIGTERM→SIGKILL, Windows uses platform-native graceful/forced primitives
 - Paths in state files: always forward slashes
+- Absolute path detection: accounts for drive letters on Windows
 - Atomic writes: rename-based on both platforms, platform-specific fsync
-- Bundle import: cross-platform import rejected in v1
+- Bundle import: cross-platform import rejected in v1 (sys_platform must match)
 - Smoke test: structured command (`program` + `args`), not shell string
 
 ## Key Flows
@@ -82,7 +153,20 @@ See ADR-003 §Platform Abstraction for full details. Summary:
 3. **Plugin removal + undo**: `node remove` → `undo` with backup restore
 4. **Bootstrap**: `init` → `install torch` → `install` → `update run` → `update promote`
 5. **Environment transfer**: `env export` → `env import` (same platform only in v1)
+6. **Bundle platform rejection**: `env import` → platform check fails → exit before mutation with explicit mismatch error
 
-## Command Behavioral Contracts
+## Drill-Down
 
-For detailed step-by-step specifications of each command (preconditions, mutations, failure paths, state transitions), see [commands/contracts.md](commands/contracts.md).
+- **Module specs** (building blocks, independently implementable):
+  - [application/](modules/application.md) — command orchestration pattern, standard handler skeleton, restore sequence
+  - [platform/](modules/platform.md) — venv Python locator, process control, path normalization
+  - [fs_support/](modules/fs-support.md) — atomic writes, hashing, directory operations
+  - [toml_support/](modules/toml-support.md) — format-preserving TOML editing
+  - [dependency_sync/](modules/dependency-sync.md) — UvClient, staged workdir, prod sync
+  - [state_ledger/](modules/state-ledger.md) — transaction/operation/plugin/conflict CRUD + schemas
+  - [safety_guards/](modules/safety-guards.md) — backup/restore, drift guard, core impact gate, smoke test
+  - [source_integration/](modules/source-integration.md) — GitClient, plugin path mapping
+  - [runtime_executor/](modules/runtime-executor.md) — process lifecycle, PID, timeout, logs
+- **Command behavioral contracts** (per-command specs): [commands/contracts.md](commands/contracts.md)
+- **Rewrite plan and migration strategy**: [adr/003-rust-rewrite-plan.md](adr/003-rust-rewrite-plan.md)
+- **Language selection rationale**: [adr/002-rewrite-language-selection.md](adr/002-rewrite-language-selection.md)

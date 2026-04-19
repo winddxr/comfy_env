@@ -121,7 +121,9 @@ Import an environment from an exported bundle. This is an **exact restore** — 
 - `custom_nodes/*/` — synchronized with bundle (extras removed, bundle contents restored)
 - `state/ops/<op_id>/` — operation record
 
-### Platform Compatibility Rules
+### Design Note: No Core Impact Gate
+
+`env import` does not apply the core impact gate. Unlike `tx promote` / `update promote` which compute a diff and gate on core packages, import is an **exact restore** — the user explicitly chose to adopt the bundle's entire dependency set. The platform compatibility check is the safety gate for import.
 
 ```
 1. Check requires-python: target python must satisfy bundled requires-python
@@ -168,6 +170,5 @@ IF custom_nodes copy fails: op_restore → restore custom_nodes backup → op_fi
 
 ### Platform Notes
 
-- custom_nodes sync: on Windows, handle read-only file attributes before deletion
-- Symlinks/junctions: delete the link only, never traverse into link targets for deletion
+- custom_nodes sync: on Windows, handle read-only file attributes before deletion (Git sets some files read-only)
 - Bundle paths in manifest use forward slashes; convert to platform-native for file operations

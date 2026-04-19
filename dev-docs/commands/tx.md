@@ -23,7 +23,7 @@ Create a candidate transaction that observes the dependency impact of a plugin. 
 
 - Plugin must exist in `plugins.json`
 - Plugin source directory must exist (`custom_nodes/<node_id>/`)
-- Plugin must have a `requirements.txt` or dependency declaration
+- Plugin must have a `requirements.txt` in its source directory (`custom_nodes/<node_id>/requirements.txt`). If no requirements file exists, the plugin is treated as having no additional dependencies — the transaction proceeds with an empty dependency set for the plugin group.
 - `config.toml` must exist
 - No existing `running` transaction for this node (prevents duplicates)
 
@@ -85,6 +85,14 @@ IF ComfyUI run exits non-zero: record exit code, status → "failed"
 ### State Transitions
 
 - Creates: transaction `running` → `completed` | `failed` | `needs_resolution`
+- `running` → `needs_resolution`: lock fails during workdir staging (before ComfyUI runs)
+- `running` → `completed`: ComfyUI exits 0
+- `running` → `failed`: ComfyUI exits non-zero or timeout
+
+### Cleanup Ownership
+
+- **Candidate env** (`.venv-candidate/<txid>/`): cleaned up by `tx abort` or `tx promote` (on success). Not cleaned on `tx run` failure — preserved for inspection.
+- **Staged workdir** (`state/work/...`): cleaned up by `tx abort` or `tx promote`. Not cleaned on needs_resolution — needed for resolve retry.
 
 ### Platform Notes
 

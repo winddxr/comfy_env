@@ -126,9 +126,10 @@ Remove a plugin's dependency group from `pyproject.toml`, re-lock, sync prod, an
 6. IF lock succeeds:
    a. Copy workdir truth → root
    b. Sync prod env via [Prod Sync Protocol]
-   c. Remove plugin entry from plugins.json
-   d. IF --purge-code: delete custom_nodes/<node_id>/
-   e. op_finalize(success)
+   c. Smoke test via [Smoke Test Protocol]
+   d. Remove plugin entry from plugins.json
+   e. IF --purge-code: delete custom_nodes/<node_id>/
+   f. op_finalize(success)
 ```
 
 ### Failure Path
@@ -142,4 +143,4 @@ IF sync fails: op_restore → re-sync prod → op_finalize(failed)
 ### Platform Notes
 
 - Directory deletion must handle read-only files (Git on Windows sets some files read-only)
-- Symlinks/junctions in custom_nodes: delete the link, not the target
+- `install_relpath` in plugins.json uses forward slashes regardless of platform
