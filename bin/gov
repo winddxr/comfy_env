@@ -1195,35 +1195,13 @@ set_dependency_group_exact() {
     local project_dir="$1"
     local group_name="$2"
     local desired_file="$3"
-    local current_file dep spec dep_name py
-
-    current_file="$(mktemp)"
-    py="$(configured_python)"
-    write_group_deps "$project_dir/pyproject.toml" "$group_name" "$current_file"
-
-    if [ -s "$current_file" ]; then
-        while IFS= read -r dep; do
-            [ -z "$dep" ] && continue
-            dep_name="$(dep_name_from_spec "$dep")"
-            [ -z "$dep_name" ] && continue
-            (
-                cd "$project_dir"
-                run_uv remove --group "$group_name" --python "$py" --no-sync "$dep_name"
-            )
-        done < "$current_file"
-    fi
+    local -a desired_specs=()
 
     if [ -s "$desired_file" ]; then
-        while IFS= read -r spec; do
-            [ -z "$spec" ] && continue
-            (
-                cd "$project_dir"
-                run_uv add --group "$group_name" --python "$py" --no-sync "$spec"
-            )
-        done < "$desired_file"
+        mapfile -t desired_specs < "$desired_file"
     fi
 
-    rm -f "$current_file"
+    rewrite_dependency_group "$project_dir/pyproject.toml" "$group_name" "replace_exact" "${desired_specs[@]}"
 }
 
 append_pins_to_overrides_group() {
