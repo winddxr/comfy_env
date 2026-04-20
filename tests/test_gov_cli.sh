@@ -355,6 +355,9 @@ PY
         mkdir -p "$env_path/bin"
         cat >"$env_path/bin/python" <<'PYEOF'
 #!/usr/bin/env bash
+if [ "${FAKE_PYTHON_SLEEP_SEC:-0}" != "0" ]; then
+    sleep "${FAKE_PYTHON_SLEEP_SEC}"
+fi
 exit "${FAKE_PYTHON_EXIT_CODE:-0}"
 PYEOF
         chmod +x "$env_path/bin/python"
@@ -687,6 +690,15 @@ fi
 assert_contains "$TMP_ROOT/init-no-args.err" "initial setup requires"
 
 mkdir -p "$TMP_ROOT/ComfyUI"
+cat >"$TMP_ROOT/ComfyUI/main.py" <<'EOF'
+print("fake comfy main")
+EOF
+cat >"$TMP_ROOT/ComfyUI/requirements.txt" <<'EOF'
+torch==2.11.1
+torchvision==0.26.1
+torchaudio==2.11.1
+numpy==1.26.3
+EOF
 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" init --comfyui-dir "$TMP_ROOT/ComfyUI" --python 3.12 >"$TMP_ROOT/init.out"
 
 assert_contains "$WORK_DIR/config.toml" "comfyui_dir = \"$TMP_ROOT/ComfyUI\""
@@ -1109,6 +1121,10 @@ assert_contains "$WORK_DIR/pyproject.toml" "torch==2.11.1"
 assert_contains "$WORK_DIR/pyproject.toml" "torchvision==0.26.1"
 assert_contains "$WORK_DIR/pyproject.toml" "\"torchaudio\""
 
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" install >"$TMP_ROOT/install-core.out"
+assert_contains "$TMP_ROOT/install-core.out" "Core requirements installed."
+assert_contains "$WORK_DIR/pyproject.toml" "numpy==1.26.3"
+
 set +e
 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" install torch --index-url https://download.pytorch.org/whl/cu130 --torch torchvision==0.26.1 >"$TMP_ROOT/install-torch-bad-flag.out" 2>"$TMP_ROOT/install-torch-bad-flag.err"
 rc=$?
@@ -1118,6 +1134,38 @@ if [ "$rc" -eq 0 ]; then
     exit 1
 fi
 assert_contains "$TMP_ROOT/install-torch-bad-flag.err" "torch flag must target package 'torch'"
+
+cat >"$TMP_ROOT/ComfyUI/requirements.txt" <<'EOF'
+torch==2.11.1
+torchvision==0.26.1
+torchaudio==2.11.1
+numpy==1.26.4
+EOF
+FAKE_PYTHON_SLEEP_SEC=2 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update run --timeout 1 >"$TMP_ROOT/update-run.out" 2>"$TMP_ROOT/update-run.err"
+assert_contains "$TMP_ROOT/update-run.out" "Staging core update candidate from:"
+assert_contains "$TMP_ROOT/update-run.out" "Syncing staged core update into candidate environment..."
+assert_contains "$TMP_ROOT/update-run.out" "Running staged ComfyUI candidate with timeout 1s..."
+assert_contains "$TMP_ROOT/update-run.out" "Core update transaction recorded."
+assert_contains "$TMP_ROOT/update-run.out" "status: completed"
+assert_contains "$TMP_ROOT/update-run.out" "candidate run timed out after 1s"
+assert_contains "$TMP_ROOT/update-run.err" "Filtered torch-family requirements:"
+
+update_txid="$(python3 - "$TMP_ROOT/update-run.out" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r"txid:\s*(\S+)", text)
+if not match:
+    raise SystemExit("missing txid in update-run output")
+print(match.group(1))
+PY
+)"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update inspect "$update_txid" >"$TMP_ROOT/update-inspect.out"
+assert_contains "$TMP_ROOT/update-inspect.out" "kind: core_update"
+assert_contains "$TMP_ROOT/update-inspect.out" "status: completed"
+assert_contains "$TMP_ROOT/update-inspect.out" "run_exit_code: 124"
 
 mkdir -p "$TMP_ROOT/ComfyUI/custom_nodes/demo-node"
 cat >"$TMP_ROOT/ComfyUI/custom_nodes/demo-node/__init__.py" <<'EOF'

@@ -62,6 +62,13 @@ uv_cache_dir() {
     echo "${ROOT_DIR}/cache/uv"
 }
 
+run_uv() {
+    local cache_dir
+    cache_dir="$(uv_cache_dir)"
+    mkdir -p "$cache_dir"
+    uv --cache-dir "$cache_dir" "$@"
+}
+
 config_get() {
     local key="$1"
     local default_value="$2"
@@ -270,12 +277,8 @@ resolve_python_minor() {
     fi
 
     require_cmd uv
-    local cache_dir
-    cache_dir="$(uv_cache_dir)"
-    mkdir -p "$cache_dir"
-
     local resolved
-    if ! resolved="$(uv --cache-dir "$cache_dir" python find --no-python-downloads "$request")"; then
+    if ! resolved="$(run_uv python find --no-python-downloads "$request")"; then
         echo "ERROR: failed to resolve python request: $request" >&2
         exit 1
     fi
@@ -461,7 +464,7 @@ lock_project_exact() {
     fi
     (
         cd "$project_dir"
-        uv lock --python "$py"
+        run_uv lock --python "$py"
     )
 }
 
@@ -474,8 +477,77 @@ sync_project_env_exact() {
     fi
     (
         cd "$project_dir"
-        UV_PROJECT_ENVIRONMENT="$env_path" uv sync --python "$py" --locked --exact --all-groups
+        UV_PROJECT_ENVIRONMENT="$env_path" run_uv sync --python "$py" --locked --exact --all-groups
     )
+}
+
+run_command_with_timeout_logged() {
+    local timeout_sec="$1"
+    local stdout_log="$2"
+    local stderr_log="$3"
+    local write_mode="$4"
+    shift 4
+
+    require_python
+    "${PYTHON_BIN}" - "$timeout_sec" "$stdout_log" "$stderr_log" "$write_mode" "$@" <<'PY'
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+
+timeout_raw, stdout_log, stderr_log, write_mode = sys.argv[1:5]
+cmd = sys.argv[5:]
+
+if not cmd:
+    raise SystemExit("ERROR: missing command for timed execution")
+
+try:
+    timeout_sec = float(timeout_raw)
+except ValueError:
+    raise SystemExit(f"ERROR: invalid timeout seconds: {timeout_raw}")
+
+if timeout_sec <= 0:
+    raise SystemExit(f"ERROR: timeout seconds must be positive: {timeout_raw}")
+
+if write_mode not in {"append", "truncate"}:
+    raise SystemExit(f"ERROR: invalid log write mode: {write_mode}")
+
+stdout_mode = "ab" if write_mode == "append" else "wb"
+stderr_mode = "ab" if write_mode == "append" else "wb"
+stdout_path = pathlib.Path(stdout_log)
+stderr_path = pathlib.Path(stderr_log)
+stdout_path.parent.mkdir(parents=True, exist_ok=True)
+stderr_path.parent.mkdir(parents=True, exist_ok=True)
+
+with stdout_path.open(stdout_mode) as stdout_handle, stderr_path.open(stderr_mode) as stderr_handle:
+    proc = subprocess.Popen(cmd, stdout=stdout_handle, stderr=stderr_handle, start_new_session=True)
+    try:
+        raise SystemExit(proc.wait(timeout=timeout_sec))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        raise SystemExit(124)
+PY
+}
+
+candidate_run_completed_status() {
+    local run_exit_code="$1"
+    if [ "$run_exit_code" -eq 0 ] || [ "$run_exit_code" -eq 124 ]; then
+        echo "completed"
+    else
+        echo "failed"
+    fi
 }
 
 prod_env_path() {
@@ -1136,7 +1208,7 @@ set_dependency_group_exact() {
             [ -z "$dep_name" ] && continue
             (
                 cd "$project_dir"
-                uv remove --group "$group_name" --python "$py" --no-sync "$dep_name"
+                run_uv remove --group "$group_name" --python "$py" --no-sync "$dep_name"
             )
         done < "$current_file"
     fi
@@ -1146,7 +1218,7 @@ set_dependency_group_exact() {
             [ -z "$spec" ] && continue
             (
                 cd "$project_dir"
-                uv add --group "$group_name" --python "$py" --no-sync "$spec"
+                run_uv add --group "$group_name" --python "$py" --no-sync "$spec"
             )
         done < "$desired_file"
     fi
@@ -1168,7 +1240,7 @@ append_pins_to_overrides_group() {
         [ -z "$pin" ] && continue
         (
             cd "$project_dir"
-            uv add --group overrides --python "$py" --no-sync "$pin"
+            run_uv add --group overrides --python "$py" --no-sync "$pin"
         )
     done < "$pins_file"
 }
@@ -1306,7 +1378,7 @@ bundle_export_pylock() {
     local pylock_file="${bundle_dir}/pylock.toml"
     (
         cd "$ROOT_DIR"
-        uv export --format pylock.toml --locked --all-groups --output-file "$pylock_file"
+        run_uv export --format pylock.toml --locked --all-groups --output-file "$pylock_file"
     )
 }
 
@@ -1679,7 +1751,7 @@ bundle_lock_check() {
     local py="$2"
     (
         cd "$workdir"
-        uv lock --check --python "$py"
+        run_uv lock --check --python "$py"
     )
 }
 
@@ -2353,7 +2425,7 @@ collect_freeze_file() {
     local env_path="$1"
     local out_file="$2"
     if [ -d "$env_path" ]; then
-        UV_PROJECT_ENVIRONMENT="$env_path" uv pip freeze 2>/dev/null | sort > "$out_file" || true
+        UV_PROJECT_ENVIRONMENT="$env_path" run_uv pip freeze 2>/dev/null | sort > "$out_file" || true
     else
         : > "$out_file"
     fi
@@ -2563,18 +2635,18 @@ apply_plan_in_workdir() {
         if [ -s "$direct_file" ]; then
             while IFS= read -r spec; do
                 [ -z "$spec" ] && continue
-                uv add --group "$group_name" --python "$py" --no-sync "$spec"
+                run_uv add --group "$group_name" --python "$py" --no-sync "$spec"
             done < "$direct_file"
         fi
 
         if [ -s "$override_file" ]; then
             while IFS= read -r spec; do
                 [ -z "$spec" ] && continue
-                uv add --group overrides --python "$py" --no-sync "$spec"
+                run_uv add --group overrides --python "$py" --no-sync "$spec"
             done < "$override_file"
         fi
 
-        uv lock --python "$py"
+        run_uv lock --python "$py"
     ) >"$log_file" 2>&1
 }
 
@@ -3468,10 +3540,10 @@ cmd_node_remove() {
         if [ -s "$deps_file" ]; then
             while IFS= read -r dep; do
                 [ -z "$dep" ] && continue
-                uv remove --group "$group" --python "$py" --no-sync "$dep" || true
+                run_uv remove --group "$group" --python "$py" --no-sync "$dep" || true
             done < "$deps_file"
         fi
-        uv lock --python "$py"
+        run_uv lock --python "$py"
     ) >"$lock_log" 2>&1 || {
         op_restore_backup "$op_id" || true
         op_finalize "$op_id" "failed" "false" "node remove lock failed"
@@ -3570,6 +3642,7 @@ cmd_tx_run() {
     if [ ! -f "$LOCK_FILE" ]; then
         lock_project_exact "$ROOT_DIR" "$py"
     fi
+    echo "Syncing candidate environment for node '$node_id'..."
     sync_project_env_exact "$ROOT_DIR" "$candidate_env" "$py"
 
     collect_freeze_file "$candidate_env" "$pre_file"
@@ -3580,13 +3653,9 @@ cmd_tx_run() {
 
     set +e
     if [ -f "$main_py" ]; then
-        if command -v timeout >/dev/null 2>&1; then
-            timeout "${timeout_sec}s" "$candidate_env/bin/python" "$main_py" >"$stdout_log" 2>"$stderr_log"
-            run_exit_code=$?
-        else
-            "$candidate_env/bin/python" "$main_py" >"$stdout_log" 2>"$stderr_log"
-            run_exit_code=$?
-        fi
+        echo "Running candidate ComfyUI with timeout ${timeout_sec}s..."
+        run_command_with_timeout_logged "$timeout_sec" "$stdout_log" "$stderr_log" "truncate" "$candidate_env/bin/python" "$main_py"
+        run_exit_code=$?
     else
         echo "ComfyUI entry not found: $main_py" >"$stderr_log"
         run_exit_code=2
@@ -3596,16 +3665,16 @@ cmd_tx_run() {
     collect_freeze_file "$candidate_env" "$post_file"
 
     ended_at="$(timestamp_utc)"
-    status="completed"
-    if [ "$run_exit_code" -ne 0 ]; then
-        status="failed"
-    fi
+    status="$(candidate_run_completed_status "$run_exit_code")"
 
     write_tx_file "$TX_FILE" "$txid" "$node_id" "$status" "$started_at" "$ended_at" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "$run_exit_code" "$(core_packages_csv)"
 
     echo "Transaction recorded."
     echo "  txid: $txid"
     echo "  status: $status"
+    if [ "$run_exit_code" -eq 124 ]; then
+        echo "  note: candidate run timed out after ${timeout_sec}s"
+    fi
     echo "  file: $TX_FILE"
 }
 
@@ -4024,7 +4093,7 @@ cmd_install_torch() {
 
     if ! (
         cd "$workdir"
-        uv add --group torch --python "$py" --index "${index_name}=${index_url}" --no-sync torch torchvision torchaudio
+        run_uv add --group torch --python "$py" --index "${index_name}=${index_url}" --no-sync torch torchvision torchaudio
     ); then
         echo "ERROR: install torch failed during staging" >&2
         exit 1
@@ -4230,6 +4299,7 @@ cmd_update_run() {
     run_exit_code=0
     status="running"
 
+    echo "Staging core update candidate from: $requirements_file"
     if ! (
         set_dependency_group_exact "$workdir" "core" "$deps_file"
         lock_project_exact "$workdir" "$py"
@@ -4254,6 +4324,7 @@ cmd_update_run() {
 
     write_update_tx_file "$TX_FILE" "$txid" "$status" "$started_at" "" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "-1" "$(core_packages_csv)" "$requirements_file" "$req_sha" "$workdir" "$deps_file"
 
+    echo "Syncing staged core update into candidate environment..."
     if ! sync_project_env_exact "$workdir" "$candidate_env" "$py" >"$stdout_log" 2>"$stderr_log"; then
         ended_at="$(timestamp_utc)"
         collect_freeze_file "$candidate_env" "$post_file"
@@ -4269,13 +4340,9 @@ cmd_update_run() {
     main_py="${comfyui_dir}/main.py"
     set +e
     if [ -f "$main_py" ]; then
-        if command -v timeout >/dev/null 2>&1; then
-            timeout "${timeout_sec}s" "$candidate_env/bin/python" "$main_py" >>"$stdout_log" 2>>"$stderr_log"
-            run_exit_code=$?
-        else
-            "$candidate_env/bin/python" "$main_py" >>"$stdout_log" 2>>"$stderr_log"
-            run_exit_code=$?
-        fi
+        echo "Running staged ComfyUI candidate with timeout ${timeout_sec}s..."
+        run_command_with_timeout_logged "$timeout_sec" "$stdout_log" "$stderr_log" "append" "$candidate_env/bin/python" "$main_py"
+        run_exit_code=$?
     else
         echo "ComfyUI entry not found: $main_py" >>"$stderr_log"
         run_exit_code=2
@@ -4284,10 +4351,7 @@ cmd_update_run() {
 
     collect_freeze_file "$candidate_env" "$post_file"
     ended_at="$(timestamp_utc)"
-    status="completed"
-    if [ "$run_exit_code" -ne 0 ]; then
-        status="failed"
-    fi
+    status="$(candidate_run_completed_status "$run_exit_code")"
 
     write_update_tx_file "$TX_FILE" "$txid" "$status" "$started_at" "$ended_at" "$candidate_env" "$pre_file" "$post_file" "$stdout_log" "$stderr_log" "$run_exit_code" "$(core_packages_csv)" "$requirements_file" "$req_sha" "$workdir" "$deps_file"
     rm -f "$deps_file"
@@ -4295,6 +4359,9 @@ cmd_update_run() {
     echo "Core update transaction recorded."
     echo "  txid: $txid"
     echo "  status: $status"
+    if [ "$run_exit_code" -eq 124 ]; then
+        echo "  note: candidate run timed out after ${timeout_sec}s"
+    fi
 }
 
 cmd_update_inspect() {
@@ -5054,9 +5121,9 @@ cmd_pin_add() {
     if ! (
         cd "$workdir"
         if [ "${#present_target_names[@]}" -ne 0 ]; then
-            uv remove --group overrides --python "$py" --frozen "${present_target_names[@]}"
+            run_uv remove --group overrides --python "$py" --frozen "${present_target_names[@]}"
         fi
-        uv add --group overrides --python "$py" --frozen "${deduped_specs[@]}"
+        run_uv add --group overrides --python "$py" --frozen "${deduped_specs[@]}"
     ); then
         echo "ERROR: pin add failed while updating overrides" >&2
         exit 1
@@ -5127,7 +5194,7 @@ cmd_pin_remove() {
 
     if ! (
         cd "$workdir"
-        uv remove --group overrides --python "$py" --frozen "${normalized_packages[@]}"
+        run_uv remove --group overrides --python "$py" --frozen "${normalized_packages[@]}"
     ); then
         exit 1
     fi
