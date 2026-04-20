@@ -42,7 +42,7 @@ It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns
 - `UC-007` Bootstrap local runtime prerequisites: persist `paths.comfyui_dir` and `runtime.python`.
 - `UC-008` Install managed runtime dependencies: install torch first, then import ComfyUI `requirements.txt` into dependency truth.
 - `UC-009` Transactional update of ComfyUI core requirements: stage new `requirements.txt`, observe candidate, resolve conflicts, promote, and allow undo.
-- `UC-010` Export and import environment bundle: hand off locked truth, plugin registry, and runtime source snapshots through a directory bundle.
+- `UC-010` Export and import environment bundle: hand off locked truth, plugin registry, and runtime source snapshots through a `.tar` bundle.
 - `UC-011` Manage global exact override pins: add, inspect, and remove shared override pins for high-impact compatibility packages.
 
 ## Key Flows & Failure Recovery
@@ -89,7 +89,7 @@ It does not own `uv`, `git`, or ComfyUI semantics. Those remain adapter concerns
   - Failure: missing env, lock, entrypoint, or PID are explicit command errors.
 - `core#KF-011` Hand off environment bundle
   - Trigger: `cmd_env_export`, `cmd_env_import`.
-  - Success: export copies locked truth plus runtime `custom_nodes` snapshots into a verified directory bundle; import validates manifest/runtime compatibility, stages truth, exact-syncs prod, restores `custom_nodes`, updates target-local config, then smoke-tests.
+  - Success: export copies locked truth plus runtime `custom_nodes` snapshots into a verified `.tar` bundle; import safely unpacks, validates manifest/runtime compatibility, stages truth, exact-syncs prod, restores `custom_nodes`, updates target-local config, then smoke-tests.
   - Failure: export blocks on missing bundle inputs or source directories; import restores pre-op truth and affected `custom_nodes` before finalizing failure.
 
 ## Internal Components / Collaboration

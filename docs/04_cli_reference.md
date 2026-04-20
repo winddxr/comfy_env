@@ -130,9 +130,9 @@
 
 ## 4. 环境导出导入
 
-### `gov env export <output_dir>`
+### `gov env export <output_tar>`
 
-用途：导出当前已验证环境的目录型 bundle，用于跨机器整体恢复。
+用途：导出当前已验证环境的单文件 `.tar` bundle，用于跨机器整体恢复。
 
 关键行为：
 
@@ -140,17 +140,17 @@
 2. 使用 `uv export --format pylock.toml --locked --all-groups` 导出 `pylock.toml`；不会自动 re-lock。
 3. 从 `state/plugins.json` 枚举节点，并把每个节点当前运行态源码快照导出到 bundle 的 `custom_nodes/<node_id>/`。
 4. 节点快照保留工作树中的已修改文件和未跟踪文件，但会过滤 `.git/` 目录与 `.git` 指针文件，不把 Git 管理元数据带入 bundle。
-5. bundle 至少包含：`manifest.json`、`pyproject.toml`、`uv.lock`、`pylock.toml`、`state/plugins.json`、`audit/prod-freeze.txt`、`audit/export-summary.json`。
+5. tar 内部的 `bundle/` 至少包含：`manifest.json`、`pyproject.toml`、`uv.lock`、`pylock.toml`、`state/plugins.json`、`audit/prod-freeze.txt`、`audit/export-summary.json`。
 6. `paths.comfyui_dir` 只用于定位当前源码目录，不会被当成迁移真相写回目标机。
 
-### `gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>`
+### `gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>`
 
-用途：从目录型 bundle 整体恢复 root truth、插件注册和 `custom_nodes` 源码，并重建 `.venv-prod`。
+用途：从单文件 `.tar` bundle 整体恢复 root truth、插件注册和 `custom_nodes` 源码，并重建 `.venv-prod`。
 
 关键行为：
 
-1. 只支持目录 bundle，不支持 tarball。
-2. 先校验 `manifest.json` 与关键文件 SHA256，再校验 bundle 的 Python / 平台约束是否与目标机兼容，然后才进入 staging 恢复。
+1. 只支持 `.tar` bundle；archive 内必须只有一个顶层 `bundle/` 目录。
+2. 先安全解包到 staging 目录，再校验 `manifest.json` 与关键文件 SHA256，并校验 bundle 的 Python / 平台约束是否与目标机兼容，然后才进入 staging 恢复。
 3. 导入后的本地依赖真相仍然是 `pyproject.toml + uv.lock`；`pylock.toml` 仅作为交付物与审计文件保留。
 4. `--comfyui-dir` 和 `--python` 始终来自目标机 CLI 参数，不从 bundle 恢复；其中 `--python` 若是纯 minor 线则直接使用，否则会先通过 `uv python find --no-python-downloads` 解析目标机解释器，再规范化为 minor 线参与 lock/sync 并写回配置。
 5. 导入默认执行 exact restore：覆盖目标 root truth、prod env、插件注册，并清理 bundle 外的 `custom_nodes/*` 目录，使目标机与 bundle 一致。
