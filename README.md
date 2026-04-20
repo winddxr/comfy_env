@@ -30,8 +30,8 @@ ComfyUI 依赖治理系统。
 6. `./bin/gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]`
 7. `./bin/gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
 8. `./bin/gov update abort <txid>`
-9. `./bin/gov env export <output_dir>`
-10. `./bin/gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>`
+9. `./bin/gov env export <output_tar>`
+10. `./bin/gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>`
 11. `./bin/gov status`
 12. `./bin/gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]`
 13. `./bin/gov node remove <node_id> [--purge-code]`
@@ -140,14 +140,14 @@ TopDir/
 ## 8. 环境交付
 
 ```bash
-./bin/gov env export /abs/path/to/bundle-dir
-./bin/gov env import /abs/path/to/bundle-dir --comfyui-dir /abs/path/to/ComfyUI --python 3.12
+./bin/gov env export /abs/path/to/bundle.tar
+./bin/gov env import /abs/path/to/bundle.tar --comfyui-dir /abs/path/to/ComfyUI --python 3.12
 ```
 
 说明：
 
-1. `env export` 导出目录型 bundle，包含 `pyproject.toml`、`uv.lock`、`pylock.toml`、`state/plugins.json`、过滤 Git 元数据后的 `custom_nodes` 运行时源码快照和审计文件；快照保留工作树中的已修改文件和未跟踪文件。
-2. `env import` 只接受目录 bundle，不支持 tarball。
+1. `env export` 导出单文件 `.tar` bundle，tar 内部固定包含 `bundle/pyproject.toml`、`bundle/uv.lock`、`bundle/pylock.toml`、`bundle/state/plugins.json`、过滤 Git 元数据后的 `bundle/custom_nodes/*` 运行时源码快照和审计文件；快照保留工作树中的已修改文件和未跟踪文件。
+2. `env import` 只接受 `.tar` bundle，不支持目录 bundle 或 tarball 以外的输入。
 3. `env import --python` 和 `init --python` 采用同一套规则：纯 `major.minor` 直接使用，其他 selector 先解析到目标机已安装解释器，再规范化为 minor 线。
 4. `comfyui_dir` 是目标机本地配置，不属于 bundle 真相；导入时必须显式传入。
 5. 导入后的本地依赖真相仍然是 `pyproject.toml + uv.lock`；`pylock.toml` 是标准化交付物，不替代本地真相。

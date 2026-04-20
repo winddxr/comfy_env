@@ -1512,6 +1512,104 @@ for rel, expected in sha_map.items():
 PY
 }
 
+bundle_tar_create() {
+    local bundle_dir="$1"
+    local output_tar="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_dir" "$output_tar" <<'PY'
+import pathlib
+import tarfile
+import sys
+
+bundle_dir = pathlib.Path(sys.argv[1]).resolve()
+output_tar = pathlib.Path(sys.argv[2]).resolve()
+
+if not bundle_dir.exists() or not bundle_dir.is_dir():
+    raise SystemExit(f"ERROR: bundle directory not found: {bundle_dir}")
+if bundle_dir.name != "bundle":
+    raise SystemExit(f"ERROR: bundle directory must be named 'bundle': {bundle_dir}")
+if output_tar.exists():
+    raise SystemExit(f"ERROR: export path already exists: {output_tar}")
+
+with tarfile.open(output_tar, "w") as archive:
+    archive.add(bundle_dir, arcname="bundle")
+PY
+}
+
+bundle_tar_extract() {
+    local bundle_tar="$1"
+    local staging_dir="$2"
+    require_python
+    "${PYTHON_BIN}" - "$bundle_tar" "$staging_dir" <<'PY'
+import pathlib
+import tarfile
+import sys
+
+bundle_tar = pathlib.Path(sys.argv[1]).resolve()
+staging_dir = pathlib.Path(sys.argv[2]).resolve()
+
+if not bundle_tar.exists() or not bundle_tar.is_file():
+    raise SystemExit(f"ERROR: bundle tar not found: {bundle_tar}")
+
+staging_dir.mkdir(parents=True, exist_ok=True)
+
+def validate_member(member: tarfile.TarInfo) -> pathlib.PurePosixPath:
+    path = pathlib.PurePosixPath(member.name)
+    if not member.name or member.name.strip() == "":
+        raise SystemExit("ERROR: bundle tar contains empty member path")
+    if path.is_absolute():
+        raise SystemExit(f"ERROR: bundle tar contains absolute path: {member.name}")
+    if any(part in ("", ".", "..") for part in path.parts):
+        raise SystemExit(f"ERROR: bundle tar contains unsafe path: {member.name}")
+    if path.parts[0] != "bundle":
+        raise SystemExit("ERROR: bundle tar must contain exactly one top-level 'bundle/' directory")
+    if member.issym() or member.islnk():
+        raise SystemExit(f"ERROR: bundle tar does not allow links: {member.name}")
+    if not (member.isdir() or member.isreg()):
+        raise SystemExit(f"ERROR: bundle tar contains unsupported entry type: {member.name}")
+    return path
+
+with tarfile.open(bundle_tar, "r") as archive:
+    members = archive.getmembers()
+    if not members:
+        raise SystemExit(f"ERROR: bundle tar is empty: {bundle_tar}")
+
+    saw_bundle_root = False
+    for member in members:
+        path = validate_member(member)
+        if path == pathlib.PurePosixPath("bundle"):
+            saw_bundle_root = True
+
+    if not saw_bundle_root:
+        raise SystemExit("ERROR: bundle tar is missing top-level 'bundle/' directory")
+
+    for member in members:
+        path = pathlib.PurePosixPath(member.name)
+        destination = (staging_dir / pathlib.Path(*path.parts)).resolve()
+        try:
+            destination.relative_to(staging_dir)
+        except Exception:
+            raise SystemExit(f"ERROR: bundle tar escapes extraction root: {member.name}")
+
+        if member.isdir():
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = archive.extractfile(member)
+        if source is None:
+            raise SystemExit(f"ERROR: failed to extract bundle member: {member.name}")
+        with source, destination.open("wb") as handle:
+            handle.write(source.read())
+
+bundle_dir = staging_dir / "bundle"
+if not bundle_dir.exists() or not bundle_dir.is_dir():
+    raise SystemExit("ERROR: extracted bundle root missing after tar unpack")
+
+print(bundle_dir)
+PY
+}
+
 bundle_check_import_conflicts() {
     local bundle_dir="$1"
     local comfyui_dir="$2"
@@ -4472,9 +4570,13 @@ cmd_env_export() {
     require_cmd uv
     ensure_layout
 
-    local output_dir="${1:-}"
-    if [ -z "$output_dir" ]; then
-        echo "Usage: gov env export <output_dir>" >&2
+    local output_tar="${1:-}"
+    if [ -z "$output_tar" ]; then
+        echo "Usage: gov env export <output_tar>" >&2
+        exit 1
+    fi
+    if [[ "$output_tar" != *.tar ]]; then
+        echo "ERROR: export path must end with .tar: $output_tar" >&2
         exit 1
     fi
 
@@ -4502,45 +4604,75 @@ cmd_env_export() {
         exit 1
     fi
 
-    if [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; then
-        echo "ERROR: export path exists and is not a directory: $output_dir" >&2
+    local output_parent
+    output_parent="$(dirname "$output_tar")"
+    if [ ! -d "$output_parent" ]; then
+        echo "ERROR: export parent directory not found: $output_parent" >&2
         exit 1
     fi
-    if [ -d "$output_dir" ] && [ -n "$(find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
-        echo "ERROR: export directory is not empty: $output_dir" >&2
+    if [ -e "$output_tar" ]; then
+        echo "ERROR: export path already exists: $output_tar" >&2
         exit 1
     fi
 
-    mkdir -p "$output_dir/state" "$output_dir/audit" "$output_dir/custom_nodes"
+    local staging_dir bundle_dir
+    staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/gov-env-export.XXXXXX")"
+    bundle_dir="${staging_dir}/bundle"
+    mkdir -p "$bundle_dir/state" "$bundle_dir/audit" "$bundle_dir/custom_nodes"
 
-    cp "$PROJECT_FILE" "$output_dir/pyproject.toml"
-    cp "$LOCK_FILE" "$output_dir/uv.lock"
-    cp "$PLUGINS_FILE" "$output_dir/state/plugins.json"
-    bundle_export_pylock "$output_dir"
-    bundle_copy_custom_nodes "$output_dir" "$comfyui_dir" "$PLUGINS_FILE"
+    cp "$PROJECT_FILE" "$bundle_dir/pyproject.toml"
+    cp "$LOCK_FILE" "$bundle_dir/uv.lock"
+    cp "$PLUGINS_FILE" "$bundle_dir/state/plugins.json"
+    if ! bundle_export_pylock "$bundle_dir"; then
+        rm -rf "$staging_dir"
+        exit 1
+    fi
+    if ! bundle_copy_custom_nodes "$bundle_dir" "$comfyui_dir" "$PLUGINS_FILE"; then
+        rm -rf "$staging_dir"
+        exit 1
+    fi
 
     local prod_env created_at node_count
     prod_env="$(prod_env_path)"
-    collect_freeze_file "$prod_env" "$output_dir/audit/prod-freeze.txt"
+    collect_freeze_file "$prod_env" "$bundle_dir/audit/prod-freeze.txt"
     created_at="$(timestamp_utc)"
-    bundle_write_export_summary "$output_dir" "$created_at"
-    bundle_manifest_write "$output_dir" "$created_at"
-    node_count="$(bundle_node_count "$output_dir/state/plugins.json")"
+    if ! bundle_write_export_summary "$bundle_dir" "$created_at"; then
+        rm -rf "$staging_dir"
+        exit 1
+    fi
+    if ! bundle_manifest_write "$bundle_dir" "$created_at"; then
+        rm -rf "$staging_dir"
+        exit 1
+    fi
+    if ! bundle_tar_create "$bundle_dir" "$output_tar"; then
+        rm -rf "$staging_dir"
+        exit 1
+    fi
+    node_count="$(bundle_node_count "$bundle_dir/state/plugins.json")"
+    rm -rf "$staging_dir"
 
     echo "Environment bundle exported."
-    echo "  output_dir: $output_dir"
+    echo "  output_tar: $output_tar"
     echo "  python: $(configured_python)"
     echo "  node_count: $node_count"
-    echo "  manifest: $output_dir/manifest.json"
+    echo "  bundle_root: bundle/"
 }
 
 cmd_env_import() {
     require_cmd uv
 
-    local bundle_dir="${1:-}"
+    local bundle_tar="${1:-}"
     shift || true
-    if [ -z "$bundle_dir" ]; then
-        echo "Usage: gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>" >&2
+    if [ -z "$bundle_tar" ]; then
+        echo "Usage: gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>" >&2
+        exit 1
+    fi
+    if [[ "$bundle_tar" != *.tar ]]; then
+        echo "ERROR: bundle input must be a .tar file: $bundle_tar" >&2
+        exit 1
+    fi
+    if [ ! -f "$bundle_tar" ]; then
+        echo "ERROR: bundle tar not found: $bundle_tar" >&2
         exit 1
     fi
 
@@ -4564,23 +4696,39 @@ cmd_env_import() {
     done
 
     if [ -z "$comfyui_dir" ] || [ -z "$python_spec" ]; then
-        echo "Usage: gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>" >&2
+        echo "Usage: gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>" >&2
+        exit 1
+    fi
+
+    local extract_dir bundle_dir=""
+    extract_dir="$(mktemp -d "${TMPDIR:-/tmp}/gov-env-import.XXXXXX")"
+    if ! bundle_dir="$(bundle_tar_extract "$bundle_tar" "$extract_dir")"; then
+        rm -rf "$extract_dir"
         exit 1
     fi
 
     local normalized_python
     normalized_python="$(resolve_python_minor "$python_spec")"
 
-    bundle_manifest_verify "$bundle_dir"
-    bundle_check_runtime_compatibility "$bundle_dir" "$normalized_python"
+    if ! bundle_manifest_verify "$bundle_dir"; then
+        rm -rf "$extract_dir"
+        exit 1
+    fi
+    if ! bundle_check_runtime_compatibility "$bundle_dir" "$normalized_python"; then
+        rm -rf "$extract_dir"
+        exit 1
+    fi
 
     local pre_restore_py current_prod_env
     pre_restore_py="$(config_get "runtime.python" "$normalized_python")"
     current_prod_env="$(prod_env_path)"
-    bundle_check_import_conflicts "$bundle_dir" "$comfyui_dir"
+    if ! bundle_check_import_conflicts "$bundle_dir" "$comfyui_dir"; then
+        rm -rf "$extract_dir"
+        exit 1
+    fi
 
     local op_id
-    op_id="$(op_begin "env_import" "$bundle_dir")"
+    op_id="$(op_begin "env_import" "$bundle_tar")"
     bundle_backup_config "$op_id"
     bundle_backup_custom_nodes "$bundle_dir" "$op_id" "$comfyui_dir"
 
@@ -4594,6 +4742,7 @@ cmd_env_import() {
         echo "ERROR: bundle lock check failed" >&2
         env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
         op_finalize "$op_id" "failed" "false" "env import failed: bundle lock check failed"
+        rm -rf "$extract_dir"
         exit 1
     fi
 
@@ -4601,6 +4750,7 @@ cmd_env_import() {
         echo "ERROR: prod sync failed during env import" >&2
         env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
         op_finalize "$op_id" "failed" "false" "env import failed: prod sync failed"
+        rm -rf "$extract_dir"
         exit 1
     fi
 
@@ -4608,6 +4758,7 @@ cmd_env_import() {
         echo "ERROR: failed to restore custom_nodes payload" >&2
         env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
         op_finalize "$op_id" "failed" "false" "env import failed: custom_nodes restore failed"
+        rm -rf "$extract_dir"
         exit 1
     fi
 
@@ -4619,6 +4770,7 @@ cmd_env_import() {
         echo "ERROR: failed to update config.toml during env import" >&2
         env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
         op_finalize "$op_id" "failed" "false" "env import failed: config update failed"
+        rm -rf "$extract_dir"
         exit 1
     fi
 
@@ -4628,14 +4780,16 @@ cmd_env_import() {
         echo "ERROR: smoke test failed during env import" >&2
         env_import_restore_after_failure "$op_id" "$comfyui_dir" "$pre_restore_py"
         op_finalize "$op_id" "failed" "false" "env import failed: smoke test failed"
+        rm -rf "$extract_dir"
         exit 1
     fi
 
     op_finalize "$op_id" "success" "false" "env import succeeded"
     ops_prune
+    rm -rf "$extract_dir"
 
     echo "Environment bundle imported."
-    echo "  bundle_dir: $bundle_dir"
+    echo "  bundle_tar: $bundle_tar"
     echo "  comfyui_dir: $comfyui_dir"
     echo "  python: $normalized_python"
     echo "  op_id: $op_id"
@@ -5081,8 +5235,8 @@ Usage:
   gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]
   gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]
   gov update abort <txid>
-  gov env export <output_dir>
-  gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>
+  gov env export <output_tar>
+  gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>
   gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]
   gov node remove <node_id> [--purge-code]
   gov tx run <node_id> [--timeout <seconds>]

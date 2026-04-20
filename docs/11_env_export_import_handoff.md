@@ -48,22 +48,23 @@
 
 ## 4. 当前 bundle 结构
 
-当前实现只支持目录 bundle，不支持 tarball，结构如下：
+当前实现只支持 `.tar` bundle，archive 内固定只有一个顶层 `bundle/` 目录，结构如下：
 
 ```text
-bundle/
-├── manifest.json
-├── pylock.toml
-├── uv.lock
-├── pyproject.toml
-├── state/
-│   └── plugins.json
-├── custom_nodes/
-│   ├── <node_id_1>/
-│   └── <node_id_2>/
-└── audit/
-    ├── prod-freeze.txt
-    └── export-summary.json
+bundle.tar
+└── bundle/
+    ├── manifest.json
+    ├── pylock.toml
+    ├── uv.lock
+    ├── pyproject.toml
+    ├── state/
+    │   └── plugins.json
+    ├── custom_nodes/
+    │   ├── <node_id_1>/
+    │   └── <node_id_2>/
+    └── audit/
+        ├── prod-freeze.txt
+        └── export-summary.json
 ```
 
 说明：
@@ -96,8 +97,8 @@ bundle/
 
 ### 5.1 已实现命令
 
-1. `./bin/gov env export <output_path>`
-2. `./bin/gov env import <bundle_path> --comfyui-dir <abs-path> --python <python-spec>`
+1. `./bin/gov env export <output_tar>`
+2. `./bin/gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>`
 
 ### 5.2 可选后续命令
 
@@ -115,7 +116,7 @@ v1 先不做 `nodes-only import` 或 `partial import`。
    - `pyproject.toml` 与 `uv.lock` 存在
    - `state/plugins.json` 存在
    - `config.toml` 存在且 `paths.comfyui_dir` 可解析
-3. 仅接受不存在路径或空目录作为输出目录；已有非空目录会直接失败。
+3. 仅接受不存在的 `.tar` 输出路径；父目录必须已存在。
 4. 用 `--locked` 导出 `pylock.toml`；若 lock 已过期则直接失败，不自动刷新。
 5. 从 `state/plugins.json` 枚举已注册节点，并把每个 `install_relpath` 对应目录导出为运行时快照；保留未提交修改与未跟踪文件，但排除 `.git` 元数据。
 6. 若 registry 中任一节点的 `install_relpath` 缺失、越界或目标目录不存在，则 export 直接失败。
@@ -136,8 +137,8 @@ v1 先不做 `nodes-only import` 或 `partial import`。
 ### 6.2 Import
 
 1. 导入默认按 bundle 对目标机做精确恢复，不区分“空白目标”和“允许覆盖”两种模式。
-2. 只支持目录 bundle，不支持 tarball。
-3. 先校验 `manifest.json` 与关键文件完整性；校验失败即退出，不提前改写 root truth。
+2. 只支持 `.tar` bundle；archive 中必须只有一个顶层 `bundle/` 目录。
+3. 先安全解包 `bundle.tar` 到 staging 目录，再校验 `manifest.json` 与关键文件完整性；校验失败即退出，不提前改写 root truth。
 4. `--python` 若传入纯 `major.minor` 则直接使用；若传入 patch 版本或解释器选择器，则先通过 `uv python find --no-python-downloads` 解析目标机解释器，再规范化为 minor 线。
 5. 先校验目标机 Python minor 线是否与 bundle `requires-python` 兼容，并校验当前主机是否落在 bundle `[tool.uv].environments` 内。
 6. 导入前创建 `env_import` operation，备份 `config.toml` 与受影响的 `custom_nodes` 目录。
@@ -167,13 +168,15 @@ v1 先不做 `nodes-only import` 或 `partial import`。
 
 1. `bundle_manifest_write`
 2. `bundle_manifest_verify`
-3. `bundle_copy_custom_nodes`
-4. `bundle_stage_truth`
-5. `bundle_restore_plugins_registry`
-6. `bundle_export_pylock`
-7. `bundle_backup_custom_nodes`
-8. `bundle_apply_custom_nodes`
-9. `env_import_restore_after_failure`
+3. `bundle_tar_create`
+4. `bundle_tar_extract`
+5. `bundle_copy_custom_nodes`
+6. `bundle_stage_truth`
+7. `bundle_restore_plugins_registry`
+8. `bundle_export_pylock`
+9. `bundle_backup_custom_nodes`
+10. `bundle_apply_custom_nodes`
+11. `env_import_restore_after_failure`
 
 ### 7.3 导入路径现状
 

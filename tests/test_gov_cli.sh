@@ -570,6 +570,96 @@ assert_not_exists() {
     fi
 }
 
+assert_tar_entry_exists() {
+    local tar_path="$1"
+    local entry="$2"
+    python3 - "$tar_path" "$entry" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+tar_path = pathlib.Path(sys.argv[1])
+entry = sys.argv[2]
+with tarfile.open(tar_path, "r") as archive:
+    names = set(archive.getnames())
+if entry not in names:
+    raise SystemExit(f"assertion failed: expected tar entry to exist: {entry} in {tar_path}")
+PY
+}
+
+assert_tar_entry_absent() {
+    local tar_path="$1"
+    local entry="$2"
+    python3 - "$tar_path" "$entry" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+tar_path = pathlib.Path(sys.argv[1])
+entry = sys.argv[2]
+with tarfile.open(tar_path, "r") as archive:
+    names = set(archive.getnames())
+if entry in names:
+    raise SystemExit(f"assertion failed: expected tar entry to be absent: {entry} in {tar_path}")
+PY
+}
+
+extract_bundle_tar() {
+    local tar_path="$1"
+    local dst="$2"
+    python3 - "$tar_path" "$dst" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+tar_path = pathlib.Path(sys.argv[1])
+dst = pathlib.Path(sys.argv[2])
+dst.mkdir(parents=True, exist_ok=True)
+with tarfile.open(tar_path, "r") as archive:
+    archive.extractall(dst)
+bundle_dir = dst / "bundle"
+if not bundle_dir.exists():
+    raise SystemExit(f"expected extracted bundle root at {bundle_dir}")
+PY
+}
+
+repack_bundle_tar() {
+    local src_root="$1"
+    local tar_path="$2"
+    python3 - "$src_root" "$tar_path" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+src_root = pathlib.Path(sys.argv[1])
+tar_path = pathlib.Path(sys.argv[2])
+bundle_dir = src_root / "bundle"
+if not bundle_dir.exists():
+    raise SystemExit(f"bundle directory not found for repack: {bundle_dir}")
+with tarfile.open(tar_path, "w") as archive:
+    archive.add(bundle_dir, arcname="bundle")
+PY
+}
+
+update_bundle_manifest_checksum() {
+    local bundle_root="$1"
+    local rel="$2"
+    python3 - "$bundle_root" "$rel" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+bundle_root = pathlib.Path(sys.argv[1])
+rel = sys.argv[2]
+target = bundle_root / rel
+manifest_path = bundle_root / "manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+manifest["files"]["sha256"][rel] = hashlib.sha256(target.read_bytes()).hexdigest()
+manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+PY
+}
+
 help_out="$TMP_ROOT/help.txt"
 bash "$WORK_DIR/bin/gov" help >"$help_out"
 assert_contains "$help_out" "gov install torch --index-url <url> [--torch <torch==version>] [--torchvision <torchvision==version>] [--torchaudio <torchaudio==version>]"
@@ -577,8 +667,8 @@ assert_contains "$help_out" "gov pin add <pkg==version>..."
 assert_contains "$help_out" "gov pin list"
 assert_contains "$help_out" "gov pin remove <pkg>..."
 assert_contains "$help_out" "gov update run"
-assert_contains "$help_out" "gov env export <output_dir>"
-assert_contains "$help_out" "gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>"
+assert_contains "$help_out" "gov env export <output_tar>"
+assert_contains "$help_out" "gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>"
 assert_not_contains "$help_out" "[--force]"
 
 assert_not_exists "$WORK_DIR/pyproject.toml"
@@ -1081,23 +1171,25 @@ cat >"$WORK_DIR/state/plugins.json" <<'EOF'
 ]
 EOF
 
-BUNDLE_DIR="$TMP_ROOT/bundle"
-PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" env export "$BUNDLE_DIR" >"$TMP_ROOT/env-export.out"
-assert_file_exists "$BUNDLE_DIR/manifest.json"
-assert_file_exists "$BUNDLE_DIR/pyproject.toml"
-assert_file_exists "$BUNDLE_DIR/uv.lock"
-assert_file_exists "$BUNDLE_DIR/pylock.toml"
-assert_file_exists "$BUNDLE_DIR/state/plugins.json"
-assert_file_exists "$BUNDLE_DIR/custom_nodes/demo-node/__init__.py"
-assert_file_exists "$BUNDLE_DIR/custom_nodes/demo-node/runtime-extra.txt"
-assert_not_exists "$BUNDLE_DIR/custom_nodes/demo-node/.git"
-assert_file_exists "$BUNDLE_DIR/custom_nodes/linked-node/__init__.py"
-assert_not_exists "$BUNDLE_DIR/custom_nodes/linked-node/.git"
-assert_file_exists "$BUNDLE_DIR/audit/prod-freeze.txt"
-assert_file_exists "$BUNDLE_DIR/audit/export-summary.json"
+BUNDLE_TAR="$TMP_ROOT/bundle.tar"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" env export "$BUNDLE_TAR" >"$TMP_ROOT/env-export.out"
+assert_file_exists "$BUNDLE_TAR"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle/manifest.json"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle/pyproject.toml"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle/uv.lock"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle/pylock.toml"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle/state/plugins.json"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle/custom_nodes/demo-node/__init__.py"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle/custom_nodes/demo-node/runtime-extra.txt"
+assert_tar_entry_absent "$BUNDLE_TAR" "bundle/custom_nodes/demo-node/.git"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle/custom_nodes/linked-node/__init__.py"
+assert_tar_entry_absent "$BUNDLE_TAR" "bundle/custom_nodes/linked-node/.git"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle/audit/prod-freeze.txt"
+assert_tar_entry_exists "$BUNDLE_TAR" "bundle/audit/export-summary.json"
 
 set +e
-FAKE_UV_EXPORT_FAIL=1 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" env export "$TMP_ROOT/bundle-export-fail" >"$TMP_ROOT/env-export-fail.out" 2>"$TMP_ROOT/env-export-fail.err"
+FAKE_UV_EXPORT_FAIL=1 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" env export "$TMP_ROOT/bundle-export-fail.tar" >"$TMP_ROOT/env-export-fail.out" 2>"$TMP_ROOT/env-export-fail.err"
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
@@ -1108,7 +1200,7 @@ assert_contains "$TMP_ROOT/env-export-fail.err" "export failed"
 
 rm -rf "$TMP_ROOT/ComfyUI/custom_nodes/demo-node"
 set +e
-PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" env export "$TMP_ROOT/bundle-missing-node" >"$TMP_ROOT/env-export-missing.out" 2>"$TMP_ROOT/env-export-missing.err"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" env export "$TMP_ROOT/bundle-missing-node.tar" >"$TMP_ROOT/env-export-missing.out" 2>"$TMP_ROOT/env-export-missing.err"
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
@@ -1122,7 +1214,7 @@ IMPORT_WORK_DIR="$TMP_ROOT/import-work"
 reset_local_state "$IMPORT_WORK_DIR"
 IMPORT_COMFY="$TMP_ROOT/ComfyUI-import"
 mkdir -p "$IMPORT_COMFY"
-PATH="$FAKE_BIN:$PATH" bash "$IMPORT_WORK_DIR/bin/gov" env import "$BUNDLE_DIR" --comfyui-dir "$IMPORT_COMFY" --python 3.12 >"$TMP_ROOT/env-import.out"
+PATH="$FAKE_BIN:$PATH" bash "$IMPORT_WORK_DIR/bin/gov" env import "$BUNDLE_TAR" --comfyui-dir "$IMPORT_COMFY" --python 3.12 >"$TMP_ROOT/env-import.out"
 assert_file_exists "$IMPORT_WORK_DIR/pyproject.toml"
 assert_file_exists "$IMPORT_WORK_DIR/uv.lock"
 assert_file_exists "$IMPORT_WORK_DIR/state/plugins.json"
@@ -1136,13 +1228,13 @@ assert_contains "$IMPORT_WORK_DIR/config.toml" "python = \"3.12\""
 assert_contains "$IMPORT_WORK_DIR/state/plugins.json" "\"demo-node\""
 assert_contains "$IMPORT_WORK_DIR/state/plugins.json" "\"linked-node\""
 
-REEXPORT_DIR="$TMP_ROOT/bundle-reexport"
-PATH="$FAKE_BIN:$PATH" bash "$IMPORT_WORK_DIR/bin/gov" env export "$REEXPORT_DIR" >"$TMP_ROOT/env-reexport.out"
-assert_file_exists "$REEXPORT_DIR/custom_nodes/demo-node/__init__.py"
-assert_file_exists "$REEXPORT_DIR/custom_nodes/demo-node/runtime-extra.txt"
-assert_file_exists "$REEXPORT_DIR/custom_nodes/linked-node/__init__.py"
-assert_not_exists "$REEXPORT_DIR/custom_nodes/demo-node/.git"
-assert_not_exists "$REEXPORT_DIR/custom_nodes/linked-node/.git"
+REEXPORT_TAR="$TMP_ROOT/bundle-reexport.tar"
+PATH="$FAKE_BIN:$PATH" bash "$IMPORT_WORK_DIR/bin/gov" env export "$REEXPORT_TAR" >"$TMP_ROOT/env-reexport.out"
+assert_tar_entry_exists "$REEXPORT_TAR" "bundle/custom_nodes/demo-node/__init__.py"
+assert_tar_entry_exists "$REEXPORT_TAR" "bundle/custom_nodes/demo-node/runtime-extra.txt"
+assert_tar_entry_exists "$REEXPORT_TAR" "bundle/custom_nodes/linked-node/__init__.py"
+assert_tar_entry_absent "$REEXPORT_TAR" "bundle/custom_nodes/demo-node/.git"
+assert_tar_entry_absent "$REEXPORT_TAR" "bundle/custom_nodes/linked-node/.git"
 
 copy_fresh_workspace "$TMP_ROOT/import-python-mismatch-work"
 PY_MISMATCH_WORK_DIR="$TMP_ROOT/import-python-mismatch-work"
@@ -1150,7 +1242,7 @@ reset_local_state "$PY_MISMATCH_WORK_DIR"
 PY_MISMATCH_COMFY="$TMP_ROOT/ComfyUI-import-python-mismatch"
 mkdir -p "$PY_MISMATCH_COMFY"
 set +e
-PATH="$FAKE_BIN:$PATH" bash "$PY_MISMATCH_WORK_DIR/bin/gov" env import "$BUNDLE_DIR" --comfyui-dir "$PY_MISMATCH_COMFY" --python 3.11 >"$TMP_ROOT/env-import-python-mismatch.out" 2>"$TMP_ROOT/env-import-python-mismatch.err"
+PATH="$FAKE_BIN:$PATH" bash "$PY_MISMATCH_WORK_DIR/bin/gov" env import "$BUNDLE_TAR" --comfyui-dir "$PY_MISMATCH_COMFY" --python 3.11 >"$TMP_ROOT/env-import-python-mismatch.out" 2>"$TMP_ROOT/env-import-python-mismatch.err"
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
@@ -1160,15 +1252,15 @@ fi
 assert_contains "$TMP_ROOT/env-import-python-mismatch.err" "bundle requires-python is ==3.12.*"
 assert_not_exists "$PY_MISMATCH_WORK_DIR/state/plugins.json"
 
-cp -a "$BUNDLE_DIR" "$TMP_ROOT/bundle-python-spacing"
-python3 - "$TMP_ROOT/bundle-python-spacing" <<'PY'
-import json
+cp "$BUNDLE_TAR" "$TMP_ROOT/bundle-python-spacing.tar"
+extract_bundle_tar "$TMP_ROOT/bundle-python-spacing.tar" "$TMP_ROOT/bundle-python-spacing-edit"
+python3 - "$TMP_ROOT/bundle-python-spacing-edit/bundle" <<'PY'
 import pathlib
 import re
 import sys
 
-bundle = pathlib.Path(sys.argv[1])
-project_path = bundle / "pyproject.toml"
+bundle_root = pathlib.Path(sys.argv[1])
+project_path = bundle_root / "pyproject.toml"
 text = project_path.read_text(encoding="utf-8")
 text = re.sub(
     r'requires-python\s*=\s*"==3\.12\.\*"',
@@ -1177,30 +1269,27 @@ text = re.sub(
     count=1,
 )
 project_path.write_text(text, encoding="utf-8")
-
-manifest_path = bundle / "manifest.json"
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-manifest["files"]["sha256"]["pyproject.toml"] = __import__("hashlib").sha256(project_path.read_bytes()).hexdigest()
-manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 PY
+update_bundle_manifest_checksum "$TMP_ROOT/bundle-python-spacing-edit/bundle" "pyproject.toml"
+repack_bundle_tar "$TMP_ROOT/bundle-python-spacing-edit" "$TMP_ROOT/bundle-python-spacing.tar"
 copy_fresh_workspace "$TMP_ROOT/import-python-spacing-work"
 PY_SPACING_WORK_DIR="$TMP_ROOT/import-python-spacing-work"
 reset_local_state "$PY_SPACING_WORK_DIR"
 PY_SPACING_COMFY="$TMP_ROOT/ComfyUI-import-python-spacing"
 mkdir -p "$PY_SPACING_COMFY"
-PATH="$FAKE_BIN:$PATH" bash "$PY_SPACING_WORK_DIR/bin/gov" env import "$TMP_ROOT/bundle-python-spacing" --comfyui-dir "$PY_SPACING_COMFY" --python 3.12 >"$TMP_ROOT/env-import-python-spacing.out"
+PATH="$FAKE_BIN:$PATH" bash "$PY_SPACING_WORK_DIR/bin/gov" env import "$TMP_ROOT/bundle-python-spacing.tar" --comfyui-dir "$PY_SPACING_COMFY" --python 3.12 >"$TMP_ROOT/env-import-python-spacing.out"
 assert_file_exists "$PY_SPACING_WORK_DIR/state/plugins.json"
 assert_file_exists "$PY_SPACING_COMFY/custom_nodes/demo-node/__init__.py"
 
-cp -a "$BUNDLE_DIR" "$TMP_ROOT/bundle-platform-subset"
-python3 - "$TMP_ROOT/bundle-platform-subset" <<'PY'
-import json
+cp "$BUNDLE_TAR" "$TMP_ROOT/bundle-platform-subset.tar"
+extract_bundle_tar "$TMP_ROOT/bundle-platform-subset.tar" "$TMP_ROOT/bundle-platform-subset-edit"
+python3 - "$TMP_ROOT/bundle-platform-subset-edit/bundle" <<'PY'
 import pathlib
 import re
 import sys
 
-bundle = pathlib.Path(sys.argv[1])
-project_path = bundle / "pyproject.toml"
+bundle_root = pathlib.Path(sys.argv[1])
+project_path = bundle_root / "pyproject.toml"
 text = project_path.read_text(encoding="utf-8")
 text = re.sub(
     r"(environments\s*=\s*\[\s*\")([^\"]+)(\",\s*\])",
@@ -1210,30 +1299,27 @@ text = re.sub(
     flags=re.MULTILINE | re.DOTALL,
 )
 project_path.write_text(text, encoding="utf-8")
-
-manifest_path = bundle / "manifest.json"
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-manifest["files"]["sha256"]["pyproject.toml"] = __import__("hashlib").sha256(project_path.read_bytes()).hexdigest()
-manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 PY
+update_bundle_manifest_checksum "$TMP_ROOT/bundle-platform-subset-edit/bundle" "pyproject.toml"
+repack_bundle_tar "$TMP_ROOT/bundle-platform-subset-edit" "$TMP_ROOT/bundle-platform-subset.tar"
 copy_fresh_workspace "$TMP_ROOT/import-platform-subset-work"
 PLATFORM_SUBSET_WORK_DIR="$TMP_ROOT/import-platform-subset-work"
 reset_local_state "$PLATFORM_SUBSET_WORK_DIR"
 PLATFORM_SUBSET_COMFY="$TMP_ROOT/ComfyUI-import-platform-subset"
 mkdir -p "$PLATFORM_SUBSET_COMFY"
-PATH="$FAKE_BIN:$PATH" bash "$PLATFORM_SUBSET_WORK_DIR/bin/gov" env import "$TMP_ROOT/bundle-platform-subset" --comfyui-dir "$PLATFORM_SUBSET_COMFY" --python 3.12 >"$TMP_ROOT/env-import-platform-subset.out"
+PATH="$FAKE_BIN:$PATH" bash "$PLATFORM_SUBSET_WORK_DIR/bin/gov" env import "$TMP_ROOT/bundle-platform-subset.tar" --comfyui-dir "$PLATFORM_SUBSET_COMFY" --python 3.12 >"$TMP_ROOT/env-import-platform-subset.out"
 assert_file_exists "$PLATFORM_SUBSET_WORK_DIR/state/plugins.json"
 assert_file_exists "$PLATFORM_SUBSET_COMFY/custom_nodes/demo-node/__init__.py"
 
-cp -a "$BUNDLE_DIR" "$TMP_ROOT/bundle-platform-mismatch"
-python3 - "$TMP_ROOT/bundle-platform-mismatch" <<'PY'
-import json
+cp "$BUNDLE_TAR" "$TMP_ROOT/bundle-platform-mismatch.tar"
+extract_bundle_tar "$TMP_ROOT/bundle-platform-mismatch.tar" "$TMP_ROOT/bundle-platform-mismatch-edit"
+python3 - "$TMP_ROOT/bundle-platform-mismatch-edit/bundle" <<'PY'
 import pathlib
 import re
 import sys
 
-bundle = pathlib.Path(sys.argv[1])
-project_path = bundle / "pyproject.toml"
+bundle_root = pathlib.Path(sys.argv[1])
+project_path = bundle_root / "pyproject.toml"
 text = project_path.read_text(encoding="utf-8")
 text = re.sub(
     r"(environments\s*=\s*\[\s*\")([^\"]+)(\",\s*\])",
@@ -1243,19 +1329,16 @@ text = re.sub(
     flags=re.MULTILINE | re.DOTALL,
 )
 project_path.write_text(text, encoding="utf-8")
-
-manifest_path = bundle / "manifest.json"
-manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-manifest["files"]["sha256"]["pyproject.toml"] = __import__("hashlib").sha256(project_path.read_bytes()).hexdigest()
-manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 PY
+update_bundle_manifest_checksum "$TMP_ROOT/bundle-platform-mismatch-edit/bundle" "pyproject.toml"
+repack_bundle_tar "$TMP_ROOT/bundle-platform-mismatch-edit" "$TMP_ROOT/bundle-platform-mismatch.tar"
 copy_fresh_workspace "$TMP_ROOT/import-platform-mismatch-work"
 PLATFORM_MISMATCH_WORK_DIR="$TMP_ROOT/import-platform-mismatch-work"
 reset_local_state "$PLATFORM_MISMATCH_WORK_DIR"
 PLATFORM_MISMATCH_COMFY="$TMP_ROOT/ComfyUI-import-platform-mismatch"
 mkdir -p "$PLATFORM_MISMATCH_COMFY"
 set +e
-PATH="$FAKE_BIN:$PATH" bash "$PLATFORM_MISMATCH_WORK_DIR/bin/gov" env import "$TMP_ROOT/bundle-platform-mismatch" --comfyui-dir "$PLATFORM_MISMATCH_COMFY" --python 3.12 >"$TMP_ROOT/env-import-platform-mismatch.out" 2>"$TMP_ROOT/env-import-platform-mismatch.err"
+PATH="$FAKE_BIN:$PATH" bash "$PLATFORM_MISMATCH_WORK_DIR/bin/gov" env import "$TMP_ROOT/bundle-platform-mismatch.tar" --comfyui-dir "$PLATFORM_MISMATCH_COMFY" --python 3.12 >"$TMP_ROOT/env-import-platform-mismatch.out" 2>"$TMP_ROOT/env-import-platform-mismatch.err"
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
@@ -1265,13 +1348,15 @@ fi
 assert_contains "$TMP_ROOT/env-import-platform-mismatch.err" "bundle environments do not support this host"
 assert_not_exists "$PLATFORM_MISMATCH_WORK_DIR/state/plugins.json"
 
-cp -a "$BUNDLE_DIR" "$TMP_ROOT/bundle-corrupt"
-printf '\n# corrupt\n' >>"$TMP_ROOT/bundle-corrupt/pyproject.toml"
+cp "$BUNDLE_TAR" "$TMP_ROOT/bundle-corrupt.tar"
+extract_bundle_tar "$TMP_ROOT/bundle-corrupt.tar" "$TMP_ROOT/bundle-corrupt-edit"
+printf '\n# corrupt\n' >>"$TMP_ROOT/bundle-corrupt-edit/bundle/pyproject.toml"
+repack_bundle_tar "$TMP_ROOT/bundle-corrupt-edit" "$TMP_ROOT/bundle-corrupt.tar"
 copy_fresh_workspace "$TMP_ROOT/import-corrupt-work"
 reset_local_state "$TMP_ROOT/import-corrupt-work"
 mkdir -p "$TMP_ROOT/ComfyUI-import-corrupt"
 set +e
-PATH="$FAKE_BIN:$PATH" bash "$TMP_ROOT/import-corrupt-work/bin/gov" env import "$TMP_ROOT/bundle-corrupt" --comfyui-dir "$TMP_ROOT/ComfyUI-import-corrupt" --python 3.12 >"$TMP_ROOT/env-import-corrupt.out" 2>"$TMP_ROOT/env-import-corrupt.err"
+PATH="$FAKE_BIN:$PATH" bash "$TMP_ROOT/import-corrupt-work/bin/gov" env import "$TMP_ROOT/bundle-corrupt.tar" --comfyui-dir "$TMP_ROOT/ComfyUI-import-corrupt" --python 3.12 >"$TMP_ROOT/env-import-corrupt.out" 2>"$TMP_ROOT/env-import-corrupt.err"
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
@@ -1279,6 +1364,92 @@ if [ "$rc" -eq 0 ]; then
     exit 1
 fi
 assert_contains "$TMP_ROOT/env-import-corrupt.err" "bundle checksum mismatch"
+
+cp "$BUNDLE_TAR" "$TMP_ROOT/bundle-missing-file.tar"
+extract_bundle_tar "$TMP_ROOT/bundle-missing-file.tar" "$TMP_ROOT/bundle-missing-file-edit"
+rm -f "$TMP_ROOT/bundle-missing-file-edit/bundle/pyproject.toml"
+repack_bundle_tar "$TMP_ROOT/bundle-missing-file-edit" "$TMP_ROOT/bundle-missing-file.tar"
+copy_fresh_workspace "$TMP_ROOT/import-missing-file-work"
+reset_local_state "$TMP_ROOT/import-missing-file-work"
+mkdir -p "$TMP_ROOT/ComfyUI-import-missing-file"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$TMP_ROOT/import-missing-file-work/bin/gov" env import "$TMP_ROOT/bundle-missing-file.tar" --comfyui-dir "$TMP_ROOT/ComfyUI-import-missing-file" --python 3.12 >"$TMP_ROOT/env-import-missing-file.out" 2>"$TMP_ROOT/env-import-missing-file.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected env import failure for bundle missing key file" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/env-import-missing-file.err" "bundle file missing: pyproject.toml"
+
+printf 'not a tar archive\n' >"$TMP_ROOT/not-a-bundle.txt"
+copy_fresh_workspace "$TMP_ROOT/import-not-tar-work"
+reset_local_state "$TMP_ROOT/import-not-tar-work"
+mkdir -p "$TMP_ROOT/ComfyUI-import-not-tar"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$TMP_ROOT/import-not-tar-work/bin/gov" env import "$TMP_ROOT/not-a-bundle.txt" --comfyui-dir "$TMP_ROOT/ComfyUI-import-not-tar" --python 3.12 >"$TMP_ROOT/env-import-not-tar.out" 2>"$TMP_ROOT/env-import-not-tar.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected env import failure for non-tar input" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/env-import-not-tar.err" "bundle input must be a .tar file"
+
+python3 - "$TMP_ROOT/bundle-no-top-level.tar" <<'PY'
+import io
+import pathlib
+import tarfile
+import sys
+
+tar_path = pathlib.Path(sys.argv[1])
+payload = b"demo"
+with tarfile.open(tar_path, "w") as archive:
+    info = tarfile.TarInfo("wrong")
+    info.type = tarfile.DIRTYPE
+    archive.addfile(info)
+    file_info = tarfile.TarInfo("wrong/manifest.json")
+    file_info.size = len(payload)
+    archive.addfile(file_info, io.BytesIO(payload))
+PY
+copy_fresh_workspace "$TMP_ROOT/import-no-top-level-work"
+reset_local_state "$TMP_ROOT/import-no-top-level-work"
+mkdir -p "$TMP_ROOT/ComfyUI-import-no-top-level"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$TMP_ROOT/import-no-top-level-work/bin/gov" env import "$TMP_ROOT/bundle-no-top-level.tar" --comfyui-dir "$TMP_ROOT/ComfyUI-import-no-top-level" --python 3.12 >"$TMP_ROOT/env-import-no-top-level.out" 2>"$TMP_ROOT/env-import-no-top-level.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected env import failure for tar without top-level bundle dir" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/env-import-no-top-level.err" "top-level 'bundle/' directory"
+
+python3 - "$TMP_ROOT/bundle-unsafe-path.tar" <<'PY'
+import io
+import pathlib
+import tarfile
+import sys
+
+tar_path = pathlib.Path(sys.argv[1])
+payload = b"demo"
+with tarfile.open(tar_path, "w") as archive:
+    info = tarfile.TarInfo("../escape.txt")
+    info.size = len(payload)
+    archive.addfile(info, io.BytesIO(payload))
+PY
+copy_fresh_workspace "$TMP_ROOT/import-unsafe-path-work"
+reset_local_state "$TMP_ROOT/import-unsafe-path-work"
+mkdir -p "$TMP_ROOT/ComfyUI-import-unsafe-path"
+set +e
+PATH="$FAKE_BIN:$PATH" bash "$TMP_ROOT/import-unsafe-path-work/bin/gov" env import "$TMP_ROOT/bundle-unsafe-path.tar" --comfyui-dir "$TMP_ROOT/ComfyUI-import-unsafe-path" --python 3.12 >"$TMP_ROOT/env-import-unsafe-path.out" 2>"$TMP_ROOT/env-import-unsafe-path.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected env import failure for unsafe tar path" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/env-import-unsafe-path.err" "bundle tar contains unsafe path"
 
 copy_fresh_workspace "$TMP_ROOT/import-conflict-work"
 EXACT_WORK_DIR="$TMP_ROOT/import-conflict-work"
@@ -1314,7 +1485,7 @@ EOF
 cat >"$EXACT_COMFY/custom_nodes/legacy-node/legacy.txt" <<'EOF'
 legacy node
 EOF
-PATH="$FAKE_BIN:$PATH" bash "$EXACT_WORK_DIR/bin/gov" env import "$BUNDLE_DIR" --comfyui-dir "$EXACT_COMFY" --python 3.12 >"$TMP_ROOT/env-import-exact.out"
+PATH="$FAKE_BIN:$PATH" bash "$EXACT_WORK_DIR/bin/gov" env import "$BUNDLE_TAR" --comfyui-dir "$EXACT_COMFY" --python 3.12 >"$TMP_ROOT/env-import-exact.out"
 assert_file_exists "$EXACT_COMFY/custom_nodes/demo-node/__init__.py"
 assert_not_exists "$EXACT_COMFY/custom_nodes/legacy-node"
 assert_contains "$EXACT_WORK_DIR/state/plugins.json" "\"demo-node\""
@@ -1327,7 +1498,7 @@ RELATIVE_WORK_DIR="$TMP_ROOT/import-relative-work"
 reset_local_state "$RELATIVE_WORK_DIR"
 mkdir -p "$ROOT_DIR/../relative-comfy"
 set +e
-(cd "$ROOT_DIR" && PATH="$FAKE_BIN:$PATH" bash "$RELATIVE_WORK_DIR/bin/gov" env import "$BUNDLE_DIR" --comfyui-dir ../relative-comfy --python 3.12 >"$TMP_ROOT/env-import-relative.out" 2>"$TMP_ROOT/env-import-relative.err")
+(cd "$ROOT_DIR" && PATH="$FAKE_BIN:$PATH" bash "$RELATIVE_WORK_DIR/bin/gov" env import "$BUNDLE_TAR" --comfyui-dir ../relative-comfy --python 3.12 >"$TMP_ROOT/env-import-relative.out" 2>"$TMP_ROOT/env-import-relative.err")
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
@@ -1342,7 +1513,7 @@ reset_local_state "$LOCKFAIL_WORK_DIR"
 LOCKFAIL_COMFY="$TMP_ROOT/ComfyUI-import-lockfail"
 mkdir -p "$LOCKFAIL_COMFY"
 set +e
-FAKE_UV_LOCK_CHECK_FAIL=1 PATH="$FAKE_BIN:$PATH" bash "$LOCKFAIL_WORK_DIR/bin/gov" env import "$BUNDLE_DIR" --comfyui-dir "$LOCKFAIL_COMFY" --python 3.12 >"$TMP_ROOT/env-import-lockfail.out" 2>"$TMP_ROOT/env-import-lockfail.err"
+FAKE_UV_LOCK_CHECK_FAIL=1 PATH="$FAKE_BIN:$PATH" bash "$LOCKFAIL_WORK_DIR/bin/gov" env import "$BUNDLE_TAR" --comfyui-dir "$LOCKFAIL_COMFY" --python 3.12 >"$TMP_ROOT/env-import-lockfail.out" 2>"$TMP_ROOT/env-import-lockfail.err"
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
@@ -1398,7 +1569,7 @@ cat >"$ROLLBACK_COMFY/custom_nodes/legacy-node/legacy.txt" <<'EOF'
 legacy node
 EOF
 set +e
-FAKE_PYTHON_EXIT_CODE=1 PATH="$FAKE_BIN:$PATH" bash "$ROLLBACK_WORK_DIR/bin/gov" env import "$BUNDLE_DIR" --comfyui-dir "$ROLLBACK_COMFY" --python 3.12 >"$TMP_ROOT/env-import-rollback.out" 2>"$TMP_ROOT/env-import-rollback.err"
+FAKE_PYTHON_EXIT_CODE=1 PATH="$FAKE_BIN:$PATH" bash "$ROLLBACK_WORK_DIR/bin/gov" env import "$BUNDLE_TAR" --comfyui-dir "$ROLLBACK_COMFY" --python 3.12 >"$TMP_ROOT/env-import-rollback.out" 2>"$TMP_ROOT/env-import-rollback.err"
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then

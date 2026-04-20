@@ -22,7 +22,7 @@
 - Runtime liveness hint:
   - `state/comfyui.pid`
 - Transfer artifact:
-  - `env export` bundle directory (`manifest.json`, `pyproject.toml`, `uv.lock`, `pylock.toml`, `state/plugins.json`, `custom_nodes/*`, audit files)
+  - `env export` bundle tar (`bundle/manifest.json`, `bundle/pyproject.toml`, `bundle/uv.lock`, `bundle/pylock.toml`, `bundle/state/plugins.json`, `bundle/custom_nodes/*`, `bundle/audit/*`)
 
 ## Ownership Rules
 

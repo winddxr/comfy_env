@@ -30,8 +30,8 @@
   - Input: optional `--sync`, passthrough ComfyUI args, PID file presence.
   - Output: foreground exec into ComfyUI or explicit stop result.
 - Environment Handoff Contract
-  - Input: `env export <output_dir>` or `env import <bundle_dir> --comfyui-dir --python`, where `--python` can be a canonical minor line or a selector resolvable on the target machine.
-  - Output: a verified directory bundle for export, or a staged-and-committed exact restore for import.
+  - Input: `env export <output_tar>` or `env import <bundle_tar> --comfyui-dir --python`, where `--python` can be a canonical minor line or a selector resolvable on the target machine.
+  - Output: a verified `.tar` bundle for export, or a staged-and-committed exact restore for import.
 
 ## Error Taxonomy
 

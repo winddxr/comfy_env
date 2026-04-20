@@ -72,8 +72,8 @@
 
 ### 4.5 环境交付
 
-1. `./bin/gov env export <output_dir>`
-2. `./bin/gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>`
+1. `./bin/gov env export <output_tar>`
+2. `./bin/gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>`
 
 ### 4.6 审计与运行
 
@@ -131,13 +131,13 @@
 ### 5.6 环境交付
 
 ```bash
-./bin/gov env export /abs/path/to/bundle-dir
-./bin/gov env import /abs/path/to/bundle-dir --comfyui-dir /abs/path/to/ComfyUI --python 3.12
+./bin/gov env export /abs/path/to/bundle.tar
+./bin/gov env import /abs/path/to/bundle.tar --comfyui-dir /abs/path/to/ComfyUI --python 3.12
 ```
 
 说明：
 
-1. `env export` 导出的是 `custom_nodes` 运行态源码快照，不依赖导入端重新拉 Git。
+1. `env export` 导出的是 `.tar` bundle，内部包含 `custom_nodes` 运行态源码快照，不依赖导入端重新拉 Git。
 2. 快照会保留工作树中的已修改文件和未跟踪文件，但不会把 `.git` 元数据带进 bundle。
 3. `env import` 默认是 exact restore，会清理 bundle 外的 `custom_nodes/*` 目录。
 
