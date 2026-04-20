@@ -670,8 +670,10 @@ assert_contains "$help_out" "gov pin add <pkg==version>..."
 assert_contains "$help_out" "gov pin list"
 assert_contains "$help_out" "gov pin remove <pkg>..."
 assert_contains "$help_out" "gov update run"
+assert_contains "$help_out" "gov update promote <txid> [--approve-core --reason \"...\"] [--allow-failed-run] [--keep-artifacts]"
 assert_contains "$help_out" "gov env export <output_tar>"
 assert_contains "$help_out" "gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>"
+assert_contains "$help_out" "gov tx promote <txid> [--approve-core --reason \"...\"] [--allow-failed-run] [--keep-artifacts]"
 assert_not_contains "$help_out" "[--force]"
 
 assert_not_exists "$WORK_DIR/pyproject.toml"
@@ -1167,6 +1169,91 @@ assert_contains "$TMP_ROOT/update-inspect.out" "kind: core_update"
 assert_contains "$TMP_ROOT/update-inspect.out" "status: completed"
 assert_contains "$TMP_ROOT/update-inspect.out" "run_exit_code: 124"
 
+update_candidate_env="$WORK_DIR/.venv-candidate/$update_txid"
+update_staged_workdir="$WORK_DIR/state/work/$update_txid"
+assert_file_exists "$update_candidate_env"
+assert_file_exists "$update_staged_workdir"
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update promote "$update_txid" >"$TMP_ROOT/update-promote.out"
+assert_contains "$TMP_ROOT/update-promote.out" "Core update promoted."
+assert_not_exists "$update_candidate_env"
+assert_not_exists "$update_staged_workdir"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update inspect "$update_txid" >"$TMP_ROOT/update-inspect-promoted.out"
+assert_contains "$TMP_ROOT/update-inspect-promoted.out" "status: promoted"
+assert_contains "$TMP_ROOT/update-inspect-promoted.out" "candidate_env: $update_candidate_env (cleaned)"
+assert_contains "$TMP_ROOT/update-inspect-promoted.out" "staged_workdir: $update_staged_workdir (cleaned)"
+
+cat >"$TMP_ROOT/ComfyUI/requirements.txt" <<'EOF'
+torch==2.11.1
+torchvision==0.26.1
+torchaudio==2.11.1
+numpy==1.26.5
+EOF
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update run >"$TMP_ROOT/update-keep-run.out" 2>"$TMP_ROOT/update-keep-run.err"
+update_keep_txid="$(python3 - "$TMP_ROOT/update-keep-run.out" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r"txid:\s*(\S+)", text)
+if not match:
+    raise SystemExit("missing txid in update-keep-run output")
+print(match.group(1))
+PY
+)"
+update_keep_candidate_env="$WORK_DIR/.venv-candidate/$update_keep_txid"
+update_keep_staged_workdir="$WORK_DIR/state/work/$update_keep_txid"
+assert_file_exists "$update_keep_candidate_env"
+assert_file_exists "$update_keep_staged_workdir"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update promote "$update_keep_txid" --keep-artifacts >"$TMP_ROOT/update-keep-promote.out"
+assert_contains "$TMP_ROOT/update-keep-promote.out" "Core update promoted."
+assert_file_exists "$update_keep_candidate_env"
+assert_file_exists "$update_keep_staged_workdir"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update inspect "$update_keep_txid" >"$TMP_ROOT/update-keep-inspect.out"
+assert_contains "$TMP_ROOT/update-keep-inspect.out" "status: promoted"
+assert_contains "$TMP_ROOT/update-keep-inspect.out" "candidate_env: $update_keep_candidate_env"
+assert_contains "$TMP_ROOT/update-keep-inspect.out" "staged_workdir: $update_keep_staged_workdir"
+assert_not_contains "$TMP_ROOT/update-keep-inspect.out" "$update_keep_candidate_env (cleaned)"
+assert_not_contains "$TMP_ROOT/update-keep-inspect.out" "$update_keep_staged_workdir (cleaned)"
+
+cat >"$TMP_ROOT/ComfyUI/requirements.txt" <<'EOF'
+torch==2.11.1
+torchvision==0.26.1
+torchaudio==2.11.1
+numpy==1.26.6
+EOF
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update run >"$TMP_ROOT/update-fail-run.out" 2>"$TMP_ROOT/update-fail-run.err"
+update_fail_txid="$(python3 - "$TMP_ROOT/update-fail-run.out" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r"txid:\s*(\S+)", text)
+if not match:
+    raise SystemExit("missing txid in update-fail-run output")
+print(match.group(1))
+PY
+)"
+update_fail_candidate_env="$WORK_DIR/.venv-candidate/$update_fail_txid"
+update_fail_staged_workdir="$WORK_DIR/state/work/$update_fail_txid"
+assert_file_exists "$update_fail_candidate_env"
+assert_file_exists "$update_fail_staged_workdir"
+set +e
+FAKE_UV_SYNC_FAIL=1 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update promote "$update_fail_txid" >"$TMP_ROOT/update-fail-promote.out" 2>"$TMP_ROOT/update-fail-promote.err"
+rc=$?
+set -e
+if [ "$rc" -eq 0 ]; then
+    echo "expected update promote to fail when prod sync fails" >&2
+    exit 1
+fi
+assert_contains "$TMP_ROOT/update-fail-promote.err" "prod sync failed during update promote"
+assert_file_exists "$update_fail_candidate_env"
+assert_file_exists "$update_fail_staged_workdir"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update inspect "$update_fail_txid" >"$TMP_ROOT/update-fail-inspect.out"
+assert_contains "$TMP_ROOT/update-fail-inspect.out" "status: promote_failed"
+
 mkdir -p "$TMP_ROOT/ComfyUI/custom_nodes/demo-node"
 cat >"$TMP_ROOT/ComfyUI/custom_nodes/demo-node/__init__.py" <<'EOF'
 print("demo")
@@ -1218,6 +1305,51 @@ cat >"$WORK_DIR/state/plugins.json" <<'EOF'
   }
 ]
 EOF
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" tx run demo-node >"$TMP_ROOT/tx-run-demo.out"
+demo_txid="$(python3 - "$TMP_ROOT/tx-run-demo.out" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r"txid:\s*(\S+)", text)
+if not match:
+    raise SystemExit("missing txid in tx-run-demo output")
+print(match.group(1))
+PY
+)"
+demo_candidate_env="$WORK_DIR/.venv-candidate/$demo_txid"
+assert_file_exists "$demo_candidate_env"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" tx promote "$demo_txid" >"$TMP_ROOT/tx-promote-demo.out"
+assert_contains "$TMP_ROOT/tx-promote-demo.out" "Promote successful."
+assert_not_exists "$demo_candidate_env"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" tx inspect "$demo_txid" >"$TMP_ROOT/tx-inspect-demo.out"
+assert_contains "$TMP_ROOT/tx-inspect-demo.out" "status: promoted"
+assert_contains "$TMP_ROOT/tx-inspect-demo.out" "candidate_env: $demo_candidate_env (cleaned)"
+
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" tx run linked-node >"$TMP_ROOT/tx-run-linked.out"
+linked_txid="$(python3 - "$TMP_ROOT/tx-run-linked.out" <<'PY'
+import pathlib
+import re
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r"txid:\s*(\S+)", text)
+if not match:
+    raise SystemExit("missing txid in tx-run-linked output")
+print(match.group(1))
+PY
+)"
+linked_candidate_env="$WORK_DIR/.venv-candidate/$linked_txid"
+assert_file_exists "$linked_candidate_env"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" tx promote "$linked_txid" --keep-artifacts >"$TMP_ROOT/tx-promote-linked.out"
+assert_contains "$TMP_ROOT/tx-promote-linked.out" "Promote successful."
+assert_file_exists "$linked_candidate_env"
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" tx inspect "$linked_txid" >"$TMP_ROOT/tx-inspect-linked.out"
+assert_contains "$TMP_ROOT/tx-inspect-linked.out" "status: promoted"
+assert_contains "$TMP_ROOT/tx-inspect-linked.out" "candidate_env: $linked_candidate_env"
+assert_not_contains "$TMP_ROOT/tx-inspect-linked.out" "$linked_candidate_env (cleaned)"
 
 BUNDLE_TAR="$TMP_ROOT/bundle.tar"
 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" env export "$BUNDLE_TAR" >"$TMP_ROOT/env-export.out"

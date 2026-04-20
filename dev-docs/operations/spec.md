@@ -30,7 +30,9 @@
 
 - Operation retention defaults to 100 directories unless config overrides it.
 - `ops_prune` removes older operation directories beyond retention.
-- Candidate envs remain until manually aborted or otherwise cleaned by the operator.
+- Successful `tx promote` and `update promote` clean transaction artifacts by default.
+- Operators can retain promote artifacts explicitly through the corresponding `--keep-artifacts` flag.
+- Candidate envs for non-promoted transactions remain until manually aborted or otherwise cleaned by the operator.
 
 ## Operator Checks
 

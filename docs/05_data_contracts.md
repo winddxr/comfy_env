@@ -51,6 +51,10 @@
 4. 日志：`logs.stdout`, `logs.stderr`, `logs.run_exit_code`
 5. 冲突与晋升：`conflict_report`, `resolution_pins`, `promotion_plan`, `promotion`
 
+语义约束：
+
+1. `candidate_env` 与 `staged_workdir` 记录原始 artifact 路径，即使成功 `promote` 后对应目录已被自动清理，也不会从事务 JSON 中抹除。
+
 `promotion` 关键子字段：
 
 1. `status`

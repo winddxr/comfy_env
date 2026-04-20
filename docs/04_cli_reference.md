@@ -90,9 +90,9 @@
 
 用途：用参数化 pin 修复 `update run` 或 `update promote` 的 lock 冲突。
 
-### `gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
+### `gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run] [--keep-artifacts]`
 
-用途：把核心依赖升级事务的 staged snapshot 晋升到 prod。
+用途：把核心依赖升级事务的 staged snapshot 晋升到 prod；成功后默认清理 candidate env 与 staged workdir，传 `--keep-artifacts` 可保留。
 
 ### `gov update abort <txid>`
 
@@ -120,9 +120,9 @@
 
 用途：删除插件事务 candidate env 并标记为 `aborted`。
 
-### `gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
+### `gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run] [--keep-artifacts]`
 
-用途：把插件事务晋升到 prod。
+用途：把插件事务晋升到 prod；成功后默认清理 candidate env，传 `--keep-artifacts` 可保留。
 
 ### `gov resolve <txid>`
 

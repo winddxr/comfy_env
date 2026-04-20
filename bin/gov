@@ -3672,12 +3672,25 @@ import pathlib
 import sys
 
 tx = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+status = str(tx.get("status") or "")
+
+def render_artifact(path_value: str, tx_status: str) -> str:
+    value = str(path_value or "").strip()
+    if not value:
+        return "(none)"
+    path = pathlib.Path(value)
+    if path.exists():
+        return value
+    if tx_status in {"promoted", "aborted"}:
+        return f"{value} (cleaned)"
+    return f"{value} (missing)"
+
 print(f"txid: {tx.get('txid')}")
 print(f"node_id: {tx.get('node_id')}")
-print(f"status: {tx.get('status')}")
+print(f"status: {status}")
 print(f"started_at: {tx.get('started_at')}")
 print(f"ended_at: {tx.get('ended_at')}")
-print(f"candidate_env: {tx.get('candidate_env')}")
+print(f"candidate_env: {render_artifact(tx.get('candidate_env'), status)}")
 diff = tx.get("diff", {})
 print(f"added_count: {len(diff.get('added', []))}")
 print(f"removed_count: {len(diff.get('removed', []))}")
@@ -3694,6 +3707,26 @@ print(f"run_exit_code: {logs.get('run_exit_code', '')}")
 PY
 }
 
+cleanup_tx_artifacts() {
+    local tx_file="$1"
+    local candidate_env staged_workdir cleanup_failed=false
+
+    candidate_env="$(tx_get_field "$tx_file" "candidate_env" "")"
+    staged_workdir="$(tx_get_field "$tx_file" "staged_workdir" "")"
+
+    if [ -n "$candidate_env" ] && [ -e "$candidate_env" ]; then
+        rm -rf "$candidate_env" || cleanup_failed=true
+    fi
+    if [ -n "$staged_workdir" ] && [ -e "$staged_workdir" ]; then
+        rm -rf "$staged_workdir" || cleanup_failed=true
+    fi
+
+    if [ "$cleanup_failed" = true ]; then
+        return 1
+    fi
+    return 0
+}
+
 _cmd_abort_impl() {
     local txid="$1"
     local expected_kind="$2"
@@ -3701,17 +3734,7 @@ _cmd_abort_impl() {
 
     load_tx "$txid"
     tx_assert_kind "$expected_kind"
-
-    local candidate_env staged_workdir
-    candidate_env="$(tx_get_field "$TX_FILE" "candidate_env" "")"
-    staged_workdir="$(tx_get_field "$TX_FILE" "staged_workdir" "")"
-
-    if [ -n "$candidate_env" ] && [ -d "$candidate_env" ]; then
-        rm -rf "$candidate_env"
-    fi
-    if [ -n "$staged_workdir" ] && [ -d "$staged_workdir" ]; then
-        rm -rf "$staged_workdir"
-    fi
+    cleanup_tx_artifacts "$TX_FILE" || true
 
     tx_update_status "$TX_FILE" "aborted"
     echo "${label} aborted."
@@ -3860,13 +3883,14 @@ cmd_tx_promote() {
     local txid="${1:-}"
     shift || true
     if [ -z "$txid" ]; then
-        echo "Usage: gov tx promote <txid> [--approve-core --reason \"...\"] [--allow-failed-run]" >&2
+        echo "Usage: gov tx promote <txid> [--approve-core --reason \"...\"] [--allow-failed-run] [--keep-artifacts]" >&2
         exit 1
     fi
 
     local approve_core=false
     local reason=""
     local allow_failed_run=false
+    local keep_artifacts=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --approve-core)
@@ -3879,6 +3903,10 @@ cmd_tx_promote() {
                 ;;
             --allow-failed-run)
                 allow_failed_run=true
+                shift
+                ;;
+            --keep-artifacts)
+                keep_artifacts=true
                 shift
                 ;;
             *)
@@ -3988,6 +4016,11 @@ cmd_tx_promote() {
     tx_set_promoted "$TX_FILE" "$op_id" "$reason"
     plugin_update_after_promote "$node_id" "$PROJECT_FILE"
     op_finalize "$op_id" "success" "true" "promote succeeded"
+    if [ "$keep_artifacts" != true ]; then
+        if ! cleanup_tx_artifacts "$TX_FILE"; then
+            echo "WARNING: promoted transaction artifacts could not be fully cleaned." >&2
+        fi
+    fi
     ops_prune
 
     echo "Promote successful."
@@ -4359,15 +4392,28 @@ import pathlib
 import sys
 
 tx = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+status = str(tx.get("status") or "")
+
+def render_artifact(path_value: str, tx_status: str) -> str:
+    value = str(path_value or "").strip()
+    if not value:
+        return "(none)"
+    path = pathlib.Path(value)
+    if path.exists():
+        return value
+    if tx_status in {"promoted", "aborted"}:
+        return f"{value} (cleaned)"
+    return f"{value} (missing)"
+
 print(f"txid: {tx.get('txid')}")
 print(f"kind: {tx.get('kind')}")
-print(f"status: {tx.get('status')}")
+print(f"status: {status}")
 print(f"started_at: {tx.get('started_at')}")
 print(f"ended_at: {tx.get('ended_at')}")
-print(f"candidate_env: {tx.get('candidate_env')}")
+print(f"candidate_env: {render_artifact(tx.get('candidate_env'), status)}")
 print(f"source_requirements_path: {tx.get('source_requirements_path')}")
 print(f"source_requirements_sha256: {tx.get('source_requirements_sha256')}")
-print(f"staged_workdir: {tx.get('staged_workdir')}")
+print(f"staged_workdir: {render_artifact(tx.get('staged_workdir'), status)}")
 print(f"target_core_deps: {len(tx.get('target_core_deps', []))}")
 diff = tx.get("diff", {})
 print(f"added_count: {len(diff.get('added', []))}")
@@ -4529,13 +4575,14 @@ cmd_update_promote() {
     local txid="${1:-}"
     shift || true
     if [ -z "$txid" ]; then
-        echo "Usage: gov update promote <txid> [--approve-core --reason \"...\"] [--allow-failed-run]" >&2
+        echo "Usage: gov update promote <txid> [--approve-core --reason \"...\"] [--allow-failed-run] [--keep-artifacts]" >&2
         exit 1
     fi
 
     local approve_core=false
     local reason=""
     local allow_failed_run=false
+    local keep_artifacts=false
     while [ $# -gt 0 ]; do
         case "$1" in
             --approve-core)
@@ -4548,6 +4595,10 @@ cmd_update_promote() {
                 ;;
             --allow-failed-run)
                 allow_failed_run=true
+                shift
+                ;;
+            --keep-artifacts)
+                keep_artifacts=true
                 shift
                 ;;
             *)
@@ -4617,6 +4668,11 @@ cmd_update_promote() {
 
     tx_set_promoted "$TX_FILE" "$op_id" "$reason"
     op_finalize "$op_id" "success" "true" "update promote succeeded"
+    if [ "$keep_artifacts" != true ]; then
+        if ! cleanup_tx_artifacts "$TX_FILE"; then
+            echo "WARNING: promoted transaction artifacts could not be fully cleaned." >&2
+        fi
+    fi
     ops_prune
 
     echo "Core update promoted."
@@ -5318,7 +5374,7 @@ Usage:
   gov update run [--requirements-file <path>] [--timeout <seconds>]
   gov update inspect <txid>
   gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]
-  gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]
+  gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run] [--keep-artifacts]
   gov update abort <txid>
   gov env export <output_tar>
   gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>
@@ -5327,7 +5383,7 @@ Usage:
   gov tx run <node_id> [--timeout <seconds>]
   gov tx inspect <txid>
   gov tx abort <txid>
-  gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]
+  gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run] [--keep-artifacts]
   gov resolve <txid>
   gov undo <op_id>
   gov op list
