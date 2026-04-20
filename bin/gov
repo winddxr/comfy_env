@@ -725,7 +725,10 @@ import sys
 try:
     import tomllib
 except ModuleNotFoundError:
-    import tomli as tomllib
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        tomllib = None
 
 pyproject = pathlib.Path(sys.argv[1])
 group = sys.argv[2]
@@ -1839,9 +1842,43 @@ def marker_matches_environment(marker: str) -> bool:
     parsed = ast.parse(marker, mode="eval")
     return eval_marker_ast(parsed)
 
+def parse_simple_string_list(raw: str) -> list[str]:
+    values = []
+    for match in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"|\'([^\'\\]*(?:\\.[^\'\\]*)*)\'', raw, re.DOTALL):
+        value = match.group(1) if match.group(1) is not None else match.group(2)
+        values.append(value.encode("utf-8").decode("unicode_escape"))
+    return values
+
+def parse_project_fallback(text: str) -> dict:
+    result: dict[str, dict] = {}
+
+    project_match = re.search(r'(?ms)^\[project\]\n(.*?)(?=^\[|\Z)', text)
+    if project_match:
+        project_body = project_match.group(1)
+        requires_match = re.search(
+            r'(?m)^\s*requires-python\s*=\s*("([^"\\]*(?:\\.[^"\\]*)*)"|\'([^\'\\]*(?:\\.[^\'\\]*)*)\')\s*$',
+            project_body,
+        )
+        if requires_match:
+            requires_value = requires_match.group(2) if requires_match.group(2) is not None else requires_match.group(3)
+            result.setdefault("project", {})["requires-python"] = requires_value.encode("utf-8").decode("unicode_escape")
+
+    tool_uv_match = re.search(r'(?ms)^\[tool\.uv\]\n(.*?)(?=^\[|\Z)', text)
+    if tool_uv_match:
+        tool_uv_body = tool_uv_match.group(1)
+        env_match = re.search(r'(?ms)^\s*environments\s*=\s*(\[[^\]]*\])', tool_uv_body)
+        if env_match:
+            result.setdefault("tool", {}).setdefault("uv", {})["environments"] = parse_simple_string_list(env_match.group(1))
+
+    return result
+
 project = {}
 if bundle_project.exists():
-    project = tomllib.loads(bundle_project.read_text(encoding="utf-8"))
+    raw_text = bundle_project.read_text(encoding="utf-8")
+    if tomllib is not None:
+        project = tomllib.loads(raw_text)
+    else:
+        project = parse_project_fallback(raw_text)
 
 requires_python = str((project.get("project") or {}).get("requires-python") or "").strip()
 bundle_minor = exact_minor_tuple(requires_python)
