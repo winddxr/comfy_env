@@ -355,6 +355,12 @@ PY
         mkdir -p "$env_path/bin"
         cat >"$env_path/bin/python" <<'PYEOF'
 #!/usr/bin/env bash
+if [ -n "${FAKE_PYTHON_STDOUT:-}" ]; then
+    printf '%s\n' "${FAKE_PYTHON_STDOUT}"
+fi
+if [ -n "${FAKE_PYTHON_STDERR:-}" ]; then
+    printf '%s\n' "${FAKE_PYTHON_STDERR}" >&2
+fi
 if [ "${FAKE_PYTHON_SLEEP_SEC:-0}" != "0" ]; then
     sleep "${FAKE_PYTHON_SLEEP_SEC}"
 fi
@@ -1143,14 +1149,16 @@ torchvision==0.26.1
 torchaudio==2.11.1
 numpy==1.26.4
 EOF
-FAKE_PYTHON_SLEEP_SEC=2 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update run --timeout 1 >"$TMP_ROOT/update-run.out" 2>"$TMP_ROOT/update-run.err"
+FAKE_PYTHON_STDOUT="candidate stdout line" FAKE_PYTHON_STDERR="candidate stderr line" FAKE_PYTHON_SLEEP_SEC=2 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update run --timeout 1 >"$TMP_ROOT/update-run.out" 2>"$TMP_ROOT/update-run.err"
 assert_contains "$TMP_ROOT/update-run.out" "Staging core update candidate from:"
 assert_contains "$TMP_ROOT/update-run.out" "Syncing staged core update into candidate environment..."
 assert_contains "$TMP_ROOT/update-run.out" "Running staged ComfyUI candidate with timeout 1s..."
+assert_contains "$TMP_ROOT/update-run.out" "candidate stdout line"
 assert_contains "$TMP_ROOT/update-run.out" "Core update transaction recorded."
 assert_contains "$TMP_ROOT/update-run.out" "status: completed"
 assert_contains "$TMP_ROOT/update-run.out" "candidate run timed out after 1s"
 assert_contains "$TMP_ROOT/update-run.err" "Filtered torch-family requirements:"
+assert_contains "$TMP_ROOT/update-run.err" "candidate stderr line"
 
 update_txid="$(python3 - "$TMP_ROOT/update-run.out" <<'PY'
 import pathlib
@@ -1168,6 +1176,8 @@ PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" update inspect "$update_txid" >"
 assert_contains "$TMP_ROOT/update-inspect.out" "kind: core_update"
 assert_contains "$TMP_ROOT/update-inspect.out" "status: completed"
 assert_contains "$TMP_ROOT/update-inspect.out" "run_exit_code: 124"
+assert_contains "$WORK_DIR/state/logs/${update_txid}.stdout.log" "candidate stdout line"
+assert_contains "$WORK_DIR/state/logs/${update_txid}.stderr.log" "candidate stderr line"
 
 update_candidate_env="$WORK_DIR/.venv-candidate/$update_txid"
 update_staged_workdir="$WORK_DIR/state/work/$update_txid"
@@ -1306,7 +1316,11 @@ cat >"$WORK_DIR/state/plugins.json" <<'EOF'
 ]
 EOF
 
-PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" tx run demo-node >"$TMP_ROOT/tx-run-demo.out"
+FAKE_PYTHON_STDOUT="tx candidate stdout line" FAKE_PYTHON_STDERR="tx candidate stderr line" PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" tx run demo-node >"$TMP_ROOT/tx-run-demo.out" 2>"$TMP_ROOT/tx-run-demo.err"
+assert_contains "$TMP_ROOT/tx-run-demo.out" "Syncing candidate environment for node 'demo-node'..."
+assert_contains "$TMP_ROOT/tx-run-demo.out" "Running candidate ComfyUI with timeout 120s..."
+assert_contains "$TMP_ROOT/tx-run-demo.out" "tx candidate stdout line"
+assert_contains "$TMP_ROOT/tx-run-demo.err" "tx candidate stderr line"
 demo_txid="$(python3 - "$TMP_ROOT/tx-run-demo.out" <<'PY'
 import pathlib
 import re
@@ -1321,6 +1335,8 @@ PY
 )"
 demo_candidate_env="$WORK_DIR/.venv-candidate/$demo_txid"
 assert_file_exists "$demo_candidate_env"
+assert_contains "$WORK_DIR/state/logs/${demo_txid}.stdout.log" "tx candidate stdout line"
+assert_contains "$WORK_DIR/state/logs/${demo_txid}.stderr.log" "tx candidate stderr line"
 PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" tx promote "$demo_txid" >"$TMP_ROOT/tx-promote-demo.out"
 assert_contains "$TMP_ROOT/tx-promote-demo.out" "Promote successful."
 assert_not_exists "$demo_candidate_env"

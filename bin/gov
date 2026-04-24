@@ -492,9 +492,11 @@ run_command_with_timeout_logged() {
     "${PYTHON_BIN}" - "$timeout_sec" "$stdout_log" "$stderr_log" "$write_mode" "$@" <<'PY'
 import os
 import pathlib
+import selectors
 import signal
 import subprocess
 import sys
+import time
 
 timeout_raw, stdout_log, stderr_log, write_mode = sys.argv[1:5]
 cmd = sys.argv[5:]
@@ -521,23 +523,66 @@ stdout_path.parent.mkdir(parents=True, exist_ok=True)
 stderr_path.parent.mkdir(parents=True, exist_ok=True)
 
 with stdout_path.open(stdout_mode) as stdout_handle, stderr_path.open(stderr_mode) as stderr_handle:
-    proc = subprocess.Popen(cmd, stdout=stdout_handle, stderr=stderr_handle, start_new_session=True)
-    try:
-        raise SystemExit(proc.wait(timeout=timeout_sec))
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        bufsize=0,
+    )
+    selector = selectors.DefaultSelector()
+    streams = []
+    if proc.stdout is not None:
+        selector.register(proc.stdout, selectors.EVENT_READ, (stdout_handle, sys.stdout.buffer))
+        streams.append(proc.stdout)
+    if proc.stderr is not None:
+        selector.register(proc.stderr, selectors.EVENT_READ, (stderr_handle, sys.stderr.buffer))
+        streams.append(proc.stderr)
+
+    deadline = time.monotonic() + timeout_sec
+    terminate_deadline = None
+    timed_out = False
+    killed = False
+
+    while selector.get_map() or proc.poll() is None:
+        now = time.monotonic()
+        if not timed_out and now >= deadline and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            timed_out = True
+            terminate_deadline = now + 5
+
+        if timed_out and not killed and terminate_deadline is not None and now >= terminate_deadline and proc.poll() is None:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            proc.wait()
-        raise SystemExit(124)
+            killed = True
+
+        timeout = 0.2
+        if not timed_out:
+            timeout = max(0.0, min(timeout, deadline - now))
+        elif terminate_deadline is not None and not killed:
+            timeout = max(0.0, min(timeout, terminate_deadline - now))
+
+        events = selector.select(timeout)
+        for key, _ in events:
+            src = key.fileobj
+            log_handle, terminal_handle = key.data
+            chunk = src.read(65536)
+            if not chunk:
+                selector.unregister(src)
+                src.close()
+                continue
+            log_handle.write(chunk)
+            log_handle.flush()
+            terminal_handle.write(chunk)
+            terminal_handle.flush()
+
+    return_code = proc.wait()
+    raise SystemExit(124 if timed_out else return_code)
 PY
 }
 
