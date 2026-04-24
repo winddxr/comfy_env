@@ -52,6 +52,7 @@ fn list_transactions() -> Result<Vec<TransactionRecord>>
 **Invariants**:
 - `txid` is immutable once created
 - Only `status`, `resolution_pins`, `promotion`, `ended_at`, `conflict_report` mutate after creation
+- `candidate_env` and `staged_workdir` retain their original path strings even if the referenced directories are later cleaned after `promote` or `abort`
 - Read path must tolerate missing optional fields (schema evolution)
 
 **Minimal fields at creation** (all others are null/empty until populated):
@@ -63,6 +64,7 @@ fn list_transactions() -> Result<Vec<TransactionRecord>>
 
 **Fields populated during promote/resolve**:
 - `resolution_pins` (resolve), `promotion` (promote), `conflict_report` (lock failure)
+- Inspect/read layers may annotate missing artifact paths as `(cleaned)` for promoted/aborted transactions or `(missing)` for other states, but they do not rewrite the stored JSON fields
 
 ### 2. Operation Records
 

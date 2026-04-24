@@ -96,11 +96,11 @@ promoted  needs_    aborted         aborted
 Valid transitions:
 - `running` → `completed` | `failed` | `needs_resolution`
 - `completed` → `promoted` | `needs_resolution` | `aborted`
-- `failed` → `aborted`
+- `failed` → `promoted` | `promote_failed` | `needs_resolution` | `aborted`
 - `needs_resolution` → `resolved` | `aborted`
 - `resolved` → `promoted` | `needs_resolution` | `promote_failed`
 
-Note: `running` → `needs_resolution` occurs when lock fails during `tx run` staging (before ComfyUI executes). `completed` → `needs_resolution` occurs when lock fails during `tx promote`.
+Note: `running` → `needs_resolution` occurs when lock fails during `tx run` staging (before ComfyUI executes). `running` → `completed` includes both exit code 0 and bounded observation timeout. `completed` / `resolved` / `failed` → `needs_resolution` occurs when lock fails during `tx promote` or `update promote`.
 
 **Operation lifecycle:**
 

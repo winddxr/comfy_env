@@ -23,13 +23,13 @@ fn run_candidate(
 1. Resolve Python: `venv_python(env_path)`
 2. Build command: `[python, <comfyui_dir>/main.py]`
 3. Spawn child process
-4. Pipe stdout → `log_stdout` file
-5. Pipe stderr → `log_stderr` file
+4. Pipe stdout → `log_stdout` file and mirror it to the parent process stdout in real time
+5. Pipe stderr → `log_stderr` file and mirror it to the parent process stderr in real time
 6. Wait with timeout:
    - If exits before timeout: return `RunOutcome::Passed` or `RunOutcome::Failed(exit_code)`
    - If timeout expires: kill child, return `RunOutcome::TimedOut`
 
-**Contract**: Used by `tx run` and `update run`. The candidate environment is isolated — this never touches prod env or truth files.
+**Contract**: Used by `tx run` and `update run`. The candidate environment is isolated — this never touches prod env or truth files. `RunOutcome::TimedOut` means the observation window ended and the process was deliberately terminated; command layers decide how that maps into transaction status.
 
 ### 2. Prod Run (ComfyUI Launch)
 
@@ -73,9 +73,14 @@ fn stop(pid_path: &Path, grace_seconds: u32) -> Result<StopOutcome>
 enum RunOutcome {
     Passed,           // exit code 0
     Failed(i32),      // non-zero exit code
-    TimedOut,         // killed after timeout
+    TimedOut,         // killed after observation timeout
 }
 ```
+
+**Command-layer mapping**:
+
+- `tx run` / `update run` should persist the real `run_exit_code` for audit.
+- `TimedOut` should normally map to transaction `status=completed`, not `failed`, because the bounded observation finished successfully even though the process did not exit on its own.
 
 ### 5. StopOutcome
 
@@ -95,6 +100,8 @@ All logs go to `state/logs/`. Naming patterns:
 |----------|--------|--------|
 | Candidate run (`tx run`, `update run`) | `state/logs/<txid>.stdout.log` | `state/logs/<txid>.stderr.log` |
 | Lock conflict | — | `state/conflicts/<txid>.lock.log` |
+
+Candidate run output is dual-channel by contract: operators see it live in the terminal, and the same bytes are written to `state/logs/` for audit.
 
 Prod run (`gov run`) does NOT write to `state/logs/` — ComfyUI output goes to the terminal (inherited stdout/stderr from the parent process).
 

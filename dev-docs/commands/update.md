@@ -46,16 +46,21 @@ Create a core update transaction that stages updated ComfyUI requirements, locks
 1. Generate txid
 2. Read requirements file
 3. Filter out torch family packages
+   - `torch`, `torchvision`, and `torchaudio` are skipped, not treated as a transaction failure
 4. Record source: requirements path + sha256
 5. Create transaction record (status="running", kind="core_update")
 6. Copy truth to staged workdir
-7. Replace dependency-groups.core in workdir with filtered requirements
+7. Replace dependency-groups.core in workdir with the full filtered target set
 8. Lock workdir: `uv lock --python <py>`
 9. Create candidate env: sync workdir to .venv-candidate/<txid>/
 10. Capture pre/post freeze
 11. Run ComfyUI in candidate env (with timeout)
+    - Mirror stdout/stderr to the terminal in real time
+    - Capture the same stdout/stderr to tx log files
 12. Compute diff and core_impact
-13. Update transaction: status → "completed" | "failed"
+13. Update transaction:
+    - status → "completed" when the run exits 0 or the observation timeout is reached
+    - status → "failed" on candidate sync failure or non-zero runtime failure
 ```
 
 ### Failure Path
@@ -63,7 +68,8 @@ Create a core update transaction that stages updated ComfyUI requirements, locks
 Same structure as `tx run`:
 - Lock failure → "needs_resolution" + conflict artifact
 - Sync failure → status "failed"
-- Run timeout/error → status "failed"
+- Run timeout → status "completed" with preserved run_exit_code
+- Non-zero runtime error → status "failed"
 
 ---
 
@@ -78,6 +84,7 @@ gov update inspect <txid>
 Identical behavior to `tx inspect` — displays transaction details. Additionally shows:
 - Source requirements file path and hash
 - Staged workdir path
+- Artifact presence annotations such as `(cleaned)` or `(missing)` when the stored paths no longer exist
 
 ---
 
@@ -160,7 +167,7 @@ Same semantics as `tx abort`. Cancels core update transaction, cleans up candida
 ### Synopsis
 
 ```
-gov update promote <txid> [--approve-core --reason "<text>"] [--allow-failed-run]
+gov update promote <txid> [--approve-core --reason "<text>"] [--allow-failed-run] [--keep-artifacts]
 ```
 
 ### Purpose
@@ -169,7 +176,7 @@ Promote a core update transaction's staged snapshot to production.
 
 ### Preconditions
 
-Same as `tx promote` — status must be `completed` or `resolved`, core impact gate applies.
+Same as `tx promote` — status may be `completed`, `resolved`, or `failed`, and `--allow-failed-run` is required for `failed` transactions.
 
 ### Reads
 
@@ -195,8 +202,10 @@ Same as `tx promote` — status must be `completed` or `resolved`, core impact g
 5. Sync prod env via [Prod Sync Protocol]
 6. Smoke test via [Smoke Test Protocol]
 7. Update tx status → "promoted"
-8. Clean up candidate env and workdir
-9. op_finalize(success)
+8. op_finalize(success)
+9. IF `--keep-artifacts` is not set:
+   - Clean up candidate env and workdir
+   - If cleanup fails, emit warning only; do not change promote success
 ```
 
 ### Failure Path

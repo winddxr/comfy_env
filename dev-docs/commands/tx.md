@@ -60,13 +60,15 @@ Create a candidate transaction that observes the dependency impact of a plugin. 
 10. Run ComfyUI in candidate env:
     - Command: venv_python <comfyui_dir>/main.py
     - With timeout
-    - Capture stdout/stderr to log files
+    - Mirror stdout/stderr to the terminal in real time
+    - Capture the same stdout/stderr to log files
     - Record exit code
 11. Capture post-freeze: `uv pip freeze` in candidate env
 12. Compute diff (added/removed packages between pre and post freeze)
 13. Compute core_impact: diff ∩ policy.core_packages
 14. Update transaction record:
-    - status = "completed" (if exit 0) or "failed" (if non-zero/timeout)
+    - status = "completed" (if exit 0 or observation timeout)
+    - status = "failed" (if non-zero runtime failure or candidate sync failure)
     - pre_freeze, post_freeze, diff, core_impact, logs, run_exit_code
 ```
 
@@ -80,7 +82,7 @@ IF lock fails during workdir staging:
   - Clean up candidate env
   - Return (not a fatal error — user resolves then re-promotes)
 IF candidate sync fails: update tx status → "failed", clean up
-IF ComfyUI run times out: record RunOutcome::TimedOut, status → "failed"
+IF ComfyUI run times out: record RunOutcome::TimedOut, preserve run_exit_code, status → "completed"
 IF ComfyUI run exits non-zero: record exit code, status → "failed"
 ```
 
@@ -88,19 +90,20 @@ IF ComfyUI run exits non-zero: record exit code, status → "failed"
 
 - Creates: transaction `running` → `completed` | `failed` | `needs_resolution`
 - `running` → `needs_resolution`: lock fails during workdir staging (before ComfyUI runs)
-- `running` → `completed`: ComfyUI exits 0
-- `running` → `failed`: ComfyUI exits non-zero or timeout
+- `running` → `completed`: ComfyUI exits 0 or reaches the observation timeout and is cleanly terminated
+- `running` → `failed`: ComfyUI exits non-zero or candidate sync/run setup fails
 
 ### Cleanup Ownership
 
-- **Candidate env** (`.venv-candidate/<txid>/`): cleaned up by `tx abort` or `tx promote` (on success). Not cleaned on `tx run` failure — preserved for inspection.
-- **Staged workdir** (`state/work/...`): cleaned up by `tx abort` or `tx promote`. Not cleaned on needs_resolution — needed for resolve retry.
+- **Candidate env** (`.venv-candidate/<txid>/`): cleaned up by `tx abort` or by successful `tx promote` by default. `tx promote --keep-artifacts` preserves it. Not cleaned on `tx run` failure — preserved for inspection.
+- **Staged workdir** (`state/work/...`): cleaned up by `tx abort` or by successful `tx promote` by default. `tx promote --keep-artifacts` preserves it. Not cleaned on `needs_resolution` — needed for resolve retry.
 
 ### Platform Notes
 
 - Candidate env Python located via `venv_python()`
 - Timeout uses platform-native child process timeout (not Unix `timeout` command)
 - Log capture uses stdout/stderr pipes (cross-platform)
+- Candidate output is a dual channel: terminal visibility for the operator and durable tx log files for audit
 
 ---
 
@@ -137,8 +140,11 @@ Nothing.
 3. Display: diff (added/removed packages)
 4. Display: core_impact (if non-empty)
 5. Display: run logs summary (exit code, timeout status)
-6. IF needs_resolution: display conflict summary and resolution hint
-7. IF promoted: display promotion details (op_id, reason)
+6. Display artifact paths (`candidate_env`, `staged_workdir`) with presence annotation:
+   - `(cleaned)` when the path is absent after a promoted/aborted transaction
+   - `(missing)` when the path is absent in any other state
+7. IF needs_resolution: display conflict summary and resolution hint
+8. IF promoted: display promotion details (op_id, reason)
 ```
 
 ---
@@ -188,7 +194,7 @@ Cancel a transaction and clean up its candidate environment.
 ### Synopsis
 
 ```
-gov tx promote <txid> [--approve-core --reason "<text>"] [--allow-failed-run]
+gov tx promote <txid> [--approve-core --reason "<text>"] [--allow-failed-run] [--keep-artifacts]
 ```
 
 ### Purpose
@@ -203,11 +209,12 @@ Promote a completed transaction's dependency changes into production truth and s
 | `--approve-core` | Conditional | Required if core_impact is non-empty |
 | `--reason` | No | Documentation for core approval |
 | `--allow-failed-run` | No | Allow promoting even if run status was "failed" |
+| `--keep-artifacts` | No | Preserve `candidate_env` and `staged_workdir` after a successful promote |
 
 ### Preconditions
 
-- Transaction must exist with status `completed` or `resolved`
-- If status is `failed`: requires `--allow-failed-run`
+- Transaction must exist with status `completed`, `resolved`, or `failed`
+- If status is `failed`: `--allow-failed-run` is required
 - Core impact gate: if core_impact non-empty, requires `--approve-core`
 
 ### Reads
@@ -249,8 +256,10 @@ Promote a completed transaction's dependency changes into production truth and s
 13. Smoke test via [Smoke Test Protocol]
 14. Update transaction: status → "promoted", promotion.op_id = op_id
 15. Update plugins.json: set managed_deps for plugin
-16. Clean up candidate env
-17. op_finalize(success)
+16. op_finalize(success)
+17. IF `--keep-artifacts` is not set:
+    - Clean up candidate env and staged workdir
+    - If cleanup fails, emit warning only; do not change promote success
 ```
 
 ### Failure Path
